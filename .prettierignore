@@ -1,0 +1,8 @@
+dist
+coverage
+node_modules
+.skill-sync
+package-lock.json
+.claude
+.codex
+openspec

@@ -1,0 +1,65 @@
+{
+  "name": "skill-sync",
+  "version": "0.1.0",
+  "description": "Safely manage a Git-backed library of AI skills across Codex, Claude, and project repositories.",
+  "type": "module",
+  "sideEffects": false,
+  "bin": {
+    "skill-sync": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "clean": "node scripts/clean.mjs",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write src tests scripts .github README.md package.json tsconfig.json tsconfig.build.json vitest.config.ts eslint.config.js .prettierrc.json",
+    "format:check": "prettier --check src tests scripts .github README.md package.json tsconfig.json tsconfig.build.json vitest.config.ts eslint.config.js .prettierrc.json",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration",
+    "test:e2e": "vitest run tests/e2e",
+    "smoke:pack": "node scripts/smoke-pack.mjs",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run smoke:pack",
+    "prepack": "npm run clean && npm run build",
+    "release:check": "npm run check && npm pack --dry-run",
+    "release:next": "npm version prerelease --preid=next",
+    "publish:dry-run": "npm publish --dry-run"
+  },
+  "keywords": [
+    "ai",
+    "skills",
+    "codex",
+    "claude",
+    "cli",
+    "git"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "packageManager": "npm@11.16.0",
+  "dependencies": {
+    "@inquirer/prompts": "^8.5.2",
+    "commander": "^15.0.0",
+    "yaml": "^2.9.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.1.1",
+    "eslint": "^10.7.0",
+    "prettier": "^3.9.5",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.64.0",
+    "vitest": "^4.1.10"
+  }
+}
