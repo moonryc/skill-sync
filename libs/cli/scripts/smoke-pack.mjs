@@ -1,11 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { delimiter, dirname, join } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
 const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const workspaceRoot = resolve(projectRoot, '../..');
+const stagedPackageRoot = join(workspaceRoot, 'dist', 'libs', 'cli');
 const smokeRoot = await mkdtemp(join(tmpdir(), 'skill-sync-pack-'));
 const npmCache = join(smokeRoot, 'npm-cache');
 const npmExecutable = process.platform === 'win32' ? 'npm.cmd' : 'npm';
@@ -18,9 +20,10 @@ function execute(command, args, options = {}) {
     npm_config_update_notifier: 'false',
     ...options.env,
   };
+  Reflect.deleteProperty(environment, 'FORCE_COLOR');
   for (const key of options.unsetEnvironment ?? []) Reflect.deleteProperty(environment, key);
   return spawnSync(command, args, {
-    cwd: projectRoot,
+    cwd: options.cwd ?? workspaceRoot,
     encoding: 'utf8',
     env: environment,
     shell: options.shell ?? false,
@@ -100,14 +103,14 @@ function verifyInteractiveCancellation(executable, options) {
 }
 
 try {
-  const packedResult = requireSuccess(npmExecutable, ['pack', '--json']);
+  const packedResult = requireSuccess(npmExecutable, ['pack', '--json', stagedPackageRoot]);
   const packed = JSON.parse(packedResult.stdout);
   const artifact = packed[0];
   if (packed.length !== 1 || artifact?.filename === undefined) {
     throw new Error('npm pack did not return exactly one package artifact');
   }
   assertPackedFiles(artifact.files ?? []);
-  packedPath = join(projectRoot, artifact.filename);
+  packedPath = join(workspaceRoot, artifact.filename);
 
   const prefix = join(smokeRoot, 'global-prefix');
   await mkdir(prefix);
@@ -166,6 +169,29 @@ try {
   if (version.status !== 0 || version.stdout.trim() !== packageJson.version) {
     throw new Error(
       `globally installed skill-sync --version failed:\n${version.stderr || version.stdout}`,
+    );
+  }
+  const invalid = runInstalled(executable, ['not-a-command'], runtime);
+  if (
+    invalid.status !== 2 ||
+    invalid.stdout !== '' ||
+    !invalid.stderr.includes('unknown command')
+  ) {
+    throw new Error(
+      `globally installed skill-sync usage failure was incorrect:\n${invalid.stderr || invalid.stdout}`,
+    );
+  }
+  const invalidJson = runInstalled(executable, ['--json', 'info'], runtime);
+  const invalidJsonBody = JSON.parse(invalidJson.stdout);
+  if (
+    invalidJson.status !== 2 ||
+    !invalidJson.stderr.includes("missing required argument 'id'") ||
+    invalidJson.stdout.trim().split('\n').length !== 1 ||
+    invalidJsonBody.ok !== false ||
+    invalidJsonBody.errors?.[0]?.code !== 'USAGE_ERROR'
+  ) {
+    throw new Error(
+      `globally installed JSON usage failure was incorrect:\n${invalidJson.stderr || invalidJson.stdout}`,
     );
   }
   verifyInteractiveCancellation(executable, runtime);

@@ -1,62 +1,38 @@
 {
-  "name": "skill-sync",
-  "version": "0.1.0",
-  "description": "Safely manage a Git-backed library of AI skills across Codex, Claude, and project repositories.",
+  "name": "skill-sync-workspace",
+  "version": "0.0.0",
+  "private": true,
   "type": "module",
-  "sideEffects": false,
-  "bin": {
-    "skill-sync": "dist/cli.js"
-  },
-  "files": [
-    "dist",
-    "README.md",
-    "LICENSE"
-  ],
-  "engines": {
-    "node": ">=22"
-  },
-  "scripts": {
-    "clean": "node scripts/clean.mjs",
-    "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint .",
-    "format": "prettier --write src tests scripts .github README.md package.json tsconfig.json tsconfig.build.json vitest.config.ts eslint.config.js .prettierrc.json",
-    "format:check": "prettier --check src tests scripts .github README.md package.json tsconfig.json tsconfig.build.json vitest.config.ts eslint.config.js .prettierrc.json",
-    "test": "vitest run",
-    "test:unit": "vitest run tests/unit",
-    "test:integration": "vitest run tests/integration",
-    "test:e2e": "vitest run tests/e2e",
-    "smoke:pack": "node scripts/smoke-pack.mjs",
-    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run smoke:pack",
-    "prepack": "npm run clean && npm run build",
-    "release:check": "npm run check && npm pack --dry-run",
-    "release:next": "npm version prerelease --preid=next",
-    "publish:dry-run": "npm publish --dry-run"
-  },
-  "keywords": [
-    "ai",
-    "skills",
-    "codex",
-    "claude",
-    "cli",
-    "git"
-  ],
-  "license": "MIT",
-  "publishConfig": {
-    "access": "public",
-    "provenance": true
-  },
   "packageManager": "npm@11.16.0",
-  "dependencies": {
-    "@inquirer/prompts": "^8.5.2",
-    "commander": "^15.0.0",
-    "yaml": "^2.9.0",
-    "zod": "^4.4.3"
+  "workspaces": [
+    "apps/*",
+    "libs/*"
+  ],
+  "scripts": {
+    "clean": "nx run cli:clean",
+    "build": "nx run cli:build",
+    "typecheck": "nx run-many -t typecheck",
+    "lint": "nx run-many -t lint",
+    "format": "prettier --write libs/cli/src libs/cli/tests libs/cli/scripts apps/wiki/src apps/wiki/astro.config.mjs apps/wiki/package.json apps/wiki/project.json apps/wiki/tsconfig.json .github README.md package.json nx.json tsconfig.json tsconfig.base.json libs/cli/package.json libs/cli/project.json libs/cli/tsconfig.json libs/cli/tsconfig.build.json libs/cli/vitest.config.ts eslint.config.js .prettierrc.json",
+    "format:check": "prettier --check libs/cli/src libs/cli/tests libs/cli/scripts apps/wiki/src apps/wiki/astro.config.mjs apps/wiki/package.json apps/wiki/project.json apps/wiki/tsconfig.json .github README.md package.json nx.json tsconfig.json tsconfig.base.json libs/cli/package.json libs/cli/project.json libs/cli/tsconfig.json libs/cli/tsconfig.build.json libs/cli/vitest.config.ts eslint.config.js .prettierrc.json",
+    "test": "nx run cli:test",
+    "test:unit": "nx run cli:test-unit",
+    "test:integration": "nx run cli:test-integration",
+    "test:e2e": "nx run cli:test-e2e",
+    "smoke:pack": "nx run cli:smoke-pack",
+    "wiki:dev": "nx run wiki:serve",
+    "wiki:build": "nx run wiki:build",
+    "wiki:preview": "nx run wiki:preview",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run wiki:build && npm run test && npm run smoke:pack",
+    "release:check": "npm run check && npm pack ./dist/libs/cli --dry-run",
+    "release:next": "npm version prerelease --workspace skill-sync --preid=next",
+    "publish:dry-run": "npm run build && npm publish ./dist/libs/cli --dry-run"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.1.1",
     "eslint": "^10.7.0",
+    "nx": "23.1.0",
     "prettier": "^3.9.5",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.64.0",

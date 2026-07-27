@@ -215,8 +215,35 @@ npm run check
 npm run release:check
 ```
 
-`npm run check` runs formatting, linting, type checking, all tests, and a packed
-CLI smoke test. CI covers Node.js 22 and 24 on Linux, macOS, and Windows and
-uploads the inspected npm tarball. The unscoped `skill-sync` package name was
-unregistered when checked on 2026-07-19; verify it again immediately before the
-first publish.
+This repository is an Nx workspace. The publishable `skill-sync` package is the
+`cli` library under `libs/cli`; builds stage its npm package at
+`dist/libs/cli`. Existing npm scripts remain the stable entry points and route
+project work through Nx. Individual targets can also be run directly:
+
+```sh
+npx nx show project cli
+npx nx build cli
+npx nx test cli
+```
+
+The CLI wiki is the Astro and React application at `apps/wiki`. Run it locally
+or validate its static output through Nx-backed root scripts:
+
+```sh
+npm run wiki:dev
+npm run wiki:build
+npm run wiki:preview
+```
+
+The production wiki is written to `dist/apps/wiki`, separately from the staged
+CLI package. When the public command surface changes, update this README, the
+detailed wiki reference under `apps/wiki/src/content/docs/reference`, and the
+searchable catalog at `apps/wiki/src/data/commands.ts` together.
+
+`npm run check` runs formatting, linting, type checking, the production wiki
+build, all CLI tests, and a packed CLI smoke test. `npm run release:check`
+validates the staged package, and
+`npm run publish:dry-run` performs a dry-run publish from `dist/libs/cli`. CI
+covers Node.js 22 and 24 on Linux, macOS, and Windows and uploads the inspected
+npm tarball. The unscoped `skill-sync` package name was unregistered when
+checked on 2026-07-19; verify it again immediately before the first publish.

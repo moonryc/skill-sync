@@ -1,0 +1,184 @@
+:root {
+  --sl-font:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --sl-font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  --sl-color-accent-low: #073a3b;
+  --sl-color-accent: #2dd4bf;
+  --sl-color-accent-high: #b5fff4;
+  --sl-color-white: #f8fafc;
+  --sl-color-gray-1: #e2e8f0;
+  --sl-color-gray-2: #a8b5c7;
+  --sl-color-gray-3: #718096;
+  --sl-color-gray-4: #3b485d;
+  --sl-color-gray-5: #202a3a;
+  --sl-color-gray-6: #141b28;
+  --sl-color-black: #0a0f1a;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #ccfbf1;
+  --sl-color-accent: #0f766e;
+  --sl-color-accent-high: #134e4a;
+  --sl-color-white: #111827;
+  --sl-color-gray-1: #1f2937;
+  --sl-color-gray-2: #374151;
+  --sl-color-gray-3: #64748b;
+  --sl-color-gray-4: #cbd5e1;
+  --sl-color-gray-5: #e5e7eb;
+  --sl-color-gray-6: #f1f5f9;
+  --sl-color-gray-7: #f8fafc;
+  --sl-color-black: #ffffff;
+}
+
+body {
+  background-image: radial-gradient(
+    circle at 80% -20%,
+    color-mix(in srgb, var(--sl-color-accent) 12%, transparent),
+    transparent 34rem
+  );
+  background-attachment: fixed;
+}
+
+.site-title {
+  font-weight: 800;
+  letter-spacing: -0.04em;
+}
+
+.hero {
+  padding-block: clamp(3rem, 10vw, 7rem);
+}
+
+.hero h1 {
+  max-width: 13ch;
+  font-size: clamp(2.6rem, 8vw, 5.5rem);
+  letter-spacing: -0.065em;
+  line-height: 0.96;
+}
+
+.hero .tagline {
+  max-width: 42rem;
+  font-size: clamp(1rem, 2vw, 1.2rem);
+}
+
+.hero .actions a {
+  border-radius: 999px;
+  font-weight: 700;
+}
+
+.sl-markdown-content h2 {
+  letter-spacing: -0.025em;
+}
+
+.sl-markdown-content a:not([class]) {
+  text-underline-offset: 0.18em;
+}
+
+.sl-markdown-content :is(code, kbd) {
+  border-radius: 0.35rem;
+}
+
+.sl-markdown-content pre {
+  border: 1px solid color-mix(in srgb, var(--sl-color-gray-4) 62%, transparent);
+  border-radius: 0.9rem;
+  box-shadow: 0 18px 55px rgb(0 0 0 / 12%);
+}
+
+.sl-markdown-content > table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-spacing: 0;
+}
+
+.wiki-path-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-block: 2rem 3rem;
+}
+
+.wiki-path {
+  display: grid;
+  min-height: 10rem;
+  align-content: start;
+  gap: 0.65rem;
+  padding: 1.25rem;
+  color: var(--sl-color-text);
+  text-decoration: none;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 1rem;
+  background: color-mix(in srgb, var(--sl-color-black) 86%, transparent);
+  transition:
+    border-color 160ms ease,
+    transform 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.wiki-path:hover {
+  color: var(--sl-color-text);
+  border-color: var(--sl-color-accent);
+  box-shadow: 0 18px 45px rgb(0 0 0 / 12%);
+  transform: translateY(-2px);
+}
+
+.wiki-path:focus-visible {
+  outline: 3px solid var(--sl-color-accent-high);
+  outline-offset: 3px;
+}
+
+.wiki-path-kicker {
+  color: var(--sl-color-accent-high);
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.wiki-path strong {
+  color: var(--sl-color-white);
+  font-size: 1.2rem;
+  letter-spacing: -0.02em;
+}
+
+.wiki-path p {
+  margin: 0;
+  color: var(--sl-color-gray-2);
+  line-height: 1.55;
+}
+
+:root[data-theme='light'] .wiki-path {
+  background: rgb(255 255 255 / 76%);
+}
+
+.wiki-command-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin-block: 1.5rem 2.5rem;
+  padding: 1rem;
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 1rem;
+  background: color-mix(in srgb, var(--sl-color-gray-6) 78%, transparent);
+}
+
+.wiki-command-strip code {
+  padding: 0.45rem 0.65rem;
+  color: var(--sl-color-accent-high);
+  background: var(--sl-color-black);
+}
+
+@media (max-width: 44rem) {
+  .wiki-path-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .wiki-path {
+    min-height: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wiki-path {
+    transition: none;
+  }
+}

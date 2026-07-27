@@ -1,0 +1,61 @@
+---
+title: skill-sync
+description: Keep reusable AI skills organized, versioned, and safely installed across Codex and Claude projects.
+template: splash
+hero:
+  tagline: One Git-backed skill library. Explicit installs. Safe updates across Codex and Claude.
+  actions:
+    - text: Install skill-sync
+      link: /getting-started/installation/
+      icon: right-arrow
+      variant: primary
+    - text: Browse commands
+      link: /reference/
+      icon: open-book
+---
+
+`skill-sync` keeps reusable AI skills in a canonical Git repository and projects selected skills into the tools and repositories where you use them. Every write is validated, conflicts stop instead of overwriting local work, and automation receives deterministic JSON and exit statuses.
+
+<div className="wiki-command-strip" aria-label="Typical skill-sync workflow">
+  <code>init</code>
+  <code>add</code>
+  <code>install</code>
+  <code>status</code>
+  <code>sync</code>
+  <code>publish</code>
+</div>
+
+## Pick your path
+
+<div className="wiki-path-grid">
+  <a className="wiki-path" href="/getting-started/quick-start/">
+    <span className="wiki-path-kicker">New user</span>
+    <strong>Connect a library and install a skill</strong>
+    <p>Go from installation to your first managed Codex and Claude copies.</p>
+  </a>
+  <a className="wiki-path" href="/guides/library-workflows/">
+    <span className="wiki-path-kicker">Library owner</span>
+    <strong>Curate and publish canonical skills</strong>
+    <p>Add skills, organize groups, publish edits, and remove content safely.</p>
+  </a>
+  <a className="wiki-path" href="/operations/conflicts-and-recovery/">
+    <span className="wiki-path-kicker">Operator</span>
+    <strong>Understand drift before changing files</strong>
+    <p>Inspect status, compare content, resolve conflicts, and recover backups.</p>
+  </a>
+  <a className="wiki-path" href="/contributing/development/">
+    <span className="wiki-path-kicker">Contributor</span>
+    <strong>Develop and validate the Nx workspace</strong>
+    <p>Build the CLI and wiki, run focused checks, and inspect release artifacts.</p>
+  </a>
+</div>
+
+## The safety model in one minute
+
+- The library is a normal Git repository, but `skill-sync` treats fetched content as inert data.
+- Installed copies are tracked by exact revision and digest in project metadata.
+- `status` and `diff` make local, canonical, and recorded-base differences visible.
+- Replacing local edits requires explicit destructive intent and confirmation.
+- Canonical writes use a clean exact-revision checkout, a normal commit, and a non-force push.
+
+Start with [installation](/getting-started/installation/) or jump directly to the [complete command reference](/reference/).

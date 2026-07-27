@@ -1,4 +1,6 @@
 node_modules/
+.nx/
+.astro/
 dist/
 coverage/
 *.tgz

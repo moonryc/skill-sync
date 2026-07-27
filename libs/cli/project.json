@@ -1,0 +1,89 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "cli",
+  "projectType": "library",
+  "sourceRoot": "libs/cli/src",
+  "tags": [],
+  "targets": {
+    "clean": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "node libs/cli/scripts/clean.mjs"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["clean"],
+      "cache": true,
+      "inputs": ["production", "{workspaceRoot}/README.md", "{workspaceRoot}/LICENSE"],
+      "outputs": ["{workspaceRoot}/dist/libs/cli"],
+      "options": {
+        "commands": [
+          "tsc -p libs/cli/tsconfig.build.json",
+          "node libs/cli/scripts/stage-package.mjs"
+        ],
+        "parallel": false
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": ["default"],
+      "options": {
+        "command": "tsc --noEmit -p libs/cli/tsconfig.json"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": ["default"],
+      "options": {
+        "command": "eslint eslint.config.js libs/cli"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["build"],
+      "cache": true,
+      "inputs": ["default", "workspaceSkills"],
+      "options": {
+        "command": "vitest run --config libs/cli/vitest.config.ts"
+      }
+    },
+    "test-unit": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": ["default"],
+      "options": {
+        "command": "vitest run --config libs/cli/vitest.config.ts tests/unit"
+      }
+    },
+    "test-integration": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": ["default", "workspaceSkills"],
+      "options": {
+        "command": "vitest run --config libs/cli/vitest.config.ts tests/integration"
+      }
+    },
+    "test-e2e": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["build"],
+      "cache": true,
+      "inputs": ["default"],
+      "options": {
+        "command": "vitest run --config libs/cli/vitest.config.ts tests/e2e"
+      }
+    },
+    "smoke-pack": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["build"],
+      "cache": false,
+      "inputs": ["default"],
+      "options": {
+        "command": "node libs/cli/scripts/smoke-pack.mjs"
+      }
+    }
+  }
+}

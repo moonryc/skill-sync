@@ -1,0 +1,53 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "wiki",
+  "projectType": "application",
+  "sourceRoot": "apps/wiki/src",
+  "tags": ["type:docs"],
+  "targets": {
+    "serve": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "command": "astro dev",
+        "cwd": "apps/wiki"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": ["production"],
+      "outputs": ["{workspaceRoot}/dist/apps/wiki"],
+      "options": {
+        "command": "astro build",
+        "cwd": "apps/wiki"
+      }
+    },
+    "preview": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["build"],
+      "cache": false,
+      "options": {
+        "command": "astro preview",
+        "cwd": "apps/wiki"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": ["default"],
+      "options": {
+        "command": "astro check",
+        "cwd": "apps/wiki"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "cache": true,
+      "inputs": ["default"],
+      "options": {
+        "command": "eslint apps/wiki --max-warnings=0"
+      }
+    }
+  }
+}

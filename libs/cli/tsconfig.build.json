@@ -2,7 +2,7 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": false,
-    "outDir": "dist",
+    "outDir": "../../dist/libs/cli/dist",
     "rootDir": "src",
     "sourceMap": true,
     "declaration": true,
@@ -10,5 +10,5 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["tests", "dist", "coverage", "node_modules"]
+  "exclude": ["tests", "../../dist", "coverage", "../../node_modules"]
 }

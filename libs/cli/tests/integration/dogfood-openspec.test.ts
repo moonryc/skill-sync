@@ -22,7 +22,7 @@ import { readProjectLock, readProjectManifest } from '../../src/infrastructure/p
 import { withTempDirectory } from '../helpers/temp.js';
 
 const execFileAsync = promisify(execFile);
-const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
 
 interface SkillBytes {
   readonly bytes: Buffer;

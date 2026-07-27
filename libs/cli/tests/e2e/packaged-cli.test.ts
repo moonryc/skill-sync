@@ -3,12 +3,13 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { beforeAll, describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'vitest';
 
 import { withTempDirectory } from '../helpers/temp.js';
 
 const projectRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
-const cliPath = join(projectRoot, 'dist', 'cli.js');
+const workspaceRoot = join(projectRoot, '..', '..');
+const cliPath = join(workspaceRoot, 'dist', 'libs', 'cli', 'dist', 'cli.js');
 
 interface ProcessResult {
   readonly status: number | null;
@@ -22,9 +23,11 @@ function execute(
   options: { readonly cwd: string; readonly env?: NodeJS.ProcessEnv },
 ): Promise<ProcessResult> {
   return new Promise((resolvePromise, rejectPromise) => {
+    const environment = { ...process.env, ...options.env };
+    Reflect.deleteProperty(environment, 'FORCE_COLOR');
     const child = spawn(executable, [...arguments_], {
       cwd: options.cwd,
-      env: { ...process.env, ...options.env },
+      env: environment,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -42,12 +45,6 @@ function execute(
     child.once('close', (status) => resolvePromise({ status, stdout, stderr }));
   });
 }
-
-beforeAll(async () => {
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  const result = await execute(npm, ['run', 'build'], { cwd: projectRoot });
-  if (result.status !== 0) throw new Error(result.stderr || result.stdout);
-}, 30_000);
 
 describe('built CLI from unrelated directories', () => {
   it('returns stable help/version and usage statuses', async () => {
