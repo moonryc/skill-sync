@@ -1,0 +1,20 @@
+# The documentation image uses an allowlisted repository-root context.
+*
+
+!package.json
+!package-lock.json
+!nx.json
+!tsconfig.json
+!tsconfig.base.json
+
+!apps/
+apps/*
+!apps/wiki/
+!apps/wiki/**
+
+# npm workspaces require every workspace package manifest during `npm ci`.
+!libs/
+libs/*
+!libs/cli/
+libs/cli/*
+!libs/cli/package.json
