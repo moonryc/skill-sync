@@ -1,5 +1,6 @@
 import { access, lstat, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
 
 export type TargetName = 'codex' | 'claude';
 
@@ -7,9 +8,14 @@ export interface TargetAdapter {
   readonly name: string;
   detect(projectRoot: string): Promise<boolean>;
   relativeDestination(skillLeafName: string): string;
+  readonly globalDestination?: (skillLeafName: string) => string;
 }
 
-function builtInTarget(name: TargetName, rootDirectory: string): TargetAdapter {
+function builtInTarget(
+  name: TargetName,
+  rootDirectory: string,
+  homeDirectory: () => string = homedir,
+): TargetAdapter {
   return {
     name,
     detect: async (projectRoot) => {
@@ -21,6 +27,8 @@ function builtInTarget(name: TargetName, rootDirectory: string): TargetAdapter {
       }
     },
     relativeDestination: (skillLeafName) => join(rootDirectory, 'skills', skillLeafName),
+    globalDestination: (skillLeafName) =>
+      join(homeDirectory(), rootDirectory, 'skills', skillLeafName),
   };
 }
 

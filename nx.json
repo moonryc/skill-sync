@@ -16,9 +16,16 @@
       "{workspaceRoot}/.claude/skills/**/*"
     ],
     "runtimeEnvironment": [
-      { "runtime": "node --version" },
-      { "runtime": "node -p process.platform" },
-      { "runtime": "node -p process.arch" }
+      {
+        "runtime": "node --version"
+      },
+      {
+        "runtime": "node -p process.platform"
+      },
+      {
+        "runtime": "node -p process.arch"
+      }
     ]
-  }
+  },
+  "analytics": false
 }

@@ -410,6 +410,20 @@ export function createWorkflowCommandHandler(
   }
 
   async function projectRoot(invocation: CommandInvocation): Promise<string> {
+    if (invocation.options.global === true && optionString(invocation, 'project') !== undefined) {
+      throw new SkillSyncError(
+        'CONFLICTING_SCOPE_OPTIONS',
+        'Pass either --global or --project, not both.',
+        EXIT_CODES.usage,
+      );
+    }
+    if (invocation.options.global === true) {
+      throw new SkillSyncError(
+        'GLOBAL_SCOPE_NOT_IMPLEMENTED',
+        'Global scope is not yet available for this command.',
+        EXIT_CODES.usage,
+      );
+    }
     const explicitPath = optionString(invocation, 'project');
     return await resolveProjectRoot({
       ...(explicitPath === undefined ? {} : { explicitPath }),

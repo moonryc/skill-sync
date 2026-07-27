@@ -123,6 +123,9 @@ export interface ApplicationPaths {
   readonly journalsDirectory: string;
   readonly locksDirectory: string;
   readonly stateDirectory: string;
+  readonly globalManifestFile?: string;
+  readonly globalLockFile?: string;
+  readonly globalStateDirectory?: string;
 }
 
 export interface ApplicationPathOptions {
@@ -186,6 +189,9 @@ export function resolveApplicationPaths(options: ApplicationPathOptions = {}): A
     journalsDirectory: path.join(stateDirectory, 'journals'),
     locksDirectory: path.join(stateDirectory, 'locks'),
     stateDirectory,
+    globalManifestFile: path.join(stateDirectory, 'global', 'skill-sync.json'),
+    globalLockFile: path.join(stateDirectory, 'global', 'skill-sync.lock.json'),
+    globalStateDirectory: path.join(stateDirectory, 'global'),
   };
 }
 

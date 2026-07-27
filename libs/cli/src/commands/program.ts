@@ -74,6 +74,7 @@ export function createProgram(dependencies: ProgramDependencies): Command {
     .option('--no-input', 'disable interactive prompts')
     .option('--yes', 'confirm ordinary prompts when destructive options are explicit')
     .option('--project <path>', 'override the project root')
+    .option('--global', 'operate on user-level global skills')
     .showHelpAfterError('(run skill-sync --help for usage)');
 
   program.configureOutput({

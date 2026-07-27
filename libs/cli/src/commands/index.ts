@@ -18,6 +18,10 @@ function requestedCommand(argv: readonly string[]): string {
       offset += 2;
       continue;
     }
+    if (argument === '--global') {
+      offset += 1;
+      continue;
+    }
     if (argument?.startsWith('-') === true) {
       offset += 1;
       continue;
