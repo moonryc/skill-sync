@@ -7,7 +7,8 @@ These commands are read-only. `doctor` reports remediation but never performs it
 
 ## `list`
 
-List the grouped canonical catalog.
+List the grouped canonical catalog. Add `--global` to show global installation
+state badges instead of project state badges.
 
 ```text
 skill-sync list [options]
@@ -34,7 +35,8 @@ The result includes validated metadata, canonical revision, digest, compatibilit
 
 ## `status`
 
-Classify every managed project copy.
+Classify every managed project copy. Add `--global` to inspect user-level state
+and absolute user-level destinations.
 
 ```text
 skill-sync status [options]
@@ -48,7 +50,8 @@ Possible states include current, outdated, locally modified, conflicted, missing
 
 ## `diff`
 
-Compare one managed skill with its recorded and canonical state.
+Compare one managed skill with its recorded and canonical state. Add `--global`
+to compare a user-level copy.
 
 ```text
 skill-sync diff <id>
@@ -74,8 +77,9 @@ Run applicable environment and state diagnostics.
 skill-sync doctor [options]
 ```
 
-| Option      | Meaning                                                                      |
-| ----------- | ---------------------------------------------------------------------------- |
-| `--offline` | Skip every remote or authentication check that would require network access. |
+| Option      | Meaning                                                                                                        |
+| ----------- | -------------------------------------------------------------------------------------------------------------- |
+| `--offline` | Skip every remote or authentication check that would require network access.                                   |
+| `--global`  | Validate global manifest, destinations, permissions, locks, journals, and backups without resolving a project. |
 
-Diagnostics cover the Node runtime, Git, GitHub CLI where applicable, authentication, config, cache, library schema, project state, destination safety, locks, journals, and backups. Every check is reported as `pass`, `warning`, `fail`, or `skipped`, with remediation for non-passing results.
+Diagnostics cover the Node runtime, Git, GitHub CLI where applicable, authentication, config, cache, library schema, project state, destination safety, locks, journals, and backups. Human output begins with an overall healthy, attention-needed, or blocked result; identifies scope and offline mode; groups `pass`, `warning`, `fail`, and `skipped` checks; and lists numbered next actions for warnings and failures. It uses semantic colour unless `--no-color` is set. `--json` preserves the structured diagnostic report and exit behavior.

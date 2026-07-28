@@ -5,6 +5,7 @@ import { Command, Option } from 'commander';
 import { resultFromUnknown, type CommandResult } from '../domain/result.js';
 import type { RuntimeIo } from '../ports/index.js';
 import { colorIsEnabled, renderResult } from '../ui/output.js';
+import type { TuiLauncher } from '../ui/tui/types.js';
 
 export interface CommandInvocation {
   readonly command: string;
@@ -17,6 +18,7 @@ export type CommandExecutor = (invocation: CommandInvocation) => Promise<Command
 export interface ProgramDependencies {
   readonly io: RuntimeIo;
   readonly execute: CommandExecutor;
+  readonly tui?: TuiLauncher;
 }
 
 function packageVersion(): string {
@@ -60,6 +62,37 @@ function registerAction(
   });
 }
 
+async function launchTui(
+  dependencies: ProgramDependencies,
+  program: Command,
+  options: Readonly<Record<string, unknown>>,
+  implicit: boolean,
+): Promise<void> {
+  const invocationOptions = { ...options } as Record<string, unknown>;
+  invocationOptions.noInput = invocationOptions.input === false;
+  invocationOptions.color = colorIsEnabled(invocationOptions.color !== false, dependencies.io);
+  try {
+    if (dependencies.tui === undefined) {
+      throw new Error('The interactive terminal UI is unavailable in this runtime.');
+    }
+    await dependencies.tui.launch({ implicit, options: invocationOptions });
+  } catch (error) {
+    renderResult(
+      'tui',
+      resultFromUnknown(error),
+      { json: invocationOptions.json === true, color: invocationOptions.color === true },
+      dependencies.io,
+    );
+  }
+}
+
+export async function launchImplicitTui(
+  dependencies: ProgramDependencies,
+  program: Command,
+): Promise<void> {
+  await launchTui(dependencies, program, program.opts(), true);
+}
+
 function idsCommand(name: string, description: string): Command {
   return new Command(name).description(description).argument('[ids...]', 'qualified skill IDs');
 }
@@ -92,6 +125,12 @@ export function createProgram(dependencies: ProgramDependencies): Command {
   registerAction(init, 'init', dependencies, program);
   program.addCommand(init);
 
+  const tui = new Command('tui').description('Open the interactive skill workflow');
+  tui.action(async () => {
+    await launchTui(dependencies, program, program.opts(), false);
+  });
+  program.addCommand(tui);
+
   const install = idsCommand('install', 'Install skills into this project')
     .option('--target <target>', 'target agent (repeatable)', repeat, [])
     .option('--all', 'select every eligible skill')
@@ -100,6 +139,14 @@ export function createProgram(dependencies: ProgramDependencies): Command {
     .option('--dry-run', 'preview without writes');
   registerAction(install, 'install', dependencies, program);
   program.addCommand(install);
+
+  const adopt = new Command('adopt')
+    .description('Track an exact existing unmanaged skill copy without replacing it')
+    .argument('<id>', 'exact qualified library skill ID')
+    .requiredOption('--target <target>', 'existing target agent containing the skill')
+    .option('--dry-run', 'verify adoption without writing tracking state');
+  registerAction(adopt, 'adopt', dependencies, program);
+  program.addCommand(adopt);
 
   const sync = new Command('sync')
     .description('Refresh every tracked skill from the library')

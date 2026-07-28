@@ -11,6 +11,7 @@
   "scripts": {
     "clean": "nx run cli:clean",
     "build": "nx run cli:build",
+    "dev": "node dist/libs/cli/dist/cli.js",
     "typecheck": "nx run-many -t typecheck",
     "lint": "nx run-many -t lint",
     "format": "prettier --write libs/cli/src libs/cli/tests libs/cli/scripts apps/wiki/src apps/wiki/astro.config.mjs apps/wiki/package.json apps/wiki/project.json apps/wiki/tsconfig.json .github README.md package.json nx.json tsconfig.json tsconfig.base.json libs/cli/package.json libs/cli/project.json libs/cli/tsconfig.json libs/cli/tsconfig.build.json libs/cli/vitest.config.ts eslint.config.js .prettierrc.json",
@@ -25,7 +26,7 @@
     "wiki:preview": "nx run wiki:preview",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm run wiki:build && npm run test && npm run smoke:pack",
     "release:check": "npm run check && npm pack ./dist/libs/cli --dry-run",
-    "release:next": "npm version prerelease --workspace skill-sync --preid=next",
+    "release:next": "npm version prerelease --workspace @moonryc/skill-sync --preid=next",
     "publish:dry-run": "npm run build && npm publish ./dist/libs/cli --dry-run"
   },
   "devDependencies": {

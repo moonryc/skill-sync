@@ -9,6 +9,8 @@ export interface TargetAdapter {
   detect(projectRoot: string): Promise<boolean>;
   relativeDestination(skillLeafName: string): string;
   readonly globalDestination?: (skillLeafName: string) => string;
+  /** The root that bounds global destinations for this target. */
+  readonly globalRoot?: () => string;
 }
 
 function builtInTarget(
@@ -27,6 +29,7 @@ function builtInTarget(
       }
     },
     relativeDestination: (skillLeafName) => join(rootDirectory, 'skills', skillLeafName),
+    globalRoot: () => join(homeDirectory(), rootDirectory),
     globalDestination: (skillLeafName) =>
       join(homeDirectory(), rootDirectory, 'skills', skillLeafName),
   };
@@ -99,5 +102,42 @@ export async function resolveContainedDestination(
   const existingReal = await realpath(existing);
   if (!isWithin(root, existingReal))
     throw new Error(`Target destination crosses an escaping symlink`);
+  return candidate;
+}
+
+/**
+ * Resolve an absolute user-level target destination without permitting it to leave the target
+ * adapter's declared root through lexical traversal or an existing symlink.
+ */
+export async function resolveContainedGlobalDestination(
+  globalRoot: string,
+  destination: string,
+): Promise<string> {
+  if (!isAbsolute(globalRoot) || !isAbsolute(destination)) {
+    throw new Error('Global target roots and destinations must be absolute paths.');
+  }
+  const root = resolve(globalRoot);
+  const candidate = resolve(destination);
+  if (!isWithin(root, candidate) || candidate === root) {
+    throw new Error(`Global target destination escapes its target root: ${destination}`);
+  }
+
+  let realRoot: string;
+  try {
+    const rootInformation = await lstat(root);
+    if (rootInformation.isSymbolicLink()) {
+      throw new Error(`Global target root must not be a symbolic link: ${root}`);
+    }
+    realRoot = await realpath(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return candidate;
+    throw error;
+  }
+
+  const existing = await nearestExisting(candidate);
+  const existingReal = await realpath(existing);
+  if (!isWithin(realRoot, existingReal)) {
+    throw new Error(`Global target destination crosses an escaping symlink: ${destination}`);
+  }
   return candidate;
 }

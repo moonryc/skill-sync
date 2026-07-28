@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use skill-sync"
+  short_description: "Manage Git-backed Codex and Claude skills"
+  default_prompt: "Use $skill-sync to connect a library, inspect skills, install updates, publish changes, or troubleshoot safely."

@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import { success } from '../../src/domain/result.js';
 import type { RuntimeIo } from '../../src/ports/index.js';
-import { createProgram } from '../../src/commands/program.js';
+import { createProgram, launchImplicitTui } from '../../src/commands/program.js';
+import type { TuiLaunchRequest } from '../../src/ui/tui/types.js';
 
 function ioFixture() {
   const state = { stdout: '', stderr: '', exitCode: -1 };
@@ -28,7 +29,9 @@ describe('CLI program', () => {
     const program = createProgram({ io, execute: () => Promise.resolve(success({})) });
     expect(program.commands.map((command) => command.name())).toEqual([
       'init',
+      'tui',
       'install',
+      'adopt',
       'sync',
       'update',
       'add',
@@ -44,6 +47,41 @@ describe('CLI program', () => {
       'library',
       'group',
     ]);
+  });
+
+  it('launches the injected TUI for bare and explicit interactive entry points', async () => {
+    const { io } = ioFixture();
+    const launches: TuiLaunchRequest[] = [];
+    const program = createProgram({
+      io,
+      execute: () => Promise.resolve(success({})),
+      tui: {
+        launch: (request) => {
+          launches.push(request);
+          return Promise.resolve();
+        },
+      },
+    });
+
+    await launchImplicitTui(
+      {
+        io,
+        execute: () => Promise.resolve(success({})),
+        tui: {
+          launch: (request) => {
+            launches.push(request);
+            return Promise.resolve();
+          },
+        },
+      },
+      program,
+    );
+    await program.parseAsync(['node', 'skill-sync', '--project', '/workspace', 'tui']);
+
+    expect(launches).toHaveLength(2);
+    expect(launches[0]?.implicit).toBe(true);
+    expect(launches[1]?.implicit).toBe(false);
+    expect(launches[1]?.options.project).toBe('/workspace');
   });
 
   it('renders one JSON result for a fully specified command', async () => {

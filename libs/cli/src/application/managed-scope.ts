@@ -1,4 +1,8 @@
 import type { ApplicationPaths } from '../infrastructure/config.js';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
+
+import type { ProjectMutationStorage } from './project-installation.js';
 import type { TargetAdapter } from '../targets/index.js';
 
 export type ManagedScope =
@@ -35,5 +39,16 @@ export function globalManagedScope(paths: ApplicationPaths): ManagedScopeDescrip
       }
       return adapter.globalDestination(skillLeafName);
     },
+  };
+}
+
+/** Stable, user-state-local transaction locations for the single global scope. */
+export function globalMutationStorage(paths: ApplicationPaths): ProjectMutationStorage {
+  const scopeKey = createHash('sha256').update('global-skill-scope-v1').digest('hex');
+  return {
+    backupRoot: join(paths.backupsDirectory, 'global'),
+    journalDirectory: join(paths.journalsDirectory, 'global'),
+    lockPath: join(paths.locksDirectory, `global-${scopeKey}.lock`),
+    stagingRoot: join(paths.stateDirectory, 'staging', 'global'),
   };
 }

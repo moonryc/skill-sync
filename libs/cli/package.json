@@ -1,5 +1,5 @@
 {
-  "name": "skill-sync",
+  "name": "@moonryc/skill-sync",
   "version": "0.1.0",
   "description": "Safely manage a Git-backed library of AI skills across Codex, Claude, and project repositories.",
   "type": "module",
@@ -31,7 +31,12 @@
   "dependencies": {
     "@inquirer/prompts": "^8.5.2",
     "commander": "^15.0.0",
+    "ink": "^7.1.1",
+    "react": "^19.2.8",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.17"
   }
 }

@@ -41,6 +41,11 @@ const dispatchCases: readonly DispatchCase[] = [
     options: { dryRun: true, gitignore: false, target: ['codex'] },
   },
   {
+    argv: ['adopt', 'group/one', '--target', 'codex', '--dry-run'],
+    command: 'adopt',
+    options: { dryRun: true, target: 'codex' },
+  },
+  {
     argv: ['sync', '--check', '--offline', '1'.repeat(40)],
     command: 'sync',
     options: { check: true, offline: '1'.repeat(40) },
@@ -100,5 +105,29 @@ describe('program command dispatch', () => {
       dispatchCases.map((entry) => entry.command),
     );
     expect(new Set(seen.map((invocation) => invocation.command)).size).toBe(dispatchCases.length);
+  });
+
+  it('passes the explicit global scope selector to supported commands', async () => {
+    const seen: CommandInvocation[] = [];
+    const program = createProgram({
+      io: memoryIo(),
+      execute: (invocation) => {
+        seen.push(invocation);
+        return Promise.resolve(success({}));
+      },
+    });
+    await program.parseAsync([
+      'node',
+      'skill-sync',
+      '--global',
+      'install',
+      'group/one',
+      '--target',
+      'codex',
+      '--dry-run',
+    ]);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.command).toBe('install');
+    expect(seen[0]?.options).toMatchObject({ dryRun: true, global: true, target: ['codex'] });
   });
 });

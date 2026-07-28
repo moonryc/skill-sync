@@ -9,6 +9,7 @@ import {
   formatDoctorReport,
   runDoctor,
   type DoctorCommandRunner,
+  type DoctorReport,
 } from '../../src/application/doctor.js';
 import { EXIT_CODES } from '../../src/domain/result.js';
 import type { ApplicationPaths } from '../../src/infrastructure/config.js';
@@ -183,7 +184,7 @@ describe('doctor diagnostics', () => {
       ]),
     );
     expect(report.exitCode).toBe(EXIT_CODES.validation);
-    expect(formatDoctorReport(report)).toContain('Remediation:');
+    expect(formatDoctorReport(report)).toContain('Next actions');
   });
 
   it('uses repository status when the only failing check is remote access', async () => {
@@ -214,5 +215,72 @@ describe('doctor diagnostics', () => {
     expect(report.checks.find((check) => check.id === 'cache')).toMatchObject({
       status: 'warning',
     });
+  });
+
+  it('formats a scannable healthy report without ANSI styling by default', () => {
+    const report: DoctorReport = {
+      checks: [
+        { id: 'node', status: 'pass', scope: 'local', message: 'Node.js is ready.' },
+        { id: 'library-access', status: 'pass', scope: 'remote', message: 'Library is reachable.' },
+      ],
+      exitCode: EXIT_CODES.success,
+      offline: false,
+      projectRoot: '/project',
+      scope: 'project' as const,
+    };
+
+    const formatted = formatDoctorReport(report);
+
+    expect(formatted).toContain('skill-sync doctor · Your skill-sync setup looks healthy');
+    expect(formatted).toContain('Scope: project (/project)');
+    expect(formatted).toContain('Remote checks: included');
+    expect(formatted).toContain('\nPASS (2)');
+    expect(formatted).not.toContain('PASS PASS');
+    expect(formatted).toContain('Node.js');
+    expect(formatted).toContain('Library access · remote');
+    expect(formatted).not.toContain('Next actions');
+    expect(formatted).not.toContain('\u001B[');
+  });
+
+  it('formats blocked offline reports with colour and numbered remedies when requested', () => {
+    const report: DoctorReport = {
+      checks: [
+        {
+          id: 'project-state',
+          status: 'fail',
+          scope: 'local',
+          message: 'State is invalid.',
+          remediation: 'Restore the manifest and lock pair.',
+        },
+        {
+          id: 'github-cli',
+          status: 'warning',
+          scope: 'local',
+          message: 'GitHub CLI is unavailable.',
+          remediation: 'Install gh before using init --create.',
+        },
+        {
+          id: 'library-access',
+          status: 'skipped',
+          scope: 'remote',
+          message: 'Skipped while offline.',
+          remediation: 'Run without --offline to check access.',
+        },
+      ],
+      exitCode: EXIT_CODES.validation,
+      offline: true,
+      scope: 'global' as const,
+      globalStateDirectory: '/state/global',
+    };
+
+    const formatted = formatDoctorReport(report, { color: true });
+
+    expect(formatted).toContain('Doctor found blocking issues');
+    expect(formatted).toContain('Scope: global (/state/global)');
+    expect(formatted).toContain('Remote checks: skipped (--offline)');
+    expect(formatted).toContain('Next actions');
+    expect(formatted).toContain('1. Project managed state — Restore the manifest and lock pair.');
+    expect(formatted).toContain('2. GitHub CLI — Install gh before using init --create.');
+    expect(formatted).toContain('\u001B[');
   });
 });

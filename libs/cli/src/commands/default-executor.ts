@@ -42,6 +42,7 @@ export function createDefaultCommandExecutor(
     config,
     doctorRequest: (invocation) => ({
       env: environment,
+      global: invocation.options.global === true,
       offline: invocation.options.offline === true,
       paths,
       ...(typeof invocation.options.project === 'string'

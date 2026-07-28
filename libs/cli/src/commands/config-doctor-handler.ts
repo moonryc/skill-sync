@@ -137,7 +137,15 @@ function configFailure(error: unknown): CommandResult<never> {
 
 function defaultDoctorRequest(invocation: ExtensibleCommandInvocation): DoctorRequest {
   const project = invocation.options.project;
+  if (invocation.options.global === true && typeof project === 'string') {
+    throw new SkillSyncError(
+      'CONFLICTING_SCOPE_OPTIONS',
+      'Pass either --global or --project, not both.',
+      EXIT_CODES.usage,
+    );
+  }
   return {
+    ...(invocation.options.global === true ? { global: true } : {}),
     offline: invocation.options.offline === true,
     ...(typeof project === 'string' ? { project } : {}),
   };
@@ -156,8 +164,12 @@ function normalizedDoctorReport(report: DoctorReport): DoctorReport {
     (check) => check.status === 'fail' && check.scope === 'remote',
   );
   return {
+    ...(report.globalStateDirectory === undefined
+      ? {}
+      : { globalStateDirectory: redactSecrets(report.globalStateDirectory) }),
     offline: report.offline,
     ...(report.projectRoot === undefined ? {} : { projectRoot: redactSecrets(report.projectRoot) }),
+    ...(report.scope === undefined ? {} : { scope: report.scope }),
     checks,
     exitCode: hasLocalFailure
       ? EXIT_CODES.validation
@@ -195,7 +207,6 @@ export function createConfigDoctorCommandHandler(
 ): OptionalCommandHandler {
   const config = dependencies.config ?? new ConfigService();
   const diagnose = dependencies.runDoctor ?? runDoctor;
-  const formatDoctor = dependencies.formatDoctor ?? formatDoctorReport;
   const requestDoctor = dependencies.doctorRequest ?? defaultDoctorRequest;
 
   return async (invocation) => {
@@ -205,7 +216,11 @@ export function createConfigDoctorCommandHandler(
     if (invocation.command === 'doctor') {
       try {
         const report = normalizedDoctorReport(await diagnose(requestDoctor(invocation)));
-        return doctorResult(report, redactSecrets(formatDoctor(report)), json);
+        const humanReport =
+          dependencies.formatDoctor === undefined
+            ? formatDoctorReport(report, { color: invocation.options.color === true })
+            : dependencies.formatDoctor(report);
+        return doctorResult(report, redactSecrets(humanReport), json);
       } catch (error) {
         return resultFromUnknown(error);
       }

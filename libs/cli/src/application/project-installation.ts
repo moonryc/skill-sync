@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import type { CatalogSkillRecord } from './catalog.js';
 import { preflightTargets, type ProjectionPlan } from './target-preflight.js';
 import { inspectRegularFileTree, sha256TreeDigest } from '../domain/digest.js';
+import { validateSkillDirectory } from '../domain/library.js';
 import {
   PROJECT_LOCK_FILENAME,
   PROJECT_LOCK_SCHEMA_VERSION,
@@ -128,6 +129,39 @@ export interface UninstallProjectSkillsOptions {
   readonly storage?: ProjectMutationStorage;
 }
 
+export type ResolvedAdoptSkill = Pick<
+  CatalogSkillRecord,
+  'compatibleAgents' | 'digest' | 'id' | 'name' | 'rootPath'
+>;
+
+export interface AdoptProjectSkillOptions {
+  readonly dryRun?: boolean;
+  readonly libraryIdentity: string;
+  readonly libraryRevision: string;
+  readonly operationId?: string;
+  readonly projectRoot: string;
+  readonly registry?: TargetRegistry;
+  readonly skill: ResolvedAdoptSkill;
+  readonly storage?: ProjectMutationStorage;
+  readonly target: TargetName;
+}
+
+export interface AdoptProjectPlan {
+  readonly applied: boolean;
+  readonly dryRun: boolean;
+  readonly libraryRevision: string;
+  readonly operation: 'adopt';
+  readonly projectRoot: string;
+  readonly skill: {
+    readonly destination: string;
+    readonly digest: string;
+    readonly id: string;
+    readonly target: string;
+  };
+  readonly state: ProjectStatePlan;
+  readonly writes: readonly string[];
+}
+
 interface ProjectStateSnapshot {
   readonly lock: ProjectLock | undefined;
   readonly manifest: ProjectManifest | undefined;
@@ -163,6 +197,13 @@ interface UninstallBuild {
   readonly nextManifest: ProjectManifest;
   readonly plan: UninstallPlan;
   readonly removals: readonly InspectedProjection[];
+}
+
+interface AdoptBuild {
+  readonly backupEntries: readonly { readonly path: string; readonly relativePath: string }[];
+  readonly nextLock: ProjectLock;
+  readonly nextManifest: ProjectManifest;
+  readonly plan: AdoptProjectPlan;
 }
 
 function projectError(
@@ -688,6 +729,243 @@ export async function installProjectSkills(
       kind: 'install',
       operationId,
       replacements,
+      root: build.plan.projectRoot,
+    });
+    return { ...build.plan, applied: true };
+  } finally {
+    if (stagingDirectory !== undefined) {
+      await rm(stagingDirectory, { force: true, recursive: true }).catch(() => undefined);
+    }
+    await advisoryLock.release();
+  }
+}
+
+async function buildAdopt(options: AdoptProjectSkillOptions): Promise<AdoptBuild> {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(options.libraryRevision)) {
+    throw projectError(
+      'INVALID_LIBRARY_REVISION',
+      'The pre-resolved library revision must be a full Git object ID.',
+      EXIT_CODES.validation,
+    );
+  }
+  if (!options.skill.compatibleAgents.includes(options.target)) {
+    throw projectError(
+      'INCOMPATIBLE_TARGET',
+      `${options.skill.id} does not declare compatibility with ${options.target}.`,
+      EXIT_CODES.validation,
+      { id: options.skill.id, target: options.target },
+    );
+  }
+
+  const projectRoot = await realpath(options.projectRoot);
+  const registry = options.registry ?? new TargetRegistry();
+  const adapter = registry.get(options.target);
+  if (adapter === undefined) {
+    throw projectError(
+      'UNKNOWN_TARGET',
+      `Unknown target: ${options.target}.`,
+      EXIT_CODES.validation,
+      { target: options.target },
+    );
+  }
+
+  let destination: string;
+  try {
+    destination = await resolveContainedProjectPath(
+      projectRoot,
+      adapter.relativeDestination(options.skill.name).split(sep).join('/'),
+    );
+  } catch (error) {
+    throw projectError(
+      'UNSAFE_ADOPTION_DESTINATION',
+      error instanceof Error ? error.message : 'The selected target destination is unsafe.',
+      EXIT_CODES.validation,
+      { target: options.target },
+    );
+  }
+  const destinationRelative = portableFromRoot(projectRoot, destination);
+
+  try {
+    const information = await lstat(destination);
+    if (!information.isDirectory() || information.isSymbolicLink()) {
+      throw projectError(
+        'UNMANAGED_SKILL_INVALID',
+        `The ${options.target} skill directory is not a regular directory: ${destinationRelative}.`,
+        EXIT_CODES.validation,
+        { path: destinationRelative, target: options.target },
+      );
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw projectError(
+        'UNMANAGED_SKILL_NOT_FOUND',
+        `No unmanaged ${options.target} skill exists at ${destinationRelative}.`,
+        EXIT_CODES.validation,
+        { path: destinationRelative, target: options.target },
+      );
+    }
+    throw error;
+  }
+
+  await validateResolvedSource(options.skill);
+  const local = await validateSkillDirectory(destination, options.skill.name);
+  if (!local.valid || local.skill === null) {
+    throw projectError(
+      'UNMANAGED_SKILL_INVALID',
+      `The unmanaged ${options.target} skill at ${destinationRelative} is not valid: ${local.errors
+        .map((issue) => issue.message)
+        .join(' ')}`,
+      EXIT_CODES.validation,
+      { path: destinationRelative, target: options.target },
+    );
+  }
+  if (local.skill.digest !== options.skill.digest) {
+    throw projectError(
+      'ADOPTION_DIGEST_MISMATCH',
+      `${destinationRelative} does not exactly match canonical skill ${options.skill.id}; it was left unchanged.`,
+      EXIT_CODES.conflict,
+      { id: options.skill.id, path: destinationRelative, target: options.target },
+    );
+  }
+
+  const snapshot = await readState(projectRoot);
+  assertLibraryIdentity(snapshot, options.libraryIdentity);
+  const desiredById = new Map(snapshot.manifest?.skills.map((skill) => [skill.id, skill]) ?? []);
+  if (desiredById.has(options.skill.id)) {
+    throw projectError(
+      'SKILL_ALREADY_MANAGED',
+      `${options.skill.id} is already managed in this project; use sync or update instead.`,
+      EXIT_CODES.conflict,
+      { id: options.skill.id },
+    );
+  }
+  const existingOwner = trackedDestinations(snapshot.manifest).find(
+    (entry) => entry.target === options.target && entry.path === destinationRelative,
+  );
+  if (existingOwner !== undefined) {
+    throw projectError(
+      'TRACKED_DESTINATION_COLLISION',
+      `${destinationRelative} is already managed by ${existingOwner.skillId}.`,
+      EXIT_CODES.conflict,
+      { id: options.skill.id, owner: existingOwner.skillId, path: destinationRelative },
+    );
+  }
+
+  const nextManifest = canonicalizeProjectManifest(
+    projectManifestSchema.parse({
+      gitignore: snapshot.manifest?.gitignore ?? 'unmanaged',
+      library: { identity: options.libraryIdentity },
+      schemaVersion: PROJECT_MANIFEST_SCHEMA_VERSION,
+      skills: [
+        ...(snapshot.manifest?.skills ?? []),
+        {
+          id: options.skill.id,
+          projections: [{ destination: destinationRelative, target: options.target }],
+        },
+      ],
+    }),
+  );
+  const nextLock = canonicalizeProjectLock(
+    projectLockSchema.parse({
+      library: { identity: options.libraryIdentity, revision: options.libraryRevision },
+      schemaVersion: PROJECT_LOCK_SCHEMA_VERSION,
+      skills: [
+        ...(snapshot.lock?.skills ?? []),
+        {
+          baseDigest: options.skill.digest,
+          canonicalDigest: options.skill.digest,
+          id: options.skill.id,
+          projections: [
+            {
+              destination: destinationRelative,
+              digest: options.skill.digest,
+              target: options.target,
+            },
+          ],
+        },
+      ],
+    }),
+  );
+  const manifestChanged = stateChanged(snapshot.manifest, nextManifest);
+  const lockChanged = stateChanged(snapshot.lock, nextLock);
+  const backupEntries =
+    snapshot.manifest === undefined
+      ? []
+      : [
+          {
+            path: join(projectRoot, PROJECT_MANIFEST_FILENAME),
+            relativePath: PROJECT_MANIFEST_FILENAME,
+          },
+          { path: join(projectRoot, PROJECT_LOCK_FILENAME), relativePath: PROJECT_LOCK_FILENAME },
+        ];
+  return {
+    backupEntries,
+    nextLock,
+    nextManifest,
+    plan: {
+      applied: false,
+      dryRun: options.dryRun === true,
+      libraryRevision: options.libraryRevision,
+      operation: 'adopt',
+      projectRoot,
+      skill: {
+        destination: destinationRelative,
+        digest: options.skill.digest,
+        id: options.skill.id,
+        target: options.target,
+      },
+      state: { lockChanged, manifestChanged },
+      writes: uniqueSorted([
+        ...(manifestChanged ? [PROJECT_MANIFEST_FILENAME] : []),
+        ...(lockChanged ? [PROJECT_LOCK_FILENAME] : []),
+      ]),
+    },
+  };
+}
+
+/** Adopt an exact, validated unmanaged copy without replacing any target files. */
+export async function adoptProjectSkill(
+  options: AdoptProjectSkillOptions,
+): Promise<AdoptProjectPlan> {
+  const initial = await buildAdopt(options);
+  if (options.dryRun === true || initial.plan.writes.length === 0) return initial.plan;
+
+  const storage = requireStorage(options.storage);
+  const operationId = options.operationId ?? `adopt-${randomUUID()}`;
+  const advisoryLock = await acquireAdvisoryLock(storage.lockPath, { operationId });
+  let stagingDirectory: string | undefined;
+  try {
+    const build = await buildAdopt(options);
+    if (build.plan.writes.length === 0) return build.plan;
+    if (build.backupEntries.length > 0) {
+      await createRecoverableBackup({
+        backupRoot: storage.backupRoot,
+        entries: build.backupEntries,
+        operationId,
+        projectRoot: build.plan.projectRoot,
+      });
+    }
+    stagingDirectory = await createStagingDirectory(storage.stagingRoot, operationId);
+    const manifestPath = join(stagingDirectory, PROJECT_MANIFEST_FILENAME);
+    const lockPath = join(stagingDirectory, PROJECT_LOCK_FILENAME);
+    await writeStagedJson(manifestPath, build.nextManifest);
+    await writeStagedJson(lockPath, build.nextLock);
+    await replacePathsAtomically({
+      journalDirectory: storage.journalDirectory,
+      kind: 'adopt',
+      operationId,
+      replacements: [
+        {
+          action: 'replace',
+          destinationPath: join(build.plan.projectRoot, PROJECT_MANIFEST_FILENAME),
+          stagedPath: manifestPath,
+        },
+        {
+          action: 'replace',
+          destinationPath: join(build.plan.projectRoot, PROJECT_LOCK_FILENAME),
+          stagedPath: lockPath,
+        },
+      ],
       root: build.plan.projectRoot,
     });
     return { ...build.plan, applied: true };

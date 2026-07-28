@@ -14,6 +14,10 @@ skill-sync --json --no-input sync --check
 
 JSON mode writes exactly one versioned object and disables prompts. Provide every required selector and choice explicitly, including IDs or `--all`, source targets, destructive intent, and recursion intent.
 
+`skill-sync tui` (and a bare interactive `skill-sync` invocation) intentionally
+does not run with `--json`, `--no-input`, or redirected terminal streams. Use the
+commands in this guide rather than attempting to automate the visual interface.
+
 Use `--no-color` for human-readable logs that must not contain ANSI sequences. Use `--project <path>` to remove current-directory ambiguity.
 
 ## Preview mutations

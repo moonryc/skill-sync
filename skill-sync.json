@@ -1,0 +1,18 @@
+{
+  "gitignore": "managed",
+  "library": {
+    "identity": "github.com/moonryc/dev-skills-sync"
+  },
+  "schemaVersion": 1,
+  "skills": [
+    {
+      "id": "tools/skill-sync",
+      "projections": [
+        {
+          "destination": ".codex/skills/skill-sync",
+          "target": "codex"
+        }
+      ]
+    }
+  ]
+}

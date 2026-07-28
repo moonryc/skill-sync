@@ -7,7 +7,8 @@ import { inspectRecoveryState, recoveryWarningLines } from '../application/recov
 import { EXIT_CODES, failure, redactSecrets } from '../domain/result.js';
 import { renderResult } from '../ui/output.js';
 import { createDefaultCommandExecutor } from './default-executor.js';
-import { createProgram, type CommandExecutor } from './program.js';
+import { createProgram, launchImplicitTui, type CommandExecutor } from './program.js';
+import { createTuiLauncher } from '../ui/tui/runner.js';
 
 function requestedCommand(argv: readonly string[]): string {
   const arguments_ = argv.slice(2);
@@ -49,12 +50,28 @@ export async function runCli(argv: readonly string[], execute?: CommandExecutor)
     const message = error instanceof Error ? error.message : String(error);
     nodeRuntimeIo.writeStderr(`RECOVERY_INSPECTION_FAILED: ${redactSecrets(message)}\n`);
   }
-  const program = createProgram({
+  const commandExecutor = execute ?? createDefaultCommandExecutor(nodeRuntimeIo);
+  const programDependencies = {
     io: nodeRuntimeIo,
-    execute: execute ?? createDefaultCommandExecutor(nodeRuntimeIo),
-  });
+    execute: commandExecutor,
+    tui: createTuiLauncher({ execute: commandExecutor, io: nodeRuntimeIo }),
+  };
+  const program = createProgram(programDependencies);
   overrideProcessExits(program);
   try {
+    const hasBareInvocation =
+      requestedCommand(argv) === 'skill-sync' &&
+      !argv.includes('--help') &&
+      !argv.includes('-h') &&
+      !argv.includes('--version') &&
+      !argv.includes('-V');
+    if (hasBareInvocation) {
+      const parsed = program.parseOptions([...argv.slice(2)]);
+      if (parsed.unknown.length === 0) {
+        await launchImplicitTui(programDependencies, program);
+        return;
+      }
+    }
     await program.parseAsync([...argv]);
   } catch (error) {
     if (error instanceof CommanderError) {

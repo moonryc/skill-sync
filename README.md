@@ -2,8 +2,9 @@
 
 `skill-sync` is a globally installed CLI for keeping reusable AI skills in one
 GitHub repository and projecting selected skills into Codex and Claude project
-folders. The canonical library is grouped, versioned by Git, validated before
-every write, and changed through explicit CLI commands.
+folders or user-level global directories. The canonical library is grouped,
+versioned by Git, validated before every write, and changed through explicit CLI
+commands.
 
 ## Requirements and installation
 
@@ -13,7 +14,7 @@ every write, and changed through explicit CLI commands.
 - Optional: the GitHub CLI (`gh`) for `init --create`
 
 ```sh
-npm install --global skill-sync
+npm install --global @moonryc/skill-sync
 skill-sync --help
 ```
 
@@ -48,6 +49,29 @@ skill-sync install frontend/review-ui --target codex --target claude --gitignore
 Later, pull safe canonical changes with `skill-sync sync`. Use `status` and
 `diff` before deciding whether to discard local changes or publish them.
 
+To make a skill available at user level instead, select the explicit global
+scope. It writes no project metadata and never changes a project's `.gitignore`:
+
+```sh
+skill-sync --global install frontend/review-ui --target codex
+skill-sync --global status
+```
+
+## Interactive workflow
+
+In an interactive terminal, run `skill-sync` with no subcommand—or use the
+explicit `skill-sync tui` command—to open a colorful keyboard-driven command
+center. Browse groups, search skills, select Codex and Claude targets, review
+an install, inspect managed-state badges, and see valid on-disk skills that are
+not tracked by the selected project or global state.
+
+The TUI is read-only until a reviewed install, synchronization, or unmanaged
+skill adoption is confirmed. An adoptable inventory entry requires a separately
+chosen exact qualified library ID and an exact content match; adoption records
+state only and never replaces target files. Viewing an unmanaged skill never
+adopts, overwrites, publishes, or deletes it. Use regular commands for pipes,
+CI, `--json`, `--no-input`, and deterministic offline workflows.
+
 ## Canonical library layout
 
 ```text
@@ -70,15 +94,22 @@ is found. A skill is then a leaf and is identified by its complete path, such as
 Duplicate leaf names may exist in different groups, but an unqualified selector
 works only when it is unambiguous.
 
-Codex copies are installed at `.codex/skills/<leaf-name>` and Claude copies at
-`.claude/skills/<leaf-name>`. The project records intent in `skill-sync.json`
-and exact revisions and digests in `skill-sync.lock.json`.
+Project copies are installed at `.codex/skills/<leaf-name>` and
+`.claude/skills/<leaf-name>`. Global copies use `~/.codex/skills/<leaf-name>`
+and `~/.claude/skills/<leaf-name>` on supported platforms. Projects record
+intent in `skill-sync.json` and exact revisions and digests in
+`skill-sync.lock.json`; global state is stored separately under skill-sync's
+user state directory as `global/skill-sync.json` and
+`global/skill-sync.lock.json`.
 
 ## Commands
 
-Every command accepts `--json`, `--no-color`, `--no-input`, and
-`--project <path>`. JSON mode disables prompts and emits exactly one versioned
-object. In automation, provide every required selector and choice explicitly.
+Every command accepts `--json`, `--no-color`, and `--no-input`. Project-like
+commands also accept `--project <path>` or the mutually exclusive `--global`.
+Global scope is supported by `install`, `adopt`, `sync`, `update`, `status`,
+`diff`, `uninstall`, `list`, `info`, and `doctor`; it is always explicit. JSON mode
+disables prompts and emits exactly one versioned object. In automation, provide
+every required selector and choice explicitly.
 
 ### Library connection and mutation
 
@@ -100,12 +131,14 @@ changes touched content, the command stops instead of overwriting it.
 
 ### Project installation and reconciliation
 
-| Command              | Purpose and important options                                                                                                                        |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `install [ids...]`   | Install selected skills from one library revision. Options: `--all`, repeated `--target codex\|claude`, `--gitignore`/`--no-gitignore`, `--dry-run`. |
-| `sync`               | Pull all safely reconcilable tracked skills. Options: `--check`, `--dry-run`, `--discard-local`, `--offline <full-commit>`.                          |
-| `update [ids...]`    | Pull selected tracked skills. Options: `--all`, `--dry-run`, `--discard-local`, `--offline <full-commit>`. `update --all` is equivalent to `sync`.   |
-| `uninstall [ids...]` | Remove only selected managed project copies. Options: `--all`, `--discard-local`, `--dry-run`.                                                       |
+| Command              | Purpose and important options                                                                                                                                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `tui`                | Open the interactive command center. The same interface starts for a bare interactive `skill-sync` invocation; it is unavailable with `--json` or `--no-input`.                                                                            |
+| `install [ids...]`   | Install selected skills from one library revision. Options: `--all`, repeated `--target codex\|claude`, `--gitignore`/`--no-gitignore`, `--dry-run`. With `--global`, destinations and state are user-level and `.gitignore` is unchanged. |
+| `adopt <id>`         | Track one exact existing unmanaged target copy. Requires `--target codex\|claude`; validates the local directory against the exact qualified canonical ID and writes state only. Option: `--dry-run`; supports `--global`.                 |
+| `sync`               | Pull all safely reconcilable tracked skills. Options: `--check`, `--dry-run`, `--discard-local`, `--offline <full-commit>`. Add `--global` for user-level copies.                                                                          |
+| `update [ids...]`    | Pull selected tracked skills. Options: `--all`, `--dry-run`, `--discard-local`, `--offline <full-commit>`. `update --all` is equivalent to `sync`; add `--global` for user-level copies.                                                   |
+| `uninstall [ids...]` | Remove only selected managed copies. Options: `--all`, `--discard-local`, `--dry-run`; add `--global` for user-level copies.                                                                                                               |
 
 `install` never acts as an update, while `sync` and `update` never publish.
 Destructive replacement requires the explicit `--discard-local` option and a
@@ -121,18 +154,20 @@ reported as current with the remote.
 
 ### Inspection and troubleshooting
 
-| Command                 | Purpose and important options                                                                                                                   |
-| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `list`                  | List grouped catalog entries. Repeatable filters: `--group`, `--query`, `--agent`, `--state`.                                                   |
-| `info <id>`             | Show validated metadata, revision, digest, and file inventory without printing file bodies.                                                     |
-| `status`                | Classify tracked copies as current, outdated, locally modified, conflicted, missing, orphaned, or colliding. Option: `--offline`.               |
-| `diff <id>`             | Show target-specific local/canonical digest changes for one tracked skill.                                                                      |
-| `validate [id-or-path]` | Validate the configured library, a canonical or installed skill, or an explicit local skill directory. Nothing is executed.                     |
-| `doctor`                | Run all applicable runtime, Git, GitHub CLI, authentication, config, cache, schema, project-state, and destination checks. Option: `--offline`. |
+| Command                 | Purpose and important options                                                                                                                                                                                 |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list`                  | List grouped catalog entries. Repeatable filters: `--group`, `--query`, `--agent`, `--state`.                                                                                                                 |
+| `info <id>`             | Show validated metadata, revision, digest, and file inventory without printing file bodies.                                                                                                                   |
+| `status`                | Classify tracked copies as current, outdated, locally modified, conflicted, missing, orphaned, or colliding. Option: `--offline`; add `--global` for user-level state.                                        |
+| `diff <id>`             | Show target-specific local/canonical digest changes for one tracked skill. Add `--global` for user-level state.                                                                                               |
+| `validate [id-or-path]` | Validate the configured library, a canonical or installed skill, or an explicit local skill directory. Nothing is executed.                                                                                   |
+| `doctor`                | Run all applicable runtime, Git, GitHub CLI, authentication, config, cache, schema, state, and destination checks. Its human report groups clear statuses and next actions. Options: `--offline`, `--global`. |
 
-`doctor --offline` performs no network operation. Every diagnostic is reported
-as `pass`, `warning`, `fail`, or `skipped`, with remediation for non-passing
-checks. It never repairs or creates state.
+`doctor --offline` performs no network operation. Its human report identifies
+scope and offline mode, groups `pass`, `warning`, `fail`, and `skipped` checks,
+and lists next actions for warnings and failures. `--no-color` keeps the same
+information without ANSI styling; `--json` retains the structured report. It
+never repairs or creates state.
 
 ### Configuration
 

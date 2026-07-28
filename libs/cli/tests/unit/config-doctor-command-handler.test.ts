@@ -329,9 +329,11 @@ describe('composable config and doctor command handler', () => {
     const human = memoryIo();
     renderResult('doctor', humanResult, { json: false, color: false }, human.io);
     expect(human.state.stdout).toBe('');
-    expect(human.state.stderr).toContain('FAIL project-state: invalid state');
-    expect(human.state.stderr).toContain('PASS git: Git available');
-    expect(human.state.stderr).toContain('Remediation: restore state');
+    expect(human.state.stderr).toContain('Doctor found blocking issues');
+    expect(human.state.stderr).toContain('Project managed state');
+    expect(human.state.stderr).toContain('Git');
+    expect(human.state.stderr).toContain('Next actions');
+    expect(human.state.stderr).toContain('restore state');
     expect(human.state.exitCode).toBe(3);
 
     const jsonResult = await requiredResult(handler, invocation('doctor', [], { json: true }));

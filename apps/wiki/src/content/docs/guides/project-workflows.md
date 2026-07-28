@@ -5,6 +5,45 @@ description: Install, inspect, update, synchronize, and remove managed project c
 
 Run project commands from the destination repository or provide the global `--project <path>` option.
 
+## Use the interactive command center
+
+Run `skill-sync` with no subcommand in an interactive terminal, or run the
+explicit command below:
+
+```sh
+skill-sync tui
+```
+
+The command center groups the catalog, supports search and multi-selection,
+shows managed reconciliation badges, and reports valid Codex/Claude skill
+directories that exist on disk but are not represented by this project's state.
+The inventory is read-only while browsing. An eligible entry can be adopted only
+after choosing an explicit compatible qualified canonical ID and accepting a
+review; the final exact-digest verification writes tracking state only and never
+overwrites the target directory. Install and sync actions always show a review
+and use the normal collision, backup, and local-edit safety rules. `tui` is
+unavailable with redirected streams, `--json`, or `--no-input`; use the commands
+in this guide for automation.
+
+Run `skill-sync --global` or `skill-sync --global tui` to use the same visual
+workflow against user-level state; its inventory then identifies global skills
+that exist on disk but are not globally tracked.
+
+## Adopt an existing exact copy
+
+Use `adopt` when a valid agent target directory already exists and you want to
+track it without replacing it. Supply the exact qualified canonical ID and the
+target containing the local copy:
+
+```sh
+skill-sync adopt frontend/review-ui --target codex --dry-run
+skill-sync adopt frontend/review-ui --target codex
+```
+
+The directory must exactly match the selected canonical skill. A divergent,
+invalid, symlinked, missing, or already-managed path is refused unchanged.
+For user-level copies, add `--global`.
+
 ## Install selected skills
 
 ```sh
@@ -19,6 +58,20 @@ skill-sync install frontend/review-ui \
 Remove `--dry-run` after reviewing the planned destinations. Repeat `--target` for each agent or use configured defaults. `--all` selects every eligible skill. `--gitignore` and `--no-gitignore` explicitly control the project's managed ignore block.
 
 `install` creates new managed copies; it never acts as an update. Existing IDs, path collisions, invalid content, or unsafe destination state stop before writes.
+
+## Install for all projects
+
+Use explicit global scope when the skill belongs in your user-level agent setup:
+
+```sh
+skill-sync --global install frontend/review-ui --target codex --dry-run
+skill-sync --global install frontend/review-ui --target codex
+```
+
+Global copies use `~/.codex/skills/<name>` or `~/.claude/skills/<name>`, with
+separate skill-sync state. They do not create project manifests or manage a
+project `.gitignore`. Add `--global` to `status`, `diff`, `sync`, `update`, or
+`uninstall` to stay in this scope.
 
 ## Check reconciliation state
 

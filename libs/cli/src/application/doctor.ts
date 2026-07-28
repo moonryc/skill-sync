@@ -20,7 +20,13 @@ import {
   readProjectManifest,
   resolveProjectRoot,
 } from '../infrastructure/project-state.js';
-import { TargetRegistry, resolveContainedDestination } from '../targets/index.js';
+import { readGlobalLock, readGlobalManifest } from '../infrastructure/global-state.js';
+import {
+  TargetRegistry,
+  resolveContainedDestination,
+  resolveContainedGlobalDestination,
+} from '../targets/index.js';
+import { globalMutationStorage } from './managed-scope.js';
 
 export type DoctorCheckStatus = 'pass' | 'warning' | 'fail' | 'skipped';
 export type DoctorCheckScope = 'local' | 'remote';
@@ -34,8 +40,10 @@ export interface DoctorCheck {
 }
 
 export interface DoctorReport {
+  readonly globalStateDirectory?: string;
   readonly offline: boolean;
   readonly projectRoot?: string;
+  readonly scope?: 'global' | 'project';
   readonly checks: readonly DoctorCheck[];
   readonly exitCode: ExitCode;
 }
@@ -59,6 +67,7 @@ export type DoctorCommandRunner = (
 export interface DoctorRequest {
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
+  readonly global?: boolean;
   readonly nodeVersion?: string;
   readonly offline?: boolean;
   readonly paths?: ApplicationPaths;
@@ -428,6 +437,136 @@ async function inspectProject(
   return projectRoot;
 }
 
+async function inspectGlobal(
+  request: DoctorRequest,
+  paths: ApplicationPaths,
+  checks: DoctorCheck[],
+): Promise<string> {
+  if (
+    paths.globalStateDirectory === undefined ||
+    paths.globalManifestFile === undefined ||
+    paths.globalLockFile === undefined
+  ) {
+    checks.push(
+      makeCheck(
+        'global-state',
+        'fail',
+        'local',
+        'Global state paths are unavailable.',
+        'Use a supported user configuration location and rerun doctor --global.',
+      ),
+    );
+    return paths.stateDirectory;
+  }
+
+  const stateProblems: string[] = [];
+  let manifest: Awaited<ReturnType<typeof readGlobalManifest>>;
+  let lock: Awaited<ReturnType<typeof readGlobalLock>>;
+  try {
+    manifest = await readGlobalManifest(paths);
+  } catch (error) {
+    stateProblems.push(`manifest: ${errorMessage(error)}`);
+  }
+  try {
+    lock = await readGlobalLock(paths);
+  } catch (error) {
+    stateProblems.push(`lock: ${errorMessage(error)}`);
+  }
+  if (stateProblems.length === 0 && (manifest === undefined) !== (lock === undefined)) {
+    stateProblems.push('Global manifest and lock must either both exist or both be absent.');
+  }
+  if (stateProblems.length === 0 && manifest !== undefined && lock !== undefined) {
+    if (manifest.library.identity !== lock.library.identity) {
+      stateProblems.push('Global manifest and lock reference different libraries.');
+    }
+    const manifestIds = manifest.skills.map((skill) => skill.id).sort();
+    const lockIds = lock.skills.map((skill) => skill.id).sort();
+    if (manifestIds.join('\n') !== lockIds.join('\n')) {
+      stateProblems.push('Global manifest and lock contain different skill IDs.');
+    }
+  }
+  checks.push(
+    stateProblems.length === 0
+      ? makeCheck(
+          'global-state',
+          'pass',
+          'local',
+          manifest === undefined
+            ? `No global skill metadata is present at ${paths.globalStateDirectory}.`
+            : `Global metadata is valid for ${String(manifest.skills.length)} tracked skill(s).`,
+        )
+      : makeCheck(
+          'global-state',
+          'fail',
+          'local',
+          `Global metadata is invalid: ${stateProblems.join(' ')}`,
+          'Correct or restore both global state files before running a mutating command.',
+        ),
+  );
+
+  const targetProblems: string[] = [];
+  for (const target of (request.targets ?? new TargetRegistry()).list()) {
+    try {
+      if (target.globalDestination === undefined || target.globalRoot === undefined) {
+        throw new Error('This target has no supported global destination.');
+      }
+      const destination = await resolveContainedGlobalDestination(
+        target.globalRoot(),
+        target.globalDestination('__doctor__'),
+      );
+      const existing = await nearestExistingPath(destination);
+      await access(existing, constants.W_OK);
+    } catch (error) {
+      targetProblems.push(`${target.name}: ${errorMessage(error)}`);
+    }
+  }
+  checks.push(
+    targetProblems.length === 0
+      ? makeCheck(
+          'global-target-permissions',
+          'pass',
+          'local',
+          'Global Codex and Claude destination ancestors are contained and writable.',
+        )
+      : makeCheck(
+          'global-target-permissions',
+          'fail',
+          'local',
+          `One or more global target destinations are unsafe or not writable: ${targetProblems.join(' ')}`,
+          'Repair destination ownership or remove escaping symlinks before installing global skills.',
+        ),
+  );
+
+  const storage = globalMutationStorage(paths);
+  const recoveryPaths = [storage.lockPath, storage.journalDirectory, storage.backupRoot];
+  const recoveryProblems: string[] = [];
+  for (const path of recoveryPaths) {
+    try {
+      const information = await safeLstat(path);
+      if (information?.isSymbolicLink()) recoveryProblems.push(`${path} is a symbolic link`);
+    } catch (error) {
+      recoveryProblems.push(errorMessage(error));
+    }
+  }
+  checks.push(
+    recoveryProblems.length === 0
+      ? makeCheck(
+          'global-recovery',
+          'pass',
+          'local',
+          'Global lock, journal, and backup locations are safe to use.',
+        )
+      : makeCheck(
+          'global-recovery',
+          'fail',
+          'local',
+          `Global recovery state is unsafe: ${recoveryProblems.join(' ')}`,
+          'Remove unsafe links and inspect any unfinished global operation before retrying.',
+        ),
+  );
+  return paths.globalStateDirectory;
+}
+
 function reportExitCode(checks: readonly DoctorCheck[]): ExitCode {
   if (checks.some((check) => check.status === 'fail' && check.scope === 'local')) {
     return EXIT_CODES.validation;
@@ -438,12 +577,114 @@ function reportExitCode(checks: readonly DoctorCheck[]): ExitCode {
   return EXIT_CODES.success;
 }
 
-export function formatDoctorReport(report: DoctorReport): string {
-  const lines = report.checks.map((check) => {
-    const remediation =
-      check.remediation === undefined ? '' : `\n  Remediation: ${check.remediation}`;
-    return `${check.status.toUpperCase()} ${check.id}: ${check.message}${remediation}`;
-  });
+export interface DoctorReportFormatOptions {
+  readonly color?: boolean;
+}
+
+const CHECK_LABELS: Readonly<Record<string, string>> = {
+  cache: 'Library cache',
+  config: 'Configuration',
+  git: 'Git',
+  'github-auth': 'GitHub authentication',
+  'github-cli': 'GitHub CLI',
+  'global-recovery': 'Global recovery paths',
+  'global-state': 'Global managed state',
+  'global-target-permissions': 'Global target permissions',
+  'library-access': 'Library access',
+  'library-schema': 'Library schema',
+  'library-url': 'Library URL',
+  node: 'Node.js',
+  'project-root': 'Project root',
+  'project-state': 'Project managed state',
+  'target-permissions': 'Target permissions',
+};
+
+const STATUS_ORDER: readonly DoctorCheckStatus[] = ['fail', 'warning', 'skipped', 'pass'];
+
+const STATUS_DETAILS: Readonly<
+  Record<
+    DoctorCheckStatus,
+    { readonly color: number; readonly glyph: string; readonly label: string }
+  >
+> = {
+  fail: { color: 31, glyph: '✕', label: 'BLOCKED' },
+  warning: { color: 33, glyph: '!', label: 'ATTENTION' },
+  skipped: { color: 36, glyph: '•', label: 'SKIPPED' },
+  pass: { color: 32, glyph: '✓', label: 'PASS' },
+};
+
+function colour(value: string, code: number, enabled: boolean): string {
+  return enabled ? `\u001B[${String(code)}m${value}\u001B[0m` : value;
+}
+
+function formattedStatus(status: DoctorCheckStatus, color: boolean): string {
+  const detail = STATUS_DETAILS[status];
+  return color ? colour(detail.glyph, detail.color, true) : detail.label;
+}
+
+function checkLabel(check: DoctorCheck): string {
+  return CHECK_LABELS[check.id] ?? check.id.replaceAll('-', ' ');
+}
+
+function reportScope(report: DoctorReport): string {
+  if (report.scope === 'global') {
+    return `global${report.globalStateDirectory === undefined ? '' : ` (${report.globalStateDirectory})`}`;
+  }
+  if (report.scope === 'project' || report.projectRoot !== undefined) {
+    return `project${report.projectRoot === undefined ? '' : ` (${report.projectRoot})`}`;
+  }
+  return 'current environment';
+}
+
+function overallStatus(checks: readonly DoctorCheck[]): DoctorCheckStatus {
+  if (checks.some((check) => check.status === 'fail')) return 'fail';
+  if (checks.some((check) => check.status === 'warning')) return 'warning';
+  return 'pass';
+}
+
+function overallLabel(status: DoctorCheckStatus): string {
+  if (status === 'fail') return 'Doctor found blocking issues';
+  if (status === 'warning') return 'Doctor found items that need attention';
+  return 'Your skill-sync setup looks healthy';
+}
+
+/** Render the existing structured report for people without changing its JSON contract. */
+export function formatDoctorReport(
+  report: DoctorReport,
+  options: DoctorReportFormatOptions = {},
+): string {
+  const color = options.color === true;
+  const overall = overallStatus(report.checks);
+  const lines = [
+    colour(`skill-sync doctor · ${overallLabel(overall)}`, STATUS_DETAILS[overall].color, color),
+    `Scope: ${reportScope(report)}`,
+    report.offline ? 'Remote checks: skipped (--offline)' : 'Remote checks: included',
+  ];
+
+  for (const status of STATUS_ORDER) {
+    const checks = report.checks.filter((check) => check.status === status);
+    if (checks.length === 0) continue;
+    const heading = color
+      ? `${formattedStatus(status, true)} ${STATUS_DETAILS[status].label}`
+      : STATUS_DETAILS[status].label;
+    lines.push('', `${heading} (${String(checks.length)})`);
+    for (const check of checks) {
+      lines.push(`  ${checkLabel(check)}${check.scope === 'remote' ? ' · remote' : ''}`);
+      lines.push(`    ${check.message}`);
+    }
+  }
+
+  const remediations = report.checks.filter(
+    (check): check is DoctorCheck & { readonly remediation: string } =>
+      (check.status === 'fail' || check.status === 'warning') && check.remediation !== undefined,
+  );
+  if (remediations.length > 0) {
+    lines.push('', colour('Next actions', 35, color));
+    for (const [index, check] of remediations.entries()) {
+      lines.push(`${String(index + 1)}. ${checkLabel(check)} — ${check.remediation}`);
+    }
+  }
+
   return lines.join('\n');
 }
 
@@ -750,10 +991,14 @@ export async function runDoctor(request: DoctorRequest = {}): Promise<DoctorRepo
     }
   }
 
-  const projectRoot = await inspectProject(request, checks);
+  const globalStateDirectory =
+    request.global === true ? await inspectGlobal(request, paths, checks) : undefined;
+  const projectRoot = request.global === true ? undefined : await inspectProject(request, checks);
   return {
     offline,
+    ...(globalStateDirectory === undefined ? {} : { globalStateDirectory }),
     ...(projectRoot === undefined ? {} : { projectRoot }),
+    scope: request.global === true ? 'global' : 'project',
     checks,
     exitCode: reportExitCode(checks),
   };

@@ -7,21 +7,31 @@ description: Control project context and output, and manage non-secret user defa
 
 Global options apply to every command. Place them before the command name in examples and automation for unambiguous parsing.
 
-| Option             | Meaning                                                                               |
-| ------------------ | ------------------------------------------------------------------------------------- |
-| `-V`, `--version`  | Print the installed package version.                                                  |
-| `--json`           | Emit exactly one versioned machine-readable JSON object.                              |
-| `--no-color`       | Disable ANSI styling.                                                                 |
-| `--no-input`       | Disable interactive prompts; missing required choices fail instead.                   |
-| `--yes`            | Answer ordinary confirmations only after any required destructive option is explicit. |
-| `--project <path>` | Override project-root discovery.                                                      |
-| `-h`, `--help`     | Display help for the selected command.                                                |
+| Option             | Meaning                                                                                                                                                                                       |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-V`, `--version`  | Print the installed package version.                                                                                                                                                          |
+| `--json`           | Emit exactly one versioned machine-readable JSON object.                                                                                                                                      |
+| `--no-color`       | Disable ANSI styling.                                                                                                                                                                         |
+| `--no-input`       | Disable interactive prompts; missing required choices fail instead.                                                                                                                           |
+| `--yes`            | Answer ordinary confirmations only after any required destructive option is explicit.                                                                                                         |
+| `--project <path>` | Override project-root discovery.                                                                                                                                                              |
+| `--global`         | Select user-level skill state and Codex/Claude destinations. Mutually exclusive with `--project`; supported by install, adopt, sync, update, status, diff, uninstall, list, info, and doctor. |
+| `-h`, `--help`     | Display help for the selected command.                                                                                                                                                        |
 
 JSON mode also disables prompts. Automation must provide selectors, source targets, overwrite intent, recursion intent, and other required choices explicitly.
 
+The interactive `tui` command (and a bare interactive invocation) requires a
+terminal and rejects `--json` and `--no-input`; it is not an automation surface.
+
 ```sh
 skill-sync --json --no-input --project /workspace status
+skill-sync --json --no-input --global status
 ```
+
+Global scope is always explicit. It stores its manifest and lock in the active
+skill-sync user state directory under `global/`, not in `~/.codex` or
+`~/.claude`. Global target destinations are `~/.codex/skills/<name>` and
+`~/.claude/skills/<name>`.
 
 ## Precedence
 

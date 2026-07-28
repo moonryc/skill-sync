@@ -131,7 +131,7 @@ try {
   const installedPackageRoot = join(
     prefix,
     process.platform === 'win32' ? 'node_modules' : 'lib/node_modules',
-    'skill-sync',
+    ...artifact.name.split('/'),
   );
   const packageJson = JSON.parse(
     await readFile(join(installedPackageRoot, 'package.json'), 'utf8'),

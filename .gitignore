@@ -5,3 +5,7 @@ dist/
 coverage/
 *.tgz
 .DS_Store
+
+# >>> skill-sync managed skills >>>
+/.codex/skills/skill-sync/
+# <<< skill-sync managed skills <<<

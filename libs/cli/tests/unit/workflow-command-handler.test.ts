@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
@@ -316,6 +316,52 @@ function invocation(
 }
 
 describe('workflow command handler', () => {
+  it('adopts only an explicit exact catalog ID and leaves the target bytes in place', async () => {
+    await withTempDirectory('skill-sync-workflow-adopt-', async (root) => {
+      const library = await createLibrary(root);
+      const project = join(root, 'project');
+      const destination = join(project, '.codex', 'skills', 'hello');
+      await mkdir(project);
+      await cp(join(library, 'skills', 'examples', 'hello'), destination, { recursive: true });
+      const before = await readFile(join(destination, 'SKILL.md'));
+      const fixture = handlerFixture(
+        root,
+        await snapshot(library, secondRevision),
+        cacheRevision(library, secondRevision),
+      );
+
+      const adopted = await fixture.handler(
+        invocation('adopt', ['examples/hello'], {
+          json: true,
+          noInput: true,
+          project,
+          target: 'codex',
+          yes: true,
+        }),
+      );
+
+      expect(adopted).toMatchObject({
+        data: {
+          applied: true,
+          operation: 'adopt',
+          skill: { id: 'examples/hello', target: 'codex' },
+        },
+        ok: true,
+      });
+      expect(await readFile(join(destination, 'SKILL.md'))).toEqual(before);
+      expect(await readFile(join(project, 'skill-sync.json'), 'utf8')).toContain('examples/hello');
+
+      const unknown = await fixture.handler(
+        invocation('adopt', ['hello'], { json: true, noInput: true, project, target: 'codex' }),
+      );
+      expect(unknown).toMatchObject({
+        errors: [{ code: 'UNKNOWN_SKILL_ID' }],
+        exitCode: EXIT_CODES.validation,
+        ok: false,
+      });
+    });
+  });
+
   it('uses only a verified cache snapshot for install dry-run and resolves aliases atomically', async () => {
     await withTempDirectory('skill-sync-workflow-install-', async (root) => {
       const library = await createLibrary(root);

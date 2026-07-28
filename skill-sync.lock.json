@@ -1,0 +1,21 @@
+{
+  "library": {
+    "identity": "github.com/moonryc/dev-skills-sync",
+    "revision": "87a9b29ce35d8a89ad82e5242522fe55eb9833bb"
+  },
+  "schemaVersion": 1,
+  "skills": [
+    {
+      "baseDigest": "304528562ab60e38a9ca453437fab6ee75aafc990cfcf8446f887409749b314c",
+      "canonicalDigest": "304528562ab60e38a9ca453437fab6ee75aafc990cfcf8446f887409749b314c",
+      "id": "tools/skill-sync",
+      "projections": [
+        {
+          "destination": ".codex/skills/skill-sync",
+          "digest": "304528562ab60e38a9ca453437fab6ee75aafc990cfcf8446f887409749b314c",
+          "target": "codex"
+        }
+      ]
+    }
+  ]
+}

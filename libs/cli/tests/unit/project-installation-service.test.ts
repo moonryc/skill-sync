@@ -1,9 +1,10 @@
-import { mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
 import {
+  adoptProjectSkill,
   installProjectSkills,
   uninstallProjectSkills,
   type ProjectMutationStorage,
@@ -66,6 +67,144 @@ async function expectSkillSyncError(
 }
 
 describe('project installation application service', () => {
+  it('adopts an exact unmanaged copy without rewriting it or .gitignore', async () => {
+    await withTempDirectory('skill-sync-adopt-project-', async (root) => {
+      const project = join(root, 'project');
+      await mkdir(project);
+      const skill = await createResolvedSkill(root);
+      const destination = join(project, '.codex', 'skills', 'review-ui');
+      await mkdir(join(destination, 'assets'), { recursive: true });
+      await copyFile(join(skill.rootPath, 'SKILL.md'), join(destination, 'SKILL.md'));
+      await copyFile(
+        join(skill.rootPath, 'assets', 'notes.txt'),
+        join(destination, 'assets', 'notes.txt'),
+      );
+      const before = {
+        bytes: await readFile(join(destination, 'SKILL.md')),
+        modified: await stat(join(destination, 'SKILL.md')),
+      };
+
+      const adopted = await adoptProjectSkill({
+        libraryIdentity,
+        libraryRevision: firstRevision,
+        operationId: 'adopt-review-ui',
+        projectRoot: project,
+        skill: { ...skill, compatibleAgents: ['codex'] },
+        storage: storage(root),
+        target: 'codex',
+      });
+
+      expect(adopted).toMatchObject({ applied: true, operation: 'adopt' });
+      expect(adopted.writes).toEqual(['skill-sync.json', 'skill-sync.lock.json']);
+      expect(await readFile(join(destination, 'SKILL.md'))).toEqual(before.bytes);
+      expect((await stat(join(destination, 'SKILL.md'))).mtimeMs).toBe(before.modified.mtimeMs);
+      expect(
+        await readFile(join(project, '.gitignore'), 'utf8').catch(() => undefined),
+      ).toBeUndefined();
+      expect(await readProjectManifest(project)).toMatchObject({
+        skills: [
+          {
+            id: skill.id,
+            projections: [{ destination: '.codex/skills/review-ui', target: 'codex' }],
+          },
+        ],
+      });
+      expect(await readProjectLock(project)).toMatchObject({
+        library: { revision: firstRevision },
+        skills: [expect.objectContaining({ canonicalDigest: skill.digest, id: skill.id })],
+      });
+    });
+  });
+
+  it('preserves existing managed entries while adopting one new exact projection', async () => {
+    await withTempDirectory('skill-sync-adopt-preserve-', async (root) => {
+      const project = join(root, 'project');
+      await mkdir(project);
+      const existing = await createResolvedSkill(root, 'frontend/review-ui');
+      const adopted = await createResolvedSkill(root, 'backend/plan');
+      await installProjectSkills({
+        libraryIdentity,
+        libraryRevision: firstRevision,
+        operationId: 'install-existing',
+        projectRoot: project,
+        skills: [existing],
+        storage: storage(root),
+        targets: ['codex'],
+      });
+      const destination = join(project, '.codex', 'skills', 'plan');
+      await mkdir(join(destination, 'assets'), { recursive: true });
+      await copyFile(join(adopted.rootPath, 'SKILL.md'), join(destination, 'SKILL.md'));
+      await copyFile(
+        join(adopted.rootPath, 'assets', 'notes.txt'),
+        join(destination, 'assets', 'notes.txt'),
+      );
+
+      await adoptProjectSkill({
+        libraryIdentity,
+        libraryRevision: secondRevision,
+        operationId: 'adopt-plan',
+        projectRoot: project,
+        skill: { ...adopted, compatibleAgents: ['codex'] },
+        storage: storage(root),
+        target: 'codex',
+      });
+
+      expect((await readProjectManifest(project))?.skills.map((skill) => skill.id)).toEqual([
+        'backend/plan',
+        'frontend/review-ui',
+      ]);
+      expect((await readProjectLock(project))?.skills.map((skill) => skill.id)).toEqual([
+        'backend/plan',
+        'frontend/review-ui',
+      ]);
+      expect(await sha256TreeDigest(join(project, '.codex', 'skills', 'review-ui'))).toBe(
+        existing.digest,
+      );
+      expect(await sha256TreeDigest(destination)).toBe(adopted.digest);
+    });
+  });
+
+  it('refuses divergent and unreliable unmanaged adoption without changing the target or state', async () => {
+    await withTempDirectory('skill-sync-adopt-refuse-', async (root) => {
+      const project = join(root, 'project');
+      await mkdir(project);
+      const skill = await createResolvedSkill(root);
+      const destination = join(project, '.codex', 'skills', 'review-ui');
+      await mkdir(destination, { recursive: true });
+      await writeFile(
+        join(destination, 'SKILL.md'),
+        '---\nname: review-ui\ndescription: Different local skill\n---\n\n# Different\n',
+      );
+      const original = await readFile(join(destination, 'SKILL.md'), 'utf8');
+      const common = {
+        libraryIdentity,
+        libraryRevision: firstRevision,
+        projectRoot: project,
+        skill: { ...skill, compatibleAgents: ['codex'] },
+        storage: storage(root),
+        target: 'codex' as const,
+      };
+
+      await expectSkillSyncError(adoptProjectSkill(common), 'ADOPTION_DIGEST_MISMATCH');
+      expect(await readFile(join(destination, 'SKILL.md'), 'utf8')).toBe(original);
+      expect(await readProjectManifest(project)).toBeUndefined();
+      expect(await readProjectLock(project)).toBeUndefined();
+
+      await copyFile(join(skill.rootPath, 'SKILL.md'), join(destination, 'SKILL.md'));
+      await mkdir(join(destination, 'assets'), { recursive: true });
+      await copyFile(
+        join(skill.rootPath, 'assets', 'notes.txt'),
+        join(destination, 'assets', 'notes.txt'),
+      );
+      await writeFile(join(project, 'skill-sync.json'), '{invalid\n');
+      await expect(adoptProjectSkill(common)).rejects.toBeInstanceOf(SyntaxError);
+      expect(await readFile(join(destination, 'SKILL.md'), 'utf8')).toBe(
+        await readFile(join(skill.rootPath, 'SKILL.md'), 'utf8'),
+      );
+      expect(await readProjectLock(project)).toBeUndefined();
+    });
+  });
+
   it('installs one canonical revision identically into multiple targets and tracks one skill', async () => {
     await withTempDirectory('skill-sync-install-service-', async (root) => {
       const project = join(root, 'project');

@@ -1,13 +1,25 @@
 import { mkdir, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
 import { preflightTargets } from '../../src/application/target-preflight.js';
-import { TargetRegistry } from '../../src/targets/index.js';
+import { claudeTarget, codexTarget, TargetRegistry } from '../../src/targets/index.js';
 import { withTempDirectory } from '../helpers/temp.js';
 
 describe('target adapters and preflight', () => {
+  it('resolves built-in global destinations from the current platform home directory', () => {
+    expect(codexTarget.globalRoot?.()).toBe(join(homedir(), '.codex'));
+    expect(codexTarget.globalDestination?.('review-ui')).toBe(
+      join(homedir(), '.codex', 'skills', 'review-ui'),
+    );
+    expect(claudeTarget.globalRoot?.()).toBe(join(homedir(), '.claude'));
+    expect(claudeTarget.globalDestination?.('review-ui')).toBe(
+      join(homedir(), '.claude', 'skills', 'review-ui'),
+    );
+  });
+
   it('detects Codex and Claude and maps portable destinations', async () =>
     withTempDirectory('skill-sync-target-', async (root) => {
       await mkdir(join(root, '.codex'));

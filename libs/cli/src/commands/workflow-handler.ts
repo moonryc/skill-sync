@@ -12,9 +12,23 @@ import {
 } from '../application/library-lifecycle.js';
 import type { LibraryLifecycleService } from '../application/library-lifecycle.js';
 import {
+  adoptProjectSkill,
   installProjectSkills,
   uninstallProjectSkills,
 } from '../application/project-installation.js';
+import {
+  adoptGlobalSkill,
+  formatGlobalDiffHuman,
+  formatGlobalReconciliationHuman,
+  formatGlobalStatusHuman,
+  installGlobalSkills,
+  inspectGlobalDiff,
+  inspectGlobalStatus,
+  syncGlobalSkills,
+  uninstallGlobalSkills,
+  updateGlobalSkills,
+  type GlobalReconciliationReport,
+} from '../application/global-skill-management.js';
 import {
   CachedLibraryRevisionProvider,
   formatProjectDiffHuman,
@@ -28,6 +42,7 @@ import {
   type ProjectReconciliationReport,
   type ResolvedLibraryRevision,
 } from '../application/project-reconciliation.js';
+import { globalMutationStorage } from '../application/managed-scope.js';
 import { projectMutationStorage } from '../application/project-storage.js';
 import {
   formatCatalogListHuman,
@@ -50,6 +65,7 @@ import {
 } from '../domain/result.js';
 import type { ProjectManifest } from '../domain/project-state.js';
 import type { ApplicationPaths } from '../infrastructure/config.js';
+import { readGlobalLock, readGlobalManifest } from '../infrastructure/global-state.js';
 import { GitExecutionError, GitRemoteUrlError, normalizeGitRemote } from '../infrastructure/git.js';
 import type { GitClient } from '../infrastructure/git.js';
 import { LibraryCacheError } from '../infrastructure/library-cache.js';
@@ -97,6 +113,7 @@ interface LibraryConnection {
 interface CatalogContext {
   readonly catalog: CatalogScanResult;
   readonly projectRoot: string;
+  readonly scope: 'global' | 'project';
   readonly snapshot: ValidatedLibrarySnapshot;
 }
 
@@ -316,10 +333,13 @@ function validationResult(result: ReadOnlyValidationResult, json: boolean): Comm
 }
 
 export function reconciliationResult(
-  report: ProjectReconciliationReport,
+  report: ProjectReconciliationReport | GlobalReconciliationReport,
   json: boolean,
 ): CommandResult<unknown> {
-  const human = formatProjectReconciliationHuman(report);
+  const human =
+    'scope' in report
+      ? formatGlobalReconciliationHuman(report)
+      : formatProjectReconciliationHuman(report);
   if (report.exitCode === EXIT_CODES.success) return success(json ? report : human);
   const code =
     report.exitCode === EXIT_CODES.partial
@@ -409,7 +429,7 @@ export function createWorkflowCommandHandler(
     };
   }
 
-  async function projectRoot(invocation: CommandInvocation): Promise<string> {
+  function globalRequested(invocation: CommandInvocation): boolean {
     if (invocation.options.global === true && optionString(invocation, 'project') !== undefined) {
       throw new SkillSyncError(
         'CONFLICTING_SCOPE_OPTIONS',
@@ -417,10 +437,14 @@ export function createWorkflowCommandHandler(
         EXIT_CODES.usage,
       );
     }
-    if (invocation.options.global === true) {
+    return invocation.options.global === true;
+  }
+
+  async function projectRoot(invocation: CommandInvocation): Promise<string> {
+    if (globalRequested(invocation)) {
       throw new SkillSyncError(
-        'GLOBAL_SCOPE_NOT_IMPLEMENTED',
-        'Global scope is not yet available for this command.',
+        'GLOBAL_SCOPE_UNSUPPORTED',
+        `Global scope is not supported by ${invocation.command}. Use --global with install, adopt, sync, update, status, diff, uninstall, list, info, or doctor.`,
         EXIT_CODES.usage,
       );
     }
@@ -453,12 +477,51 @@ export function createWorkflowCommandHandler(
     return Object.fromEntries(report.skills.map((skill) => [skill.id, skill.state]));
   }
 
+  async function globalInstallationStates(
+    snapshot: ValidatedLibrarySnapshot,
+  ): Promise<Readonly<Partial<Record<string, CatalogInstallationState>>>> {
+    const [manifest, lock] = await Promise.all([
+      readGlobalManifest(dependencies.paths),
+      readGlobalLock(dependencies.paths),
+    ]);
+    if (manifest === undefined && lock === undefined) return {};
+    const provider: LibraryRevisionProvider = {
+      resolve: () =>
+        Promise.resolve({
+          branch: snapshot.branch,
+          freshness: snapshot.freshness,
+          identity: snapshot.identity,
+          libraryRoot: snapshot.rootPath,
+          refreshedAt: '1970-01-01T00:00:00.000Z',
+          revision: snapshot.revision,
+          stale: snapshot.stale,
+          usableForMutation: !snapshot.stale,
+        }),
+    };
+    const report = await inspectGlobalStatus({
+      library: provider,
+      paths: dependencies.paths,
+      registry,
+    });
+    return Object.fromEntries(report.skills.map((skill) => [skill.id, skill.state]));
+  }
+
   async function withCatalog<T>(
     invocation: CommandInvocation,
     options: { readonly allowStale?: boolean; readonly cacheOnly?: boolean },
     consume: (context: CatalogContext) => Promise<T> | T,
   ): Promise<T> {
-    const selectedProjectRoot = await projectRoot(invocation);
+    const global = globalRequested(invocation);
+    const selectedProjectRoot = global
+      ? dependencies.paths.globalStateDirectory
+      : await projectRoot(invocation);
+    if (selectedProjectRoot === undefined) {
+      throw new SkillSyncError(
+        'GLOBAL_STATE_UNAVAILABLE',
+        'Global skill state paths are unavailable.',
+        EXIT_CODES.validation,
+      );
+    }
     const selectedConnection = await connection();
     return await dependencies.lifecycle.withValidatedLibrary(
       {
@@ -468,13 +531,16 @@ export function createWorkflowCommandHandler(
         ...(options.cacheOnly === undefined ? {} : { cacheOnly: options.cacheOnly }),
       },
       async (snapshot) => {
-        const installationStates = await projectInstallationStates(selectedProjectRoot, snapshot);
+        const installationStates = global
+          ? await globalInstallationStates(snapshot)
+          : await projectInstallationStates(selectedProjectRoot, snapshot);
         return await consume({
           catalog: catalogFromValidatedLibrary(snapshot.library, {
             installationStates,
             sourceRevision: snapshot.revision,
           }),
           projectRoot: selectedProjectRoot,
+          scope: global ? 'global' : 'project',
           snapshot,
         });
       },
@@ -504,9 +570,14 @@ export function createWorkflowCommandHandler(
       return [...listing.effective.value.defaultTargets].sort();
     }
 
-    const detected = new Set(await registry.detect(root));
+    const global = globalRequested(invocation);
+    const detected = global ? new Set<string>() : new Set(await registry.detect(root));
     const choices = registry.list().map((target) => ({
-      name: detected.has(target.name) ? `${target.name} (detected)` : target.name,
+      name: global
+        ? `${target.name} (global)`
+        : detected.has(target.name)
+          ? `${target.name} (detected)`
+          : target.name,
       value: target.name,
     }));
     const values = await prompt.selectMany('Select installation targets', choices);
@@ -594,7 +665,7 @@ export function createWorkflowCommandHandler(
   }
 
   async function handleList(invocation: CommandInvocation): Promise<CommandResult<unknown>> {
-    return await withCatalog(invocation, { allowStale: true }, ({ catalog, snapshot }) => {
+    return await withCatalog(invocation, { allowStale: true }, ({ catalog, scope, snapshot }) => {
       const result = listCatalog(catalog, {
         groups: optionStrings(invocation, 'group'),
         queries: optionStrings(invocation, 'query'),
@@ -615,6 +686,7 @@ export function createWorkflowCommandHandler(
           branch: snapshot.branch,
           freshness: snapshot.freshness,
           revision: snapshot.revision,
+          scope,
           stale: snapshot.stale,
           skills: result.items,
         });
@@ -622,13 +694,15 @@ export function createWorkflowCommandHandler(
       const warning = snapshot.stale
         ? `Warning: using ${snapshot.freshness}; this catalog is not current with the remote.\n`
         : '';
-      return success(`${warning}${formatCatalogListHuman(result.items)}`);
+      return success(
+        `${scope === 'global' ? 'Scope: global\n' : ''}${warning}${formatCatalogListHuman(result.items)}`,
+      );
     });
   }
 
   async function handleInfo(invocation: CommandInvocation): Promise<CommandResult<unknown>> {
     const selector = argumentString(invocation, 0, 'skill ID');
-    return await withCatalog(invocation, { allowStale: true }, ({ catalog, snapshot }) => {
+    return await withCatalog(invocation, { allowStale: true }, ({ catalog, scope, snapshot }) => {
       const result = getCatalogSkillInfo(catalog, selector);
       if (!result.ok) {
         return reportFailure(
@@ -641,8 +715,8 @@ export function createWorkflowCommandHandler(
       }
       return success(
         jsonRequested(invocation)
-          ? { ...result.info, freshness: snapshot.freshness, stale: snapshot.stale }
-          : formatCatalogSkillInfoHuman(result.info),
+          ? { ...result.info, freshness: snapshot.freshness, scope, stale: snapshot.stale }
+          : `${scope === 'global' ? 'Scope: global\n' : ''}${formatCatalogSkillInfoHuman(result.info)}`,
       );
     });
   }
@@ -708,7 +782,7 @@ export function createWorkflowCommandHandler(
     return await withCatalog(
       invocation,
       dryRun ? { cacheOnly: true } : {},
-      async ({ catalog, projectRoot: root, snapshot }) => {
+      async ({ catalog, projectRoot: root, scope, snapshot }) => {
         const selected = await selectCandidates(catalog.records, selectors, all, prompt, 'install');
         if (selected.length === 0) return noSelectionResult('install');
         const targets = await selectedTargets(invocation, root, prompt);
@@ -724,23 +798,93 @@ export function createWorkflowCommandHandler(
             EXIT_CODES.validation,
           );
         }
-        const gitignore = await gitignorePolicy(invocation, prompt);
-        const plan = await installProjectSkills({
-          dryRun,
-          gitignore,
-          libraryIdentity: snapshot.identity,
-          libraryRevision: snapshot.revision,
-          projectRoot: root,
-          registry,
-          skills: selected,
-          ...(dryRun ? {} : { storage: projectMutationStorage(dependencies.paths, root) }),
-          targets,
-        });
+        const plan =
+          scope === 'global'
+            ? await installGlobalSkills({
+                dryRun,
+                libraryIdentity: snapshot.identity,
+                libraryRevision: snapshot.revision,
+                paths: dependencies.paths,
+                registry,
+                skills: selected,
+                ...(dryRun ? {} : { storage: globalMutationStorage(dependencies.paths) }),
+                targets,
+              })
+            : await installProjectSkills({
+                dryRun,
+                gitignore: await gitignorePolicy(invocation, prompt),
+                libraryIdentity: snapshot.identity,
+                libraryRevision: snapshot.revision,
+                projectRoot: root,
+                registry,
+                skills: selected,
+                ...(dryRun ? {} : { storage: projectMutationStorage(dependencies.paths, root) }),
+                targets,
+              });
         return success({
           ...plan,
           freshness: snapshot.freshness,
+          scope,
           stale: snapshot.stale,
         });
+      },
+    );
+  }
+
+  async function handleAdopt(invocation: CommandInvocation): Promise<CommandResult<unknown>> {
+    const id = argumentString(invocation, 0, 'exact qualified skill ID');
+    const rawTarget = optionString(invocation, 'target');
+    if (rawTarget === undefined) {
+      throw new SkillSyncError(
+        'MISSING_TARGET_SELECTION',
+        'Pass --target codex or --target claude for the existing unmanaged copy.',
+        EXIT_CODES.usage,
+      );
+    }
+    if (rawTarget !== 'codex' && rawTarget !== 'claude') {
+      throw new SkillSyncError(
+        'INVALID_TARGET',
+        'Targets must be codex or claude.',
+        EXIT_CODES.validation,
+      );
+    }
+    const dryRun = invocation.options.dryRun === true;
+    return await withCatalog(
+      invocation,
+      dryRun ? { cacheOnly: true } : {},
+      async ({ catalog, projectRoot: root, scope, snapshot }) => {
+        const skill = catalog.records.find((candidate) => candidate.id === id);
+        if (skill === undefined) {
+          throw new SkillSyncError(
+            'UNKNOWN_SKILL_ID',
+            `Adoption requires an exact qualified library skill ID; no skill matches ${id}.`,
+            EXIT_CODES.validation,
+            { id },
+          );
+        }
+        const plan =
+          scope === 'global'
+            ? await adoptGlobalSkill({
+                dryRun,
+                libraryIdentity: snapshot.identity,
+                libraryRevision: snapshot.revision,
+                paths: dependencies.paths,
+                registry,
+                skill,
+                ...(dryRun ? {} : { storage: globalMutationStorage(dependencies.paths) }),
+                target: rawTarget,
+              })
+            : await adoptProjectSkill({
+                dryRun,
+                libraryIdentity: snapshot.identity,
+                libraryRevision: snapshot.revision,
+                projectRoot: root,
+                registry,
+                skill,
+                ...(dryRun ? {} : { storage: projectMutationStorage(dependencies.paths, root) }),
+                target: rawTarget,
+              });
+        return success({ ...plan, freshness: snapshot.freshness, scope, stale: snapshot.stale });
       },
     );
   }
@@ -756,24 +900,44 @@ export function createWorkflowCommandHandler(
         'Discarding local edits in automation requires --discard-local together with --yes.',
       );
     }
-    const root = await projectRoot(invocation);
-    const manifest = await readProjectManifest(root);
+    const global = globalRequested(invocation);
+    const root = global ? dependencies.paths.globalStateDirectory : await projectRoot(invocation);
+    if (root === undefined) {
+      throw new SkillSyncError(
+        'GLOBAL_STATE_UNAVAILABLE',
+        'Global skill state paths are unavailable.',
+        EXIT_CODES.validation,
+      );
+    }
+    const manifest = global
+      ? await readGlobalManifest(dependencies.paths)
+      : await readProjectManifest(root);
     if (manifest === undefined) {
       throw new SkillSyncError(
-        'PROJECT_STATE_REQUIRED',
-        'This project has no skill-sync manifest.',
+        global ? 'GLOBAL_STATE_REQUIRED' : 'PROJECT_STATE_REQUIRED',
+        global
+          ? 'No global skill-sync manifest is present.'
+          : 'This project has no skill-sync manifest.',
         EXIT_CODES.validation,
       );
     }
     const prompt = promptFor(invocation);
     const selected = await selectCandidates(manifest.skills, selectors, all, prompt, 'uninstall');
     if (selected.length === 0) return noSelectionResult('uninstall');
-    const preview = await uninstallProjectSkills({
-      discardLocal,
-      dryRun: true,
-      projectRoot: root,
-      skillIds: selected.map((skill) => skill.id),
-    });
+    const preview = global
+      ? await uninstallGlobalSkills({
+          discardLocal,
+          dryRun: true,
+          paths: dependencies.paths,
+          registry,
+          skillIds: selected.map((skill) => skill.id),
+        })
+      : await uninstallProjectSkills({
+          discardLocal,
+          dryRun: true,
+          projectRoot: root,
+          skillIds: selected.map((skill) => skill.id),
+        });
     if (invocation.options.dryRun === true) return success(preview);
 
     let confirmed = false;
@@ -791,14 +955,23 @@ export function createWorkflowCommandHandler(
         return success({ ...preview, message: 'Uninstall cancelled before mutation.' });
       }
     }
-    const result = await uninstallProjectSkills({
-      confirmed,
-      discardLocal,
-      projectRoot: root,
-      skillIds: selected.map((skill) => skill.id),
-      storage: projectMutationStorage(dependencies.paths, root),
-    });
-    return success(result);
+    const result = global
+      ? await uninstallGlobalSkills({
+          confirmed,
+          discardLocal,
+          paths: dependencies.paths,
+          registry,
+          skillIds: selected.map((skill) => skill.id),
+          storage: globalMutationStorage(dependencies.paths),
+        })
+      : await uninstallProjectSkills({
+          confirmed,
+          discardLocal,
+          projectRoot: root,
+          skillIds: selected.map((skill) => skill.id),
+          storage: projectMutationStorage(dependencies.paths, root),
+        });
+    return success({ ...result, scope: global ? 'global' : 'project' });
   }
 
   async function handleInit(invocation: CommandInvocation): Promise<CommandResult<unknown>> {
@@ -1064,25 +1237,46 @@ export function createWorkflowCommandHandler(
   }
 
   async function handleStatus(invocation: CommandInvocation): Promise<CommandResult<unknown>> {
-    const root = await projectRoot(invocation);
     const selectedConnection = await connection();
+    const global = globalRequested(invocation);
+    if (global) {
+      const report = await inspectGlobalStatus({
+        allowStale: true,
+        library: revisionProvider(selectedConnection),
+        offline: invocation.options.offline === true,
+        paths: dependencies.paths,
+        registry,
+      });
+      return success(jsonRequested(invocation) ? report : formatGlobalStatusHuman(report));
+    }
     const report = await inspectProjectStatus({
       allowStale: true,
       library: revisionProvider(selectedConnection),
       offline: invocation.options.offline === true,
-      projectRoot: root,
+      projectRoot: await projectRoot(invocation),
     });
     return success(jsonRequested(invocation) ? report : formatProjectStatusHuman(report));
   }
 
   async function handleDiff(invocation: CommandInvocation): Promise<CommandResult<unknown>> {
-    const root = await projectRoot(invocation);
     const selectedConnection = await connection();
+    const global = globalRequested(invocation);
+    const selector = argumentString(invocation, 0, 'tracked skill ID');
+    if (global) {
+      const report = await inspectGlobalDiff({
+        allowStale: true,
+        library: revisionProvider(selectedConnection),
+        paths: dependencies.paths,
+        registry,
+        selector,
+      });
+      return success(jsonRequested(invocation) ? report : formatGlobalDiffHuman(report));
+    }
     const report = await inspectProjectDiff({
       allowStale: true,
       library: revisionProvider(selectedConnection),
-      projectRoot: root,
-      selector: argumentString(invocation, 0, 'tracked skill ID'),
+      projectRoot: await projectRoot(invocation),
+      selector,
     });
     return success(jsonRequested(invocation) ? report : formatProjectDiffHuman(report));
   }
@@ -1107,14 +1301,26 @@ export function createWorkflowCommandHandler(
         'Discarding local edits in automation requires --discard-local together with --yes.',
       );
     }
-    const root = await projectRoot(invocation);
+    const global = globalRequested(invocation);
+    const root = global ? dependencies.paths.globalStateDirectory : await projectRoot(invocation);
+    if (root === undefined) {
+      throw new SkillSyncError(
+        'GLOBAL_STATE_UNAVAILABLE',
+        'Global skill state paths are unavailable.',
+        EXIT_CODES.validation,
+      );
+    }
     let resolvedExplicitSelectors = explicitSelectors;
     if (operation === 'update' && explicitSelectors.length > 0) {
-      const manifest = await readProjectManifest(root);
+      const manifest = global
+        ? await readGlobalManifest(dependencies.paths)
+        : await readProjectManifest(root);
       if (manifest === undefined) {
         throw new SkillSyncError(
-          'PROJECT_STATE_REQUIRED',
-          'update requires a managed project manifest.',
+          global ? 'GLOBAL_STATE_REQUIRED' : 'PROJECT_STATE_REQUIRED',
+          global
+            ? 'update requires a managed global manifest.'
+            : 'update requires a managed project manifest.',
           EXIT_CODES.validation,
         );
       }
@@ -1128,7 +1334,13 @@ export function createWorkflowCommandHandler(
     return await withSharedRevision(selectedConnection, offlineRevision, async (sharedProvider) => {
       let selectors = resolvedExplicitSelectors;
       if (operation === 'update' && !all && selectors.length === 0) {
-        const status = await inspectProjectStatus({ library: sharedProvider, projectRoot: root });
+        const status = global
+          ? await inspectGlobalStatus({
+              library: sharedProvider,
+              paths: dependencies.paths,
+              registry,
+            })
+          : await inspectProjectStatus({ library: sharedProvider, projectRoot: root });
         const eligible = status.skills.filter((skill) =>
           ['outdated', 'missing', 'locally-modified', 'conflicted'].includes(skill.state),
         );
@@ -1146,7 +1358,7 @@ export function createWorkflowCommandHandler(
       const invoke = async (
         preview: boolean,
         confirmed: boolean,
-      ): Promise<ProjectReconciliationReport> => {
+      ): Promise<ProjectReconciliationReport | GlobalReconciliationReport> => {
         context?.throwIfCancelled();
         const common = {
           check,
@@ -1155,15 +1367,44 @@ export function createWorkflowCommandHandler(
           dryRun: preview || dryRun,
           library: sharedProvider,
           ...(offlineRevision === undefined ? {} : { offlineRevision }),
-          projectRoot: root,
-          ...(preview || dryRun || check
-            ? {}
-            : { storage: projectMutationStorage(dependencies.paths, root) }),
         };
-        const report =
-          operation === 'sync'
-            ? await syncProjectSkills(common)
-            : await updateProjectSkills({ ...common, all, selectors });
+        const report = global
+          ? operation === 'sync'
+            ? await syncGlobalSkills({
+                ...common,
+                paths: dependencies.paths,
+                registry,
+                ...(preview || dryRun || check
+                  ? {}
+                  : { storage: globalMutationStorage(dependencies.paths) }),
+              })
+            : await updateGlobalSkills({
+                ...common,
+                all,
+                paths: dependencies.paths,
+                registry,
+                selectors,
+                ...(preview || dryRun || check
+                  ? {}
+                  : { storage: globalMutationStorage(dependencies.paths) }),
+              })
+          : operation === 'sync'
+            ? await syncProjectSkills({
+                ...common,
+                projectRoot: root,
+                ...(preview || dryRun || check
+                  ? {}
+                  : { storage: projectMutationStorage(dependencies.paths, root) }),
+              })
+            : await updateProjectSkills({
+                ...common,
+                all,
+                projectRoot: root,
+                selectors,
+                ...(preview || dryRun || check
+                  ? {}
+                  : { storage: projectMutationStorage(dependencies.paths, root) }),
+              });
         context?.throwIfCancelled();
         return report;
       };
@@ -1192,7 +1433,7 @@ export function createWorkflowCommandHandler(
         return success(
           jsonRequested(invocation)
             ? { ...preview, message: 'Reconciliation cancelled before mutation.' }
-            : `${formatProjectReconciliationHuman(preview)}\nReconciliation cancelled before mutation.`,
+            : `${'scope' in preview ? formatGlobalReconciliationHuman(preview) : formatProjectReconciliationHuman(preview)}\nReconciliation cancelled before mutation.`,
         );
       }
       return reconciliationResult(await invoke(false, true), jsonRequested(invocation));
@@ -1207,6 +1448,8 @@ export function createWorkflowCommandHandler(
           return await handleInit(invocation);
         case 'install':
           return await handleInstall(invocation);
+        case 'adopt':
+          return await handleAdopt(invocation);
         case 'sync':
         case 'update':
           return await runReconciliation(invocation, context);
