@@ -452,6 +452,8 @@ export class GitClient {
       'protocol.ext.allow=never',
       '-c',
       'core.fsmonitor=false',
+      '-c',
+      'core.longpaths=true',
       ...arguments_,
     ];
     const environment: NodeJS.ProcessEnv = {
