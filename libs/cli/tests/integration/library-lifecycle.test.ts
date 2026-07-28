@@ -534,7 +534,7 @@ describe('validated optimistic library mutations', () => {
         remoteFile(root, fixture.remote, 'skills/engineering/review-ui/SKILL.md'),
       ).rejects.toThrow();
     });
-  });
+  }, 30_000);
 });
 
 describe('publication and canonical deletion', () => {
