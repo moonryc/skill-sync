@@ -107,6 +107,7 @@ describe('safe Git execution', () => {
       expect(call?.arguments_.some((argument) => argument.startsWith('core.hooksPath='))).toBe(
         true,
       );
+      expect(call?.arguments_).toContain('core.longpaths=true');
       expect(call?.environment.SSH_AUTH_SOCK).toBe('/external/agent.sock');
       expect(call?.environment.GIT_CONFIG_COUNT).toBeUndefined();
       expect(call?.environment.GIT_CONFIG_KEY_0).toBeUndefined();

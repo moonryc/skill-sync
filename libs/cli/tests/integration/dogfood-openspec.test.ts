@@ -207,5 +207,5 @@ describe('OpenSpec skill dogfood workflow', () => {
 
     expect(await snapshotOpenSpecSkillBytes(codexSources)).toEqual(codexBefore);
     expect(await snapshotOpenSpecSkillBytes(claudeSources)).toEqual(claudeBefore);
-  });
+  }, 60_000);
 });

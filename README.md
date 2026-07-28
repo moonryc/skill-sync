@@ -217,9 +217,9 @@ canonical library deletions.
 - Skill trees reject symlinks, special files, nested Git repositories, path
   traversal, nested skill roots, malformed front matter, and case-fold
   collisions.
-- Git commands use argument arrays, isolated hooks and filters, no force push,
-  and external authentication. Diagnostics redact common credentials and
-  tokens.
+- Git commands use argument arrays, isolated hooks and filters, Windows
+  long-path support, no force push, and external authentication. Diagnostics
+  redact common credentials and tokens.
 - Project writes are contained beneath the resolved project root and are staged,
   journaled, digest-checked, and atomically replaced where supported.
 
