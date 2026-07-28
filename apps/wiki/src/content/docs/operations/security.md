@@ -22,7 +22,7 @@ Validation rejects symlinks, special files, nested Git repositories, traversal o
 
 ## Git operations are constrained
 
-Git commands use argument arrays instead of shell interpolation. Canonical writes use isolated hooks and filters, a clean exact-revision checkout, a normal commit, and a non-force push. Authentication remains external in Git credential helpers, SSH, or `gh`; repository URLs containing credentials are refused.
+Git commands use argument arrays instead of shell interpolation. Canonical writes use isolated hooks and filters, a clean exact-revision checkout, a normal commit, and a non-force push. Windows Git invocations enable long-path support for nested managed content. Authentication remains external in Git credential helpers, SSH, or `gh`; repository URLs containing credentials are refused.
 
 ## Project writes stay contained
 
