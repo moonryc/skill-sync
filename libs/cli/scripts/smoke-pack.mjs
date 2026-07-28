@@ -39,6 +39,10 @@ function requireSuccess(command, args, options = {}) {
   return result;
 }
 
+function runNpm(args) {
+  return requireSuccess(npmExecutable, args, { shell: process.platform === 'win32' });
+}
+
 function assertPackedFiles(files) {
   const paths = files.map((file) => file.path);
   for (const required of ['LICENSE', 'README.md', 'dist/cli.js', 'package.json']) {
@@ -103,7 +107,7 @@ function verifyInteractiveCancellation(executable, options) {
 }
 
 try {
-  const packedResult = requireSuccess(npmExecutable, ['pack', '--json', stagedPackageRoot]);
+  const packedResult = runNpm(['pack', '--json', stagedPackageRoot]);
   const packed = JSON.parse(packedResult.stdout);
   const artifact = packed[0];
   if (packed.length !== 1 || artifact?.filename === undefined) {
@@ -114,7 +118,7 @@ try {
 
   const prefix = join(smokeRoot, 'global-prefix');
   await mkdir(prefix);
-  requireSuccess(npmExecutable, [
+  runNpm([
     'install',
     '--global',
     '--prefix',
