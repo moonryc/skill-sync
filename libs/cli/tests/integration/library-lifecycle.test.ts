@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -15,9 +15,11 @@ import {
   type LibraryGitPort,
   type LibraryProjectStateStore,
 } from '../../src/application/library-lifecycle.js';
+import { inspectRecoveryRecord, listRecoveryRecords } from '../../src/application/recovery.js';
 import { validateSkillDirectory } from '../../src/domain/library.js';
 import type { ProjectLock, ProjectManifest } from '../../src/domain/project-state.js';
-import type { UserConfig } from '../../src/infrastructure/config.js';
+import { success } from '../../src/domain/result.js';
+import type { ApplicationPaths, UserConfig } from '../../src/infrastructure/config.js';
 import {
   GitClient,
   GitExecutionError,
@@ -26,6 +28,10 @@ import {
   type NormalizedGitRemote,
 } from '../../src/infrastructure/git.js';
 import { LibraryCache } from '../../src/infrastructure/library-cache.js';
+import { ProcessRunError } from '../../src/infrastructure/process-runner.js';
+import { runWithRuntimeBoundary } from '../../src/runtime/boundary.js';
+import type { RuntimeBoundaryContext } from '../../src/runtime/boundary.js';
+import type { OperationGuard } from '../../src/runtime/operation-guard.js';
 import { withTempDirectory } from '../helpers/temp.js';
 
 const execFileAsync = promisify(execFile);
@@ -123,6 +129,20 @@ class MemoryConfigStore implements LibraryConfigStore {
   }
 }
 
+class FailingConfigRollbackStore implements LibraryConfigStore {
+  replacementAttempts = 0;
+
+  read(): Promise<UserConfig | undefined> {
+    return Promise.resolve(undefined);
+  }
+
+  replace(): Promise<void> {
+    this.replacementAttempts += 1;
+    const phase = this.replacementAttempts === 1 ? 'write' : 'rollback';
+    return Promise.reject(new Error(`simulated configuration ${phase} failure`));
+  }
+}
+
 class MemoryProjectStateStore implements LibraryProjectStateStore {
   writes = 0;
 
@@ -161,7 +181,7 @@ function configuredLibrary(remote: string): UserConfig {
 
 function createHarness(
   root: string,
-  config: MemoryConfigStore,
+  config: LibraryConfigStore,
   options: {
     readonly github?: GitHubRepositoryPort;
     readonly projectState?: LibraryProjectStateStore;
@@ -195,6 +215,44 @@ function createHarness(
   return { service, cache, gitClient };
 }
 
+function recoveryPaths(root: string): ApplicationPaths {
+  const configDirectory = join(root, 'config');
+  const stateDirectory = join(root, 'state');
+  return {
+    backupsDirectory: join(stateDirectory, 'backups'),
+    cacheDirectory: join(root, 'cache'),
+    configDirectory,
+    configFile: join(configDirectory, 'config.json'),
+    journalsDirectory: join(stateDirectory, 'journals'),
+    locksDirectory: join(stateDirectory, 'locks'),
+    stateDirectory,
+  };
+}
+
+function initializationRecoveryRuntime(paths: ApplicationPaths, context: RuntimeBoundaryContext) {
+  return {
+    journalDirectory: join(paths.journalsDirectory, 'library'),
+    operationGuard: context.operationGuard,
+    registerRecovery: context.registerRecovery,
+    rootFingerprint: 'f'.repeat(64),
+  };
+}
+
+function recoveryEvidenceNote(evidence: unknown): Readonly<Record<string, unknown>> {
+  if (typeof evidence !== 'object' || evidence === null) {
+    throw new Error('Expected initialization recovery journal evidence.');
+  }
+  const note = (evidence as Readonly<Record<string, unknown>>).note;
+  if (typeof note !== 'string') {
+    throw new Error('Expected initialization recovery evidence note.');
+  }
+  const parsed = JSON.parse(note) as unknown;
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new Error('Expected structured initialization recovery evidence.');
+  }
+  return parsed as Readonly<Record<string, unknown>>;
+}
+
 async function remoteHead(root: string, remote: string): Promise<string> {
   return (await git(root, ['--git-dir', remote, 'rev-parse', 'refs/heads/main'])).trim();
 }
@@ -204,6 +262,62 @@ async function remoteFile(root: string, remote: string, path: string): Promise<s
 }
 
 describe('library initialization lifecycle', () => {
+  it('plans with disposable storage and rejects configuration drift before persistent writes', async () => {
+    await withTempDirectory('skill-sync-lifecycle-init-plan-', async (root) => {
+      const fixture = await initializeLibrary(root, 'planned');
+      const config = new MemoryConfigStore();
+      const gitClient = new GitClient({ safetyDirectory: join(root, 'git-safety') });
+      const cacheRoot = join(root, 'cache');
+      const inspectionRoot = join(root, 'inspection');
+      const service = new LibraryLifecycleService({
+        cache: new LibraryCache({ rootDirectory: cacheRoot, git: gitClient }),
+        config,
+        git: gitClient,
+        inspectionRoot,
+        normalizeRemote: localRemote,
+        stagingRoot: join(root, 'staging'),
+      });
+
+      const request = { branch: 'main', kind: 'connect', url: fixture.remote } as const;
+      const first = await service.planInitialization(request);
+      const second = await service.planInitialization(request);
+      expect(first).toMatchObject({
+        action: 'connect',
+        applied: false,
+        dryRun: true,
+        operation: 'init',
+        remoteState: 'compatible',
+        validation: { groups: 0, skills: 0 },
+      });
+      expect(first.fingerprint).toBe(second.fingerprint);
+      expect(first.revision).toBe(await remoteHead(root, fixture.remote));
+      expect(config.writes).toBe(0);
+      await expect(stat(cacheRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await readdir(inspectionRoot)).toEqual([]);
+
+      config.value = { defaults: { targets: ['codex'] }, schemaVersion: 1 };
+      await expect(service.applyInitialization(request, first.fingerprint)).rejects.toMatchObject({
+        code: 'INIT_PLAN_CHANGED',
+      });
+      expect(config.writes).toBe(0);
+      await expect(stat(cacheRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await readdir(inspectionRoot)).toEqual([]);
+
+      config.value = undefined;
+      const reviewedRemote = await service.planInitialization(request);
+      await writeFile(join(fixture.worktree, 'README.md'), 'remote advanced after review\n');
+      await git(fixture.worktree, ['add', 'README.md']);
+      await git(fixture.worktree, ['commit', '--quiet', '-m', 'advance after init review']);
+      await git(fixture.worktree, ['push', '--quiet', 'origin', 'main']);
+      await expect(
+        service.applyInitialization(request, reviewedRemote.fingerprint),
+      ).rejects.toMatchObject({ code: 'INIT_PLAN_CHANGED' });
+      expect(config.writes).toBe(0);
+      await expect(stat(cacheRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await readdir(inspectionRoot)).toEqual([]);
+    });
+  });
+
   it('requires confirmation for empty remotes, initializes safely, reconnects idempotently, and refuses incompatible remotes', async () => {
     await withTempDirectory('skill-sync-lifecycle-init-', async (root) => {
       const empty = await createBareRemote(root, 'empty');
@@ -247,9 +361,199 @@ describe('library initialization lifecycle', () => {
       const incompatibleHead = await remoteHead(root, incompatible);
       await expect(service.init({ url: incompatible, branch: 'main' })).rejects.toMatchObject({
         code: 'INCOMPATIBLE_LIBRARY',
+        message:
+          'The nonempty remote is not a compatible skill-sync library. Its contents and your saved library configuration were left unchanged. Next: preview a compatible or empty repository with skill-sync init <repository-url> --dry-run, or preview a new one with skill-sync init --create <owner/name> --dry-run.',
       });
       expect(config.value).toEqual(prior);
       expect(await remoteHead(root, incompatible)).toBe(incompatibleHead);
+    });
+  });
+
+  it('rejects a remote advance at exact cache promotion without persistent writes', async () => {
+    await withTempDirectory('skill-sync-lifecycle-init-promotion-race-', async (root) => {
+      const fixture = await initializeLibrary(root, 'promotion-race');
+      const config = new MemoryConfigStore();
+      const gitClient = new GitClient({ safetyDirectory: join(root, 'git-safety') });
+      const cacheRoot = join(root, 'cache');
+      const realCache = new LibraryCache({ rootDirectory: cacheRoot, git: gitClient });
+      let advanced = false;
+      const cache = {
+        inspect: realCache.inspect.bind(realCache),
+        refresh: realCache.refresh.bind(realCache),
+        promoteExact: async (...arguments_: Parameters<LibraryCache['promoteExact']>) => {
+          if (!advanced) {
+            advanced = true;
+            await writeFile(join(fixture.worktree, 'advanced.md'), 'advanced after review\n');
+            await git(fixture.worktree, ['add', 'advanced.md']);
+            await git(fixture.worktree, ['commit', '--quiet', '-m', 'advance after review']);
+            await git(fixture.worktree, ['push', '--quiet', 'origin', 'main']);
+          }
+          return await realCache.promoteExact(...arguments_);
+        },
+      };
+      const inspectionRoot = join(root, 'inspection');
+      const service = new LibraryLifecycleService({
+        cache,
+        config,
+        git: gitClient,
+        inspectionRoot,
+        normalizeRemote: localRemote,
+        stagingRoot: join(root, 'staging'),
+      });
+      const request = { branch: 'main', kind: 'connect', url: fixture.remote } as const;
+      const plan = await service.planInitialization(request);
+
+      await expect(service.applyInitialization(request, plan.fingerprint)).rejects.toMatchObject({
+        code: 'INIT_PLAN_CHANGED',
+        details: { expectedRevision: plan.revision },
+      });
+      expect(advanced).toBe(true);
+      expect(config.value).toBeUndefined();
+      expect(config.writes).toBe(0);
+      await expect(stat(cacheRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await readdir(inspectionRoot)).toEqual([]);
+    });
+  });
+
+  it('retains inspect-only recovery evidence when provider creation fails after its attempt begins', async () => {
+    await withTempDirectory('skill-sync-lifecycle-init-provider-recovery-', async (root) => {
+      const remote = await createBareRemote(root, 'provider-recovery');
+      const config = new MemoryConfigStore();
+      const paths = recoveryPaths(root);
+      const github: GitHubRepositoryPort = {
+        inspectRepository: () => Promise.resolve({ cloneUrl: remote }),
+        createRepository: () => Promise.reject(new Error('simulated provider creation failure')),
+      };
+      const { service } = createHarness(root, config, { github });
+      const request = {
+        branch: 'main',
+        kind: 'create',
+        repository: 'tests/provider-recovery',
+      } as const;
+      const plan = await service.planInitialization(request);
+      let guard: OperationGuard | undefined;
+
+      const result = await runWithRuntimeBoundary(async (context) => {
+        guard = context.operationGuard;
+        const initialized = await service.applyInitialization(request, plan.fingerprint, {
+          recovery: initializationRecoveryRuntime(paths, context),
+          signal: context.signal,
+        });
+        return success(initialized);
+      });
+
+      expect(result).toMatchObject({
+        errors: [{ code: 'RECOVERY_REQUIRED' }],
+        exitCode: 5,
+        ok: false,
+      });
+      expect(guard?.outcome()).toMatchObject({ kind: 'recovery-required' });
+      expect(config.writes).toBe(0);
+
+      const records = await listRecoveryRecords(paths);
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        inspectOnly: true,
+        kind: 'journal',
+        operationKind: 'library-initialization',
+        scopeKind: 'library',
+        status: 'failed',
+      });
+      const inspection = await inspectRecoveryRecord(paths, records[0]?.id ?? 'missing');
+      expect(recoveryEvidenceNote(inspection?.evidence)).toMatchObject({
+        configuration: 'prepared',
+        failure: { code: 'RECOVERY_REQUIRED', reason: 'failure', signal: null },
+        provider: 'attempted',
+        push: 'prepared',
+      });
+    });
+  });
+
+  it('removes initialization recovery evidence after provider creation, push, and config succeed', async () => {
+    await withTempDirectory('skill-sync-lifecycle-init-success-recovery-', async (root) => {
+      const remote = await createBareRemote(root, 'successful-recovery');
+      const config = new MemoryConfigStore();
+      const paths = recoveryPaths(root);
+      const github: GitHubRepositoryPort = {
+        inspectRepository: () => Promise.resolve({ cloneUrl: remote }),
+        createRepository: () => Promise.resolve({ cloneUrl: remote }),
+      };
+      const { service } = createHarness(root, config, { github });
+      const request = {
+        branch: 'main',
+        kind: 'create',
+        repository: 'tests/successful-recovery',
+      } as const;
+      const plan = await service.planInitialization(request);
+      let registrations = 0;
+
+      const result = await runWithRuntimeBoundary(async (context) => {
+        const runtime = initializationRecoveryRuntime(paths, context);
+        const initialized = await service.applyInitialization(request, plan.fingerprint, {
+          recovery: {
+            ...runtime,
+            registerRecovery: (participant) => {
+              registrations += 1;
+              return runtime.registerRecovery(participant);
+            },
+          },
+          signal: context.signal,
+        });
+        return success(initialized);
+      });
+
+      expect(result).toMatchObject({
+        data: { changed: true, initialized: true },
+        exitCode: 0,
+        ok: true,
+      });
+      expect(registrations).toBe(1);
+      expect(await listRecoveryRecords(paths, { includeTerminalJournals: true })).toEqual([]);
+      expect(await readdir(join(paths.journalsDirectory, 'library'))).toEqual([]);
+    });
+  });
+
+  it('surfaces configuration rollback failure as recovery-required with inspect-only evidence', async () => {
+    await withTempDirectory('skill-sync-lifecycle-init-config-recovery-', async (root) => {
+      const fixture = await initializeLibrary(root, 'config-recovery');
+      const config = new FailingConfigRollbackStore();
+      const paths = recoveryPaths(root);
+      const { service } = createHarness(root, config);
+      const request = { branch: 'main', kind: 'connect', url: fixture.remote } as const;
+      const plan = await service.planInitialization(request);
+      let guard: OperationGuard | undefined;
+
+      const result = await runWithRuntimeBoundary(async (context) => {
+        guard = context.operationGuard;
+        const initialized = await service.applyInitialization(request, plan.fingerprint, {
+          recovery: initializationRecoveryRuntime(paths, context),
+          signal: context.signal,
+        });
+        return success(initialized);
+      });
+
+      expect(result).toMatchObject({
+        errors: [{ code: 'RECOVERY_REQUIRED' }],
+        exitCode: 5,
+        ok: false,
+      });
+      expect(guard?.outcome()).toMatchObject({ kind: 'recovery-required' });
+      expect(config.replacementAttempts).toBe(2);
+
+      const records = await listRecoveryRecords(paths);
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({
+        inspectOnly: true,
+        operationKind: 'library-initialization',
+        status: 'failed',
+      });
+      const inspection = await inspectRecoveryRecord(paths, records[0]?.id ?? 'missing');
+      expect(recoveryEvidenceNote(inspection?.evidence)).toMatchObject({
+        configuration: 'attempted',
+        failure: { code: 'RECOVERY_REQUIRED', reason: 'failure', signal: null },
+        provider: 'not-planned',
+        push: 'not-planned',
+      });
     });
   });
 
@@ -262,6 +566,7 @@ describe('library initialization lifecycle', () => {
       },
     };
     const cache = {
+      promoteExact: (): Promise<never> => Promise.reject(new Error('cache must not be reached')),
       refresh: (): Promise<never> => Promise.reject(new Error('cache must not be reached')),
     };
     const service = new LibraryLifecycleService({
@@ -277,6 +582,140 @@ describe('library initialization lifecycle', () => {
     expect(argumentsSeen[0]).toContain('https://github.com/example/skills.git');
     expect(argumentsSeen[0]).not.toContain('http://github.com/example/skills.git');
   });
+
+  it.each([
+    [
+      'HTTPS',
+      'https://github.com/acme/private-skills.git',
+      'fatal: repository not found',
+      'For HTTPS, configure a Git credential helper',
+    ],
+    [
+      'SSH',
+      'git@github.com:acme/private-skills.git',
+      'Permission denied (publickey).',
+      'For SSH, check that the correct key is loaded',
+    ],
+  ] as const)(
+    'preserves a safe %s init failure reason and leaves state unchanged',
+    async (_transport, url, reason, guidance) => {
+      await withTempDirectory('skill-sync-lifecycle-init-failure-', async (root) => {
+        const secret = 'top-secret-value';
+        const prior: UserConfig = { schemaVersion: 1 };
+        const config = new MemoryConfigStore(prior);
+        let refreshes = 0;
+        const cache = {
+          promoteExact: (): Promise<never> =>
+            Promise.reject(new Error('cache must not be reached')),
+          refresh: (): Promise<never> => {
+            refreshes += 1;
+            return Promise.reject(new Error('cache must not be reached'));
+          },
+        };
+        const gitPort: LibraryGitPort = {
+          run: () =>
+            Promise.reject(
+              new GitExecutionError({
+                code: 'GIT_EXECUTION_FAILED',
+                command: ['git', 'ls-remote'],
+                message: 'Child process git exited with code 128.',
+                stderr: `${reason}\n\u001b[31mtoken=${secret}\u001b[0m ${'x'.repeat(800)}`,
+              }),
+            ),
+        };
+        const stagingRoot = join(root, 'staging');
+        const service = new LibraryLifecycleService({
+          cache,
+          config,
+          git: gitPort,
+          stagingRoot,
+        });
+
+        let failure: unknown;
+        try {
+          await service.init({ url });
+        } catch (error) {
+          failure = error;
+        }
+
+        expect(failure).toMatchObject({ code: 'REMOTE_ACCESS_FAILED' });
+        const message = failure instanceof Error ? failure.message : String(failure);
+        expect(message).toContain(reason);
+        expect(message).toContain('Verify the repository exists and your account has access.');
+        expect(message).toContain(guidance);
+        expect(message).not.toContain(secret);
+        expect(message).not.toContain('\u001b');
+        expect(message.length).toBeLessThan(800);
+        expect(config.value).toEqual(prior);
+        expect(config.writes).toBe(0);
+        expect(refreshes).toBe(0);
+        await expect(stat(stagingRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      });
+    },
+  );
+
+  it('leaves local state untouched when a newly created repository cannot be inspected', async () => {
+    await withTempDirectory('skill-sync-lifecycle-create-probe-failure-', async (root) => {
+      const prior: UserConfig = { schemaVersion: 1 };
+      const config = new MemoryConfigStore(prior);
+      let created = 0;
+      let refreshes = 0;
+      const github: GitHubRepositoryPort = {
+        inspectRepository: () =>
+          Promise.resolve({ cloneUrl: 'https://github.com/acme/new-skills.git' }),
+        createRepository: () => {
+          created += 1;
+          return Promise.resolve({ cloneUrl: 'https://github.com/acme/new-skills.git' });
+        },
+      };
+      const gitPort: LibraryGitPort = {
+        run: (arguments_) =>
+          arguments_[0] === 'check-ref-format'
+            ? Promise.resolve({ stdout: '', stderr: '' })
+            : Promise.reject(
+                new GitExecutionError({
+                  code: 'GIT_EXECUTION_FAILED',
+                  command: ['git', 'ls-remote'],
+                  message: 'Child process git exited with code 128.',
+                  stderr: 'fatal: repository is not available yet',
+                }),
+              ),
+      };
+      const cache = {
+        promoteExact: (): Promise<never> => Promise.reject(new Error('cache must not be reached')),
+        refresh: (): Promise<never> => {
+          refreshes += 1;
+          return Promise.reject(new Error('cache must not be reached'));
+        },
+      };
+      const stagingRoot = join(root, 'staging');
+      const service = new LibraryLifecycleService({
+        cache,
+        config,
+        git: gitPort,
+        github,
+        stagingRoot,
+      });
+
+      let failure: unknown;
+      try {
+        await service.create({ repository: 'acme/new-skills' });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({ code: 'REMOTE_ACCESS_FAILED' });
+      const message = failure instanceof Error ? failure.message : String(failure);
+      expect(message).toContain('fatal: repository is not available yet');
+      expect(message).toContain(
+        'The GitHub repository was created before this access check failed and may still exist. Inspect it with your Git provider before retrying or deleting it.',
+      );
+      expect(created).toBe(1);
+      expect(config.value).toEqual(prior);
+      expect(config.writes).toBe(0);
+      expect(refreshes).toBe(0);
+      await expect(stat(stagingRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+  });
 });
 
 describe('GitHub creation lifecycle', () => {
@@ -285,6 +724,10 @@ describe('GitHub creation lifecycle', () => {
       const successfulRemote = await createBareRemote(root, 'created');
       const createRequests: GitHubCreateRequest[] = [];
       const github: GitHubRepositoryPort = {
+        inspectRepository: (request) => {
+          createRequests.push(request);
+          return Promise.resolve({ cloneUrl: successfulRemote });
+        },
         createRepository: (request) => {
           createRequests.push(request);
           return Promise.resolve({ cloneUrl: successfulRemote });
@@ -313,21 +756,29 @@ describe('GitHub creation lifecycle', () => {
         },
       };
       const failingGithub: GitHubRepositoryPort = {
+        inspectRepository: () => Promise.resolve({ cloneUrl: failingRemote }),
         createRepository: () => Promise.resolve({ cloneUrl: failingRemote }),
       };
       const failingHarness = createHarness(join(root, 'failure'), config, {
         github: failingGithub,
         git: failingGit,
       });
-      await expect(
-        failingHarness.service.create({ repository: 'tests/push-fails', branch: 'main' }),
-      ).rejects.toBeInstanceOf(GitExecutionError);
+      let failure: unknown;
+      try {
+        await failingHarness.service.create({ repository: 'tests/push-fails', branch: 'main' });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({ code: 'GITHUB_CREATE_FAILED' });
+      expect(failure instanceof Error ? failure.message : String(failure)).toContain(
+        'The GitHub repository was created and may still exist.',
+      );
       expect(config.value).toEqual(prior);
       expect(await git(root, ['--git-dir', failingRemote, 'for-each-ref'])).toBe('');
     });
   });
 
-  it('uses argument arrays and refuses an existing repository through the gh adapter', async () => {
+  it('uses argument arrays and refuses an existing repository during inspection', async () => {
     const calls: readonly string[][] = [];
     const client = new GhCliRepositoryClient({
       processRunner: (_executable, arguments_) => {
@@ -337,15 +788,138 @@ describe('GitHub creation lifecycle', () => {
     });
 
     await expect(
-      client.createRepository({
+      client.inspectRepository({
         repository: 'tests/existing',
         transport: 'https',
         visibility: 'private',
       }),
-    ).rejects.toMatchObject({ code: 'GITHUB_REPOSITORY_EXISTS' });
+    ).rejects.toMatchObject({
+      code: 'GITHUB_REPOSITORY_EXISTS',
+      message:
+        'The requested GitHub repository already exists. Preview connecting it with skill-sync init https://github.com/tests/existing.git --dry-run instead.',
+    });
     expect(calls).toEqual([
       ['auth', 'status'],
       ['repo', 'view', 'tests/existing', '--json', 'nameWithOwner'],
+    ]);
+  });
+
+  it('maps inspection authentication failures and supplies noninteractive GitHub CLI options', async () => {
+    const controller = new AbortController();
+    let receivedOptions:
+      | {
+          readonly env: NodeJS.ProcessEnv;
+          readonly signal?: AbortSignal;
+          readonly timeoutMs?: number;
+        }
+      | undefined;
+    const client = new GhCliRepositoryClient({
+      environment: { GIT_DIR: '/hostile' },
+      processRunner: (_executable, _arguments, options) => {
+        receivedOptions = options;
+        throw new ProcessRunError('timeout', 'Child process gh stopped: timeout.', {
+          exitCode: null,
+          stderr: 'token=top-secret timed out',
+          stdout: '',
+        });
+      },
+      signal: controller.signal,
+      timeoutMs: 37,
+    });
+
+    await expect(
+      client.inspectRepository({
+        repository: 'tests/new-library',
+        transport: 'https',
+        visibility: 'private',
+      }),
+    ).rejects.toMatchObject({
+      code: 'GITHUB_CREATE_FAILED',
+      message:
+        'GitHub authentication is unavailable: token=[REDACTED] timed out Next: run gh auth login, then retry the same skill-sync init --create preview with --dry-run.',
+    });
+    expect(receivedOptions).toMatchObject({
+      signal: controller.signal,
+      timeoutMs: 37,
+    });
+    expect(receivedOptions?.env).toMatchObject({
+      GCM_INTERACTIVE: 'never',
+      GH_PROMPT_DISABLED: '1',
+      GIT_TERMINAL_PROMPT: '0',
+    });
+    expect(receivedOptions?.env.GIT_DIR).toBeUndefined();
+  });
+
+  it('creates through one direct mutation without repeating authentication or existence checks', async () => {
+    const calls: string[][] = [];
+    const client = new GhCliRepositoryClient({
+      processRunner: (_executable, arguments_) => {
+        calls.push([...arguments_]);
+        return Promise.resolve({ stdout: '', stderr: '' });
+      },
+    });
+
+    await expect(
+      client.createRepository({
+        repository: 'tests/new-library',
+        transport: 'ssh',
+        visibility: 'public',
+      }),
+    ).resolves.toEqual({ cloneUrl: 'git@github.com:tests/new-library.git' });
+    expect(calls).toEqual([['repo', 'create', 'tests/new-library', '--public']]);
+  });
+
+  it('warns that the repository may exist when the create process fails', async () => {
+    const calls: string[][] = [];
+    const client = new GhCliRepositoryClient({
+      processRunner: (_executable, arguments_) => {
+        calls.push([...arguments_]);
+        throw new ProcessRunError('unsuccessful', 'Child process gh exited unsuccessfully.', {
+          exitCode: 1,
+          stderr: 'HTTP 502 while waiting for GitHub',
+          stdout: '',
+        });
+      },
+    });
+
+    await expect(
+      client.createRepository({
+        repository: 'tests/maybe-created',
+        transport: 'https',
+        visibility: 'private',
+      }),
+    ).rejects.toMatchObject({
+      code: 'GITHUB_CREATE_FAILED',
+      message:
+        'GitHub repository creation failed: HTTP 502 while waiting for GitHub The repository may have been created; inspect GitHub before retrying or deleting it.',
+    });
+    expect(calls).toEqual([['repo', 'create', 'tests/maybe-created', '--private']]);
+  });
+
+  it('does not treat an ambiguous repository lookup failure as an available name', async () => {
+    const calls: string[][] = [];
+    const client = new GhCliRepositoryClient({
+      processRunner: (_executable, arguments_) => {
+        calls.push([...arguments_]);
+        if (arguments_[0] === 'auth') return Promise.resolve({ stdout: '', stderr: '' });
+        return Promise.reject(new Error('temporary network failure'));
+      },
+    });
+
+    await expect(
+      client.inspectRepository({
+        repository: 'tests/new-library',
+        transport: 'https',
+        visibility: 'private',
+      }),
+    ).rejects.toMatchObject({
+      code: 'GITHUB_CREATE_FAILED',
+      message:
+        'GitHub repository availability could not be verified: temporary network failure Check GitHub connectivity, then retry the same skill-sync init --create preview with --dry-run.',
+    });
+    expect(calls).toEqual([
+      ['auth', 'status'],
+      ['repo', 'view', 'tests/new-library', '--json', 'nameWithOwner'],
     ]);
   });
 });
@@ -662,5 +1236,5 @@ describe('publication and canonical deletion', () => {
         remoteFile(root, fixture.remote, 'skills/frontend/review-ui/SKILL.md'),
       ).rejects.toThrow();
     });
-  });
+  }, 15_000);
 });

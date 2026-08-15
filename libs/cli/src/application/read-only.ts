@@ -12,6 +12,7 @@ import {
   type CatalogSkillRecord,
 } from './catalog.js';
 import { resolveSkillSelector, type SelectorResolutionIssue } from './selectors.js';
+import { scopedHumanCommand, type ScopedHumanOutputOptions } from '../ui/scope-output.js';
 
 export interface CatalogFilters {
   readonly groups?: readonly string[];
@@ -252,6 +253,8 @@ export function getCatalogSkillInfo(
 
 /** Format info without reading or including any file body. */
 export function formatCatalogSkillInfoHuman(info: CatalogSkillInfo): string {
+  const inventoryLimit = 25;
+  const visibleInventory = info.inventory.slice(0, inventoryLimit);
   const lines = [
     `ID: ${info.id}`,
     `Group: ${info.group ?? '(root)'}`,
@@ -260,10 +263,13 @@ export function formatCatalogSkillInfoHuman(info: CatalogSkillInfo): string {
     `State: ${info.installationState}`,
     `Revision: ${info.sourceRevision ?? 'unknown'}`,
     `Digest: ${info.digest}`,
-    'Files:',
+    `Files (${String(info.inventory.length)}):`,
   ];
-  for (const file of info.inventory) {
+  for (const file of visibleInventory) {
     lines.push(`  ${file.relativePath} (${String(file.size)} bytes, sha256:${file.sha256})`);
+  }
+  if (visibleInventory.length < info.inventory.length) {
+    lines.push(`  … ${String(info.inventory.length - visibleInventory.length)} more files omitted`);
   }
   return lines.join('\n');
 }
@@ -322,6 +328,94 @@ export interface ReadOnlyValidationResult {
   readonly valid: boolean;
   readonly skills: readonly ValidatedSkillSummary[];
   readonly errors: readonly ReadOnlyValidationIssue[];
+}
+
+function validationKindLabel(kind: ReadOnlyValidationKind): string {
+  switch (kind) {
+    case 'library':
+      return 'library';
+    case 'catalog':
+      return 'library catalog';
+    case 'skill-id':
+      return 'library skill';
+    case 'installed-skill':
+      return 'installed skill copies';
+    case 'local-path':
+      return 'local skill path';
+  }
+}
+
+export interface ReadOnlyValidationFormatOptions extends ScopedHumanOutputOptions {
+  readonly scope?: 'global' | 'project';
+  readonly selectorProvided?: boolean;
+}
+
+function validationNextAction(
+  result: ReadOnlyValidationResult,
+  options: ReadOnlyValidationFormatOptions,
+): string {
+  const scope = options.scope ?? 'project';
+  if (!result.valid) {
+    if (options.selectorProvided === true) {
+      return `Next: Fix the issues above, then rerun ${scopedHumanCommand(scope, 'validate <same-id-or-path>', options)}.`;
+    }
+    return `Next: Fix the issues above, then run ${scopedHumanCommand(scope, 'validate', options)} again.`;
+  }
+  switch (result.kind) {
+    case 'library':
+    case 'catalog':
+      return result.skills.length === 0
+        ? 'Next: Add the first skill with skill-sync add <path> --group <group>.'
+        : `Next: Run ${scopedHumanCommand(scope, 'list', options)} to browse the validated skills.`;
+    case 'skill-id':
+      return result.skills[0] === undefined
+        ? `Next: Run ${scopedHumanCommand(scope, 'list', options)} to browse available skills.`
+        : `Next: Run ${scopedHumanCommand(scope, `info ${result.skills[0].id}`, options)} to review compatibility and get a complete install preview command.`;
+    case 'installed-skill':
+      return `Next: Run ${scopedHumanCommand(scope, 'status', options)} to review all managed copies.`;
+    case 'local-path':
+      return 'Next: Add this skill to your library with skill-sync add <path>.';
+  }
+}
+
+/** Concise deterministic validation text for people using the CLI directly. */
+export function formatReadOnlyValidationHuman(
+  result: ReadOnlyValidationResult,
+  options: ReadOnlyValidationFormatOptions = {},
+): string {
+  const skills = [...result.skills].sort((left, right) => {
+    const idOrder = comparePortableStrings(left.id, right.id);
+    return idOrder === 0 ? comparePortableStrings(left.source, right.source) : idOrder;
+  });
+  const errors = [...result.errors].sort((left, right) => {
+    const sourceOrder = comparePortableStrings(left.source, right.source);
+    if (sourceOrder !== 0) return sourceOrder;
+    const codeOrder = comparePortableStrings(left.code, right.code);
+    if (codeOrder !== 0) return codeOrder;
+    return comparePortableStrings(left.message, right.message);
+  });
+  const skillLines = skills.map(
+    (skill) =>
+      `  ${skill.id} — ${String(skill.inventory.length)} file${skill.inventory.length === 1 ? '' : 's'} (${skill.source})`,
+  );
+  const errorLines = errors.flatMap((error) => [
+    `  [${error.code}] ${error.source}: ${error.message}`,
+    ...(error.candidates.length === 0
+      ? []
+      : [`    Candidates: ${[...error.candidates].sort(comparePortableStrings).join(', ')}`]),
+  ]);
+
+  return [
+    result.valid ? 'Validation passed.' : 'Validation failed.',
+    `Kind: ${validationKindLabel(result.kind)}`,
+    `Skills checked: ${String(skills.length)}`,
+    `Issues: ${String(errors.length)}`,
+    'Details:',
+    ...(skillLines.length === 0 && errorLines.length === 0
+      ? ['  None.']
+      : [...skillLines, ...errorLines]),
+    validationNextAction(result, options),
+  ].join('\n');
 }
 
 function libraryValidationIssue(

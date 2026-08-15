@@ -3,6 +3,7 @@ import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises
 import { join } from 'node:path';
 
 import { inspectRegularFileTree, type RegularFileInventoryEntry } from '../domain/digest.js';
+import { comparePortableStrings } from '../domain/identifiers.js';
 import {
   canonicalizeProjectLock,
   PROJECT_LOCK_FILENAME,
@@ -18,6 +19,10 @@ import {
 } from '../domain/reconciliation.js';
 import { EXIT_CODES, SkillSyncError, redactSecrets, type ExitCode } from '../domain/result.js';
 import { validateLibrary, type ValidatedSkill } from '../domain/library.js';
+import {
+  isRecoveryIntegrityError,
+  isTransactionRolledBackError,
+} from '../domain/recovery-integrity.js';
 import type { NormalizedGitRemote } from '../infrastructure/git.js';
 import { GitClient, type GitProcessResult, type GitRunOptions } from '../infrastructure/git.js';
 import {
@@ -27,11 +32,11 @@ import {
   type LibraryCacheRevision,
 } from '../infrastructure/library-cache.js';
 import {
-  assertProjectStatePair,
   readProjectLock,
   readProjectManifest,
   resolveContainedProjectPath,
 } from '../infrastructure/project-state.js';
+import { loadManagedStatePair } from '../infrastructure/managed-state.js';
 import { stableJsonStringify } from '../infrastructure/stable-json.js';
 import {
   acquireAdvisoryLock,
@@ -41,6 +46,7 @@ import {
   stageRegularPath,
   type AtomicReplacement,
 } from '../infrastructure/transactions.js';
+import type { OperationGuard } from '../runtime/operation-guard.js';
 import { resolveSkillSelectors, selectAllSkills } from './selectors.js';
 import type { ProjectMutationStorage } from './project-installation.js';
 
@@ -147,9 +153,13 @@ export class CachedLibraryRevisionProvider implements LibraryRevisionProvider {
         });
       }
     } catch (error) {
+      const offlineGuidance =
+        request.cacheOnly === true
+          ? ' Re-run this status command without --offline when remote access is available to populate a verified cache.'
+          : '';
       throw reconciliationError(
         'LIBRARY_REVISION_UNAVAILABLE',
-        `Unable to resolve the library revision: ${safeMessage(error)}`,
+        `Unable to resolve the library revision: ${safeMessage(error)}${offlineGuidance}`,
         EXIT_CODES.repository,
       );
     }
@@ -319,36 +329,16 @@ interface RevisionInspection {
 
 async function readSnapshot(projectRootInput: string): Promise<ProjectSnapshot> {
   const projectRoot = await realpath(projectRootInput);
-  const [manifest, lock] = await Promise.all([
-    readProjectManifest(projectRoot),
-    readProjectLock(projectRoot),
-  ]);
+  const { lock, manifest } = await loadManagedStatePair({
+    readLock: async () => await readProjectLock(projectRoot),
+    readManifest: async () => await readProjectManifest(projectRoot),
+    required: true,
+    resolveDestination: async (projection) =>
+      await resolveContainedProjectPath(projectRoot, projection.destination),
+    scope: 'project',
+  });
   if (manifest === undefined || lock === undefined) {
-    throw reconciliationError(
-      'PROJECT_STATE_REQUIRED',
-      `Both ${PROJECT_MANIFEST_FILENAME} and ${PROJECT_LOCK_FILENAME} are required for reconciliation.`,
-      EXIT_CODES.validation,
-    );
-  }
-  try {
-    assertProjectStatePair(manifest, lock);
-  } catch (error) {
-    throw reconciliationError(
-      'INVALID_PROJECT_STATE',
-      `Project tracking state is inconsistent: ${safeMessage(error)}`,
-      EXIT_CODES.validation,
-    );
-  }
-
-  const desiredIds = manifest.skills.map((skill) => skill.id).sort();
-  const resolvedIds = lock.skills.map((skill) => skill.id).sort();
-  if (desiredIds.join('\n') !== resolvedIds.join('\n')) {
-    throw reconciliationError(
-      'INVALID_PROJECT_STATE',
-      'Project manifest and lock must contain exactly the same managed skill IDs.',
-      EXIT_CODES.validation,
-      { desiredIds, resolvedIds },
-    );
+    throw new Error('Required project state was not returned by the managed-state loader.');
   }
   return { lock, manifest, projectRoot };
 }
@@ -645,41 +635,129 @@ export async function inspectProjectDiff(options: ProjectDiffOptions): Promise<P
   );
 }
 
-export function formatProjectStatusHuman(report: ProjectStatusReport): string {
+export interface ProjectHumanFormatOptions {
+  readonly explicitProject?: boolean;
+}
+
+function projectOptionSuffix(options: ProjectHumanFormatOptions): string {
+  return options.explicitProject === true ? ' --project <project-path>' : '';
+}
+
+export function formatProjectStatusHuman(
+  report: ProjectStatusReport,
+  options: ProjectHumanFormatOptions = {},
+): string {
+  const scopeOption = projectOptionSuffix(options);
   const freshness = report.authoritative ? report.freshness : `${report.freshness}, not current`;
+  const ordered = [...report.skills].sort((left, right) =>
+    comparePortableStrings(left.id, right.id),
+  );
+  const visible = ordered.slice(0, 20);
+  const counts = new Map<string, number>();
+  for (const skill of ordered) counts.set(skill.state, (counts.get(skill.state) ?? 0) + 1);
   const lines = [
+    'Scope: project',
     `Project: ${report.projectRoot}`,
     `Library: ${report.libraryIdentity} @ ${report.libraryRevision} (${freshness})`,
+    `Managed skills: ${String(ordered.length)}${
+      counts.size === 0
+        ? ''
+        : ` (${[...counts.entries()]
+            .sort(([left], [right]) => comparePortableStrings(left, right))
+            .map(([state, count]) => `${state} ${String(count)}`)
+            .join(', ')})`
+    }`,
   ];
   if (report.warning !== undefined) lines.push(`Warning: ${report.warning.message}`);
-  if (report.skills.length === 0) lines.push('No managed skills.');
-  for (const skill of report.skills) {
+  else if (report.stale) lines.push('Warning: Cached status may differ from the remote library.');
+  if (ordered.length === 0) lines.push('No managed skills.');
+  for (const skill of visible) {
     lines.push(`${skill.id}: ${skill.state}`);
     for (const destination of skill.destinations) {
-      const detail = destination.exists ? (destination.digest ?? 'unreadable') : 'missing';
+      const detail = destination.exists
+        ? destination.digest === undefined
+          ? 'unreadable'
+          : 'present'
+        : 'missing';
       lines.push(`  ${destination.target} ${destination.path}: ${detail}`);
     }
   }
+  if (visible.length < ordered.length) {
+    lines.push(`… ${String(ordered.length - visible.length)} more managed skills omitted`);
+  }
+  const review = ordered.find((skill) =>
+    ['conflicted', 'locally-modified', 'unmanaged-collision'].includes(skill.state),
+  );
+  const orphaned = ordered.find((skill) => skill.state === 'orphaned');
+  const reconcile = ordered.find((skill) => ['missing', 'outdated'].includes(skill.state));
+  lines.push(
+    report.stale
+      ? `Next: Re-run skill-sync status${scopeOption} without --offline before making changes.`
+      : review !== undefined
+        ? `Next: Review ${review.id} with skill-sync diff ${review.id}${scopeOption} before deciding whether to sync.`
+        : orphaned !== undefined
+          ? `Next: ${orphaned.id} no longer exists in the canonical library. Preview removal with skill-sync uninstall ${orphaned.id}${scopeOption} --dry-run, or restore that skill to the library.`
+          : reconcile !== undefined
+            ? `Next: Run skill-sync sync${scopeOption} to update or restore the non-current skills.`
+            : ordered[0] === undefined
+              ? `Next: Run skill-sync list${scopeOption} and follow its preview-ready install command.`
+              : `Next: Inspect ${ordered[0].id} with skill-sync diff ${ordered[0].id}${scopeOption}, or run skill-sync list${scopeOption} to install more skills.`,
+  );
   return lines.join('\n');
 }
 
-export function formatProjectDiffHuman(report: ProjectDiffReport): string {
+export function formatProjectDiffHuman(
+  report: ProjectDiffReport,
+  options: ProjectHumanFormatOptions = {},
+): string {
+  const scopeOption = projectOptionSuffix(options);
   const freshness = report.authoritative ? report.freshness : `${report.freshness}, not current`;
+  const targets = [...report.targets].sort((left, right) => {
+    const targetOrder = comparePortableStrings(left.target, right.target);
+    return targetOrder === 0
+      ? comparePortableStrings(left.destination, right.destination)
+      : targetOrder;
+  });
+  const differenceCount = targets.reduce((total, target) => total + target.differences.length, 0);
   const lines = [
-    `${report.id}: ${report.state}`,
-    `Library revision: ${report.libraryRevision} (${freshness})`,
+    `Scope: project (${report.projectRoot})`,
+    `Skill: ${report.id}`,
+    `State: ${report.state}`,
+    `Library: ${report.libraryIdentity} @ ${report.libraryRevision} (${freshness})`,
+    `Targets: ${String(targets.length)}; differences: ${String(differenceCount)}`,
   ];
   if (report.warning !== undefined) lines.push(`Warning: ${report.warning.message}`);
-  for (const target of report.targets) {
-    lines.push(`${target.target} ${target.destination}:`);
+  else if (report.stale)
+    lines.push('Warning: Cached differences may not reflect the remote library.');
+  for (const target of targets) {
+    const differences = [...target.differences].sort((left, right) => {
+      const pathOrder = comparePortableStrings(left.path, right.path);
+      return pathOrder === 0 ? comparePortableStrings(left.kind, right.kind) : pathOrder;
+    });
+    const visible = differences.slice(0, 25);
+    lines.push(`${target.target} ${target.destination} (${String(differences.length)}):`);
     if (target.differences.length === 0) {
       lines.push('  no content differences');
     } else {
-      for (const difference of target.differences) {
+      for (const difference of visible) {
         lines.push(`  ${difference.kind}: ${difference.path}`);
+      }
+      if (visible.length < differences.length) {
+        lines.push(`  … ${String(differences.length - visible.length)} more differences omitted`);
       }
     }
   }
+  lines.push(
+    report.stale
+      ? `Next: Re-run skill-sync diff ${report.id}${scopeOption} when remote access is available before making changes.`
+      : report.state === 'orphaned'
+        ? `Next: ${report.id} no longer exists in the canonical library. Preview removal with skill-sync uninstall ${report.id}${scopeOption} --dry-run, or restore that skill to the library.`
+        : differenceCount === 0
+          ? `Next: No sync is needed; run skill-sync status${scopeOption} to review all managed skills.`
+          : ['conflicted', 'locally-modified', 'unmanaged-collision'].includes(report.state)
+            ? `Next: Keep the local edits, or run skill-sync sync${scopeOption} --discard-local only if canonical content should replace them.`
+            : `Next: Run skill-sync sync${scopeOption} to reconcile this skill, then verify with skill-sync status${scopeOption}.`,
+  );
   return lines.join('\n');
 }
 
@@ -739,6 +817,7 @@ interface CommonReconciliationOptions {
   readonly library: LibraryRevisionProvider;
   readonly offlineRevision?: string;
   readonly operationId?: string;
+  readonly operationGuard?: OperationGuard;
   readonly projectRoot: string;
   readonly storage?: ProjectMutationStorage;
 }
@@ -960,6 +1039,7 @@ async function applySkill(
   options: {
     readonly hooks?: ReconciliationTransactionHooks;
     readonly operationId: string;
+    readonly operationGuard?: OperationGuard;
     readonly storage: ProjectMutationStorage;
   },
 ): Promise<ProjectLock> {
@@ -1011,6 +1091,7 @@ async function applySkill(
       journalDirectory: options.storage.journalDirectory,
       kind: 'reconcile',
       operationId: options.operationId,
+      ...(options.operationGuard === undefined ? {} : { operationGuard: options.operationGuard }),
       replacements,
       root: inspection.snapshot.projectRoot,
     });
@@ -1158,10 +1239,16 @@ async function reconcile(
           currentLock = await applySkill(result, inspection, currentLock, {
             ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
             operationId: skillOperationId,
+            ...(options.operationGuard === undefined
+              ? {}
+              : { operationGuard: options.operationGuard }),
             storage,
           });
           results.push({ ...result, outcome: successfulOutcome(result.action) });
         } catch (error) {
+          if (isRecoveryIntegrityError(error) || !isTransactionRolledBackError(error)) {
+            throw error;
+          }
           results.push({
             ...result,
             error: { code: 'SKILL_RECONCILIATION_FAILED', message: safeMessage(error) },
@@ -1194,17 +1281,160 @@ export async function updateProjectSkills(
   });
 }
 
-export function formatProjectReconciliationHuman(report: ProjectReconciliationReport): string {
+interface ReconciliationHumanReport {
+  readonly applied: boolean;
+  readonly authoritative: boolean;
+  readonly check: boolean;
+  readonly dryRun: boolean;
+  readonly freshness: string;
+  readonly libraryIdentity: string;
+  readonly libraryRevision: string;
+  readonly operation: ReconciliationOperation;
+  readonly selectedIds: readonly string[];
+  readonly skills: readonly ReconciliationSkillResult[];
+  readonly stale: boolean;
+  readonly warning?: { readonly code: string; readonly message: string };
+  readonly wouldChange: boolean;
+}
+
+interface ReconciliationHumanScope {
+  readonly label: string;
+  readonly optionSuffix: string;
+}
+
+const RECONCILIATION_HUMAN_LIMIT = 20;
+const RECONCILIATION_OUTCOME_ORDER: readonly ReconciliationOutcome[] = [
+  'unchanged',
+  'planned',
+  'updated',
+  'restored',
+  'discarded-local',
+  'skipped',
+  'failed',
+];
+
+function reconciliationResultLabel(report: ReconciliationHumanReport): string {
+  const failed = report.skills.some((skill) => skill.outcome === 'failed');
+  const skipped = report.skills.some((skill) => skill.outcome === 'skipped');
+  if (failed || skipped) return report.applied ? 'partial' : 'needs attention';
+  if (report.check) return report.wouldChange ? 'changes detected' : 'current';
+  if (report.dryRun) return report.wouldChange ? 'changes planned' : 'no changes';
+  return report.applied ? 'complete' : 'already current';
+}
+
+function reconciliationCommand(
+  report: ReconciliationHumanReport,
+  optionSuffix: ReconciliationHumanScope['optionSuffix'],
+): string | undefined {
+  if (report.operation === 'sync') return `skill-sync sync${optionSuffix}`;
+  if (report.selectedIds.length === 0) return `skill-sync update --all${optionSuffix}`;
+  if (report.selectedIds.length > 5) return undefined;
+  return `skill-sync update ${report.selectedIds.join(' ')}${optionSuffix}`;
+}
+
+function countLabel(count: number, singular: string): string {
+  return `${String(count)} ${singular}${count === 1 ? '' : 's'}`;
+}
+
+function reconciliationNextAction(
+  report: ReconciliationHumanReport,
+  scope: ReconciliationHumanScope,
+): string {
+  const statusCommand = `skill-sync status${scope.optionSuffix}`;
+  const command = reconciliationCommand(report, scope.optionSuffix);
+  const failed = report.skills.find((skill) => skill.outcome === 'failed');
+  if (failed !== undefined) {
+    const retry =
+      command === undefined ? 'retry the same skill-sync update selection' : `retry ${command}`;
+    return `Next: Fix the failure for ${failed.id}, then ${retry}; run skill-sync doctor if the cause is environmental.`;
+  }
+  const orphaned = report.skills.find((skill) => skill.action === 'skip-orphaned');
+  if (orphaned !== undefined) {
+    return `Next: ${orphaned.id} no longer exists in the canonical library. Preview removal with skill-sync uninstall ${orphaned.id}${scope.optionSuffix} --dry-run, or restore that skill to the library.`;
+  }
+  const skipped = report.skills.find((skill) => skill.outcome === 'skipped');
+  if (skipped !== undefined) {
+    const retry =
+      command === undefined ? 'retry the same skill-sync update selection' : `retry ${command}`;
+    return `Next: Review ${skipped.id} with skill-sync diff ${skipped.id}${scope.optionSuffix}, resolve the reported conflict, then ${retry}.`;
+  }
+  if (report.stale) {
+    return `Next: Run ${statusCommand} when remote access is available to confirm the current remote state.`;
+  }
+  if ((report.check || report.dryRun) && report.wouldChange) {
+    const destructive = report.skills.some((skill) => skill.action === 'discard-local');
+    if (command === undefined) {
+      return 'Next: Re-run the same skill-sync update selection without --dry-run to apply this preview.';
+    }
+    return `Next: Apply with ${command}${destructive ? ' --discard-local' : ''}, then verify with ${statusCommand}.`;
+  }
+  if (report.applied) return `Next: Verify with ${statusCommand}.`;
+  return `Next: No changes needed; run ${statusCommand} to review all managed skills.`;
+}
+
+export function formatReconciliationReportHuman(
+  report: ReconciliationHumanReport,
+  scope: ReconciliationHumanScope,
+): string {
   const mode = report.check ? 'check' : report.dryRun ? 'dry-run' : 'apply';
   const freshness = report.authoritative ? report.freshness : `${report.freshness}, not current`;
-  const lines = [
-    `${report.operation} (${mode}): ${report.projectRoot}`,
-    `Library: ${report.libraryIdentity} @ ${report.libraryRevision} (${freshness})`,
-  ];
-  if (report.warning !== undefined) lines.push(`Warning: ${report.warning.message}`);
+  const outcomeCounts = new Map<ReconciliationOutcome, number>();
   for (const skill of report.skills) {
-    lines.push(`${skill.id}: ${skill.state} -> ${skill.outcome}`);
-    if (skill.error !== undefined) lines.push(`  ${skill.error.message}`);
+    outcomeCounts.set(skill.outcome, (outcomeCounts.get(skill.outcome) ?? 0) + 1);
   }
+  const outcomes = RECONCILIATION_OUTCOME_ORDER.flatMap((outcome) => {
+    const count = outcomeCounts.get(outcome) ?? 0;
+    return count === 0 ? [] : [`${outcome} ${String(count)}`];
+  });
+  const writeCount = new Set(report.skills.flatMap((skill) => skill.writes)).size;
+  const backupCount = new Set(report.skills.flatMap((skill) => skill.backupPaths)).size;
+  const sortedSkills = [...report.skills].sort((left, right) =>
+    comparePortableStrings(left.id, right.id),
+  );
+  const visibleSkills = sortedSkills.slice(0, RECONCILIATION_HUMAN_LIMIT);
+  const lines = [
+    `${report.operation === 'sync' ? 'Sync' : 'Update'} ${mode}: ${scope.label}`,
+    `Library: ${report.libraryIdentity} @ ${report.libraryRevision} (${freshness})`,
+    `Result: ${reconciliationResultLabel(report)}; selected ${String(report.skills.length)}`,
+    `Outcomes: ${outcomes.length === 0 ? 'none' : outcomes.join('; ')}`,
+  ];
+  if (writeCount > 0 || backupCount > 0) {
+    lines.push(`Paths: ${countLabel(writeCount, 'write')}; ${countLabel(backupCount, 'backup')}`);
+  }
+  if (report.warning !== undefined) lines.push(`Warning: ${report.warning.message}`);
+  if (visibleSkills.length === 0) {
+    lines.push('Skills: none');
+  } else {
+    lines.push(
+      `Skills (showing ${String(visibleSkills.length)} of ${String(sortedSkills.length)}):`,
+    );
+  }
+  for (const skill of visibleSkills) {
+    const details = [
+      ...(skill.action === 'none' ? [] : [skill.action]),
+      ...(skill.writes.length === 0 ? [] : [countLabel(skill.writes.length, 'write')]),
+      ...(skill.backupPaths.length === 0 ? [] : [countLabel(skill.backupPaths.length, 'backup')]),
+    ];
+    lines.push(
+      `  ${skill.id}: ${skill.state} → ${skill.outcome}${details.length === 0 ? '' : ` (${details.join('; ')})`}`,
+    );
+    if (skill.error !== undefined) {
+      lines.push(`    Error ${skill.error.code}: ${skill.error.message}`);
+    }
+  }
+  if (visibleSkills.length < sortedSkills.length) {
+    lines.push(`  … ${String(sortedSkills.length - visibleSkills.length)} more skills omitted`);
+  }
+  lines.push(reconciliationNextAction(report, scope));
   return lines.join('\n');
+}
+
+export function formatProjectReconciliationHuman(
+  report: ProjectReconciliationReport,
+  options: ProjectHumanFormatOptions = {},
+): string {
+  return formatReconciliationReportHuman(report, {
+    label: `project ${report.projectRoot}`,
+    optionSuffix: projectOptionSuffix(options),
+  });
 }

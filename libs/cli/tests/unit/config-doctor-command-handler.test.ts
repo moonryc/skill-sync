@@ -2,7 +2,11 @@ import { readFile } from 'node:fs/promises';
 
 import { describe, expect, it } from 'vitest';
 
-import { ConfigService, type ConfigurationListing } from '../../src/application/config-service.js';
+import {
+  ConfigService,
+  type ConfigKey,
+  type ConfigurationListing,
+} from '../../src/application/config-service.js';
 import type { DoctorReport, DoctorRequest } from '../../src/application/doctor.js';
 import {
   createConfigDoctorCommandHandler,
@@ -88,15 +92,59 @@ function fakeConfig(overrides: Partial<ConfigCommandService> = {}): ConfigComman
   ]);
   return {
     path: () => '/config/config.json',
-    list: () => Promise.resolve(BASE_LISTING),
+    list: () =>
+      Promise.resolve({
+        path: BASE_LISTING.path,
+        configured: {
+          'library.remote': values.get('library.remote'),
+          'library.branch': values.get('library.branch'),
+          'library.transport': values.get('library.transport'),
+          'defaults.targets': values.get('defaults.targets'),
+          'defaults.gitignore': values.get('defaults.gitignore'),
+        },
+        effective: {
+          value: {
+            ...(typeof values.get('library.remote') === 'string'
+              ? { libraryUrl: values.get('library.remote') as string }
+              : {}),
+            branch:
+              typeof values.get('library.branch') === 'string'
+                ? (values.get('library.branch') as string)
+                : 'main',
+            defaultTargets: Array.isArray(values.get('defaults.targets'))
+              ? (values.get('defaults.targets') as readonly ('claude' | 'codex')[])
+              : [],
+            gitignore: values.get('defaults.gitignore') === 'manage' ? 'manage' : 'leave',
+            transport: values.get('library.transport') === 'ssh' ? 'ssh' : 'https',
+          },
+          sources: {
+            branch: values.has('library.branch') ? 'user' : 'default',
+            defaultTargets: values.has('defaults.targets') ? 'user' : 'default',
+            gitignore: values.has('defaults.gitignore') ? 'user' : 'default',
+            libraryUrl: values.has('library.remote') ? 'user' : 'default',
+            transport: values.has('library.transport') ? 'user' : 'default',
+          },
+        },
+      }),
     get: (key) => Promise.resolve(values.get(key)),
     set: (key, value) => {
       values.set(key, value);
       return Promise.resolve(undefined);
     },
     unset: (key) => {
-      values.delete(key);
-      return Promise.resolve(undefined);
+      let changedKeys: ConfigKey[] = [];
+      if (key === 'library.remote' && values.has(key)) {
+        changedKeys = [
+          'library.remote',
+          ...(values.has('library.branch') ? (['library.branch'] as const) : []),
+          ...(values.has('library.transport') ? (['library.transport'] as const) : []),
+        ];
+        for (const changedKey of changedKeys) values.delete(changedKey);
+      } else if (values.has(key)) {
+        values.delete(key);
+        changedKeys = [key as ConfigKey];
+      }
+      return Promise.resolve({ changed: changedKeys.length > 0, changedKeys });
     },
     ...overrides,
   };
@@ -130,7 +178,10 @@ describe('composable config and doctor command handler', () => {
 
     await expect(requiredResult(handler, invocation('config:path'))).resolves.toEqual({
       ok: true,
-      data: '/config/config.json',
+      data: [
+        'Configuration path: /config/config.json',
+        'Next: Run skill-sync config list to inspect configured and effective values.',
+      ].join('\n'),
       exitCode: 0,
     });
     await expect(
@@ -140,9 +191,14 @@ describe('composable config and doctor command handler', () => {
     const humanList = await requiredResult(handler, invocation('config:list'));
     expect(humanList).toMatchObject({ ok: true });
     if (humanList.ok) {
-      expect(humanList.data).toContain('Configuration: /config/config.json');
-      expect(humanList.data).toContain('library.branch = stable (user)');
-      expect(humanList.data).toContain('defaults.gitignore = <unset>');
+      expect(humanList.data).toContain('Configuration path: /config/config.json');
+      expect(humanList.data).toContain('Configured values: 2 of 5');
+      expect(humanList.data).toContain('Key: library.branch');
+      expect(humanList.data).toContain('Configured: stable');
+      expect(humanList.data).toContain('Effective source: user');
+      expect(humanList.data).toContain('Key: defaults.gitignore');
+      expect(humanList.data).toContain('Configured: <unset>');
+      expect(humanList.data).toContain('Next: Change a value with skill-sync config set');
     }
 
     const jsonList = await requiredResult(handler, invocation('config:list', [], { json: true }));
@@ -157,15 +213,31 @@ describe('composable config and doctor command handler', () => {
       },
     });
 
-    await expect(
-      requiredResult(handler, invocation('config:get', ['defaults.targets'])),
-    ).resolves.toMatchObject({ ok: true, data: 'claude, codex' });
+    const humanGet = await requiredResult(handler, invocation('config:get', ['defaults.targets']));
+    expect(humanGet).toMatchObject({ ok: true });
+    if (humanGet.ok) {
+      expect(humanGet.data).toContain('Key: defaults.targets');
+      expect(humanGet.data).toContain('Configuration path: /config/config.json');
+      expect(humanGet.data).toContain('Configured value: claude, codex');
+      expect(humanGet.data).toContain('Effective value: claude, codex');
+      expect(humanGet.data).toContain('Effective source: user');
+      expect(humanGet.data).toContain('Next: Change it with skill-sync config set');
+    }
     await expect(
       requiredResult(handler, invocation('config:get', ['library.remote'], { json: true })),
     ).resolves.toMatchObject({
       ok: true,
       data: { key: 'library.remote', configured: false, value: null },
     });
+    const missingGet = await requiredResult(handler, invocation('config:get', ['library.remote']));
+    expect(missingGet).toMatchObject({ ok: true });
+    if (missingGet.ok) {
+      expect(missingGet.data).toContain('Configured value: <unset>');
+      expect(missingGet.data).toContain(
+        'Next: Set it with skill-sync config set library.remote <value>.',
+      );
+      expect(missingGet.data).not.toContain('config unset library.remote');
+    }
   });
 
   it('sets and unsets values through the injected service', async () => {
@@ -180,10 +252,88 @@ describe('composable config and doctor command handler', () => {
       ok: true,
       data: { key: 'defaults.gitignore', value: 'manage' },
     });
-    await expect(
-      requiredResult(handler, invocation('config:unset', ['defaults.gitignore'])),
-    ).resolves.toMatchObject({ ok: true, data: 'Unset defaults.gitignore.' });
+    const humanUnset = await requiredResult(
+      handler,
+      invocation('config:unset', ['defaults.gitignore']),
+    );
+    expect(humanUnset).toMatchObject({ ok: true });
+    if (humanUnset.ok) expect(humanUnset.data).toContain('Configured value removed.');
     await expect(config.get('defaults.gitignore')).resolves.toBeUndefined();
+
+    const humanSet = await requiredResult(
+      handler,
+      invocation('config:set', ['defaults.gitignore', 'manage']),
+    );
+    expect(humanSet).toMatchObject({ ok: true });
+    if (humanSet.ok) {
+      expect(humanSet.data).toContain('Configuration updated.');
+      expect(humanSet.data).toContain('Key: defaults.gitignore');
+      expect(humanSet.data).toContain('Configured value: manage');
+      expect(humanSet.data).toContain('Effective value: manage');
+      expect(humanSet.data).toContain('Effective source: user');
+      expect(humanSet.data).toContain('Next: Run skill-sync config get defaults.gitignore');
+    }
+
+    const jsonUnset = await requiredResult(
+      handler,
+      invocation('config:unset', ['defaults.gitignore'], { json: true }),
+    );
+    expect(jsonUnset).toMatchObject({
+      data: {
+        changed: true,
+        changedKeys: ['defaults.gitignore'],
+        key: 'defaults.gitignore',
+        unset: true,
+      },
+      ok: true,
+    });
+
+    const noOp = await requiredResult(handler, invocation('config:unset', ['defaults.gitignore']));
+    expect(noOp).toMatchObject({ ok: true });
+    if (noOp.ok) {
+      expect(noOp.data).toContain('No configuration change.');
+      expect(noOp.data).toContain('Changed keys (0): none');
+      expect(noOp.data).toContain(
+        'Next: Set an override with skill-sync config set defaults.gitignore <value>.',
+      );
+    }
+    await expect(
+      requiredResult(handler, invocation('config:unset', ['defaults.gitignore'], { json: true })),
+    ).resolves.toMatchObject({
+      data: { changed: false, changedKeys: [], unset: false },
+      ok: true,
+    });
+  });
+
+  it('renders empty configured arrays as none instead of a blank value', async () => {
+    const emptyTargets: ConfigurationListing = {
+      ...BASE_LISTING,
+      configured: { ...BASE_LISTING.configured, 'defaults.targets': [] },
+      effective: {
+        value: { ...BASE_LISTING.effective.value, defaultTargets: [] },
+        sources: { ...BASE_LISTING.effective.sources, defaultTargets: 'user' },
+      },
+    };
+    const handler = createConfigDoctorCommandHandler({
+      config: fakeConfig({
+        get: (key) => Promise.resolve(key === 'defaults.targets' ? [] : undefined),
+        list: () => Promise.resolve(emptyTargets),
+      }),
+    });
+
+    const get = await requiredResult(handler, invocation('config:get', ['defaults.targets']));
+    expect(get).toMatchObject({ ok: true });
+    if (get.ok) {
+      expect(get.data).toContain('Configured value: <none>');
+      expect(get.data).toContain('Effective value: <none>');
+    }
+    const list = await requiredResult(handler, invocation('config:list'));
+    expect(list).toMatchObject({ ok: true });
+    if (list.ok) {
+      expect(list.data).toContain('Key: defaults.targets');
+      expect(list.data).toContain('Configured: <none>');
+      expect(list.data).toContain('Effective: <none>');
+    }
   });
 
   it('maps plain config validation errors to redacted status 3 failures', async () => {
@@ -233,6 +383,52 @@ describe('composable config and doctor command handler', () => {
       );
       expect(invalid).toMatchObject({ ok: false, exitCode: 3 });
       expect(await readFile(service.path(), 'utf8')).toBe(before);
+    });
+  });
+
+  it('names every coupled key when unsetting a configured library remote', async () => {
+    await withTempDirectory('skill-sync-config-command-coupled-unset-', async (root) => {
+      const environment = { SKILL_SYNC_CONFIG_HOME: root };
+      const service = new ConfigService(
+        environment,
+        resolveApplicationPaths({ cwd: root, env: environment }),
+      );
+      const handler = createConfigDoctorCommandHandler({ config: service });
+      await service.set('library.remote', 'https://github.com/acme/skills.git');
+      await service.set('library.branch', 'stable');
+      await service.set('library.transport', 'ssh');
+
+      const human = await requiredResult(handler, invocation('config:unset', ['library.remote']));
+      expect(human).toMatchObject({ ok: true });
+      if (human.ok) {
+        expect(human.data).toContain('Configuration updated.');
+        expect(human.data).toContain('Requested key: library.remote');
+        expect(human.data).toContain(
+          'Changed keys (3): library.remote, library.branch, library.transport',
+        );
+        expect(human.data).toContain(
+          'Next: Run skill-sync config list to review every effective value',
+        );
+      }
+      expect(await service.get('library.remote')).toBeUndefined();
+      expect(await service.get('library.branch')).toBeUndefined();
+      expect(await service.get('library.transport')).toBeUndefined();
+
+      await service.set('library.remote', 'https://github.com/acme/skills.git');
+      await service.set('library.branch', 'stable');
+      const json = await requiredResult(
+        handler,
+        invocation('config:unset', ['library.remote'], { json: true }),
+      );
+      expect(json).toMatchObject({
+        data: {
+          changed: true,
+          changedKeys: ['library.remote', 'library.branch', 'library.transport'],
+          key: 'library.remote',
+          unset: true,
+        },
+        ok: true,
+      });
     });
   });
 

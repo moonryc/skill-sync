@@ -253,6 +253,75 @@ describe('project installation application service', () => {
     });
   });
 
+  it('applies only the exact reviewed project install plan', async () => {
+    await withTempDirectory('skill-sync-reviewed-install-', async (root) => {
+      const project = join(root, 'project');
+      await mkdir(project);
+      const skill = await createResolvedSkill(root);
+      const common = {
+        gitignore: 'managed' as const,
+        libraryIdentity,
+        libraryRevision: firstRevision,
+        projectRoot: project,
+        skills: [skill],
+        storage: storage(root),
+        targets: ['codex'] as const,
+      };
+      const preview = await installProjectSkills({ ...common, dryRun: true });
+
+      expect(preview.fingerprint).toMatch(/^install-v1-[a-f0-9]{64}$/u);
+      const installed = await installProjectSkills({
+        ...common,
+        expectedPlanFingerprint: preview.fingerprint,
+      });
+
+      expect(installed).toMatchObject({ applied: true, fingerprint: preview.fingerprint });
+      expect(await readProjectManifest(project)).toBeDefined();
+    });
+  });
+
+  it('refuses a changed reviewed project install before staging or journaling', async () => {
+    await withTempDirectory('skill-sync-changed-install-', async (root) => {
+      const project = join(root, 'project');
+      await mkdir(project);
+      const skill = await createResolvedSkill(root);
+      const common = {
+        gitignore: 'managed' as const,
+        libraryIdentity,
+        libraryRevision: firstRevision,
+        projectRoot: project,
+        skills: [skill],
+        storage: storage(root),
+        targets: ['codex'] as const,
+      };
+      const preview = await installProjectSkills({ ...common, dryRun: true });
+      await writeFile(join(project, '.gitignore'), '# added after review\n');
+
+      const error = await expectSkillSyncError(
+        installProjectSkills({
+          ...common,
+          expectedPlanFingerprint: preview.fingerprint,
+        }),
+        'INSTALL_PLAN_CHANGED',
+      );
+
+      expect(error.exitCode).toBe(5);
+      expect(error.details).toMatchObject({
+        expectedFingerprint: preview.fingerprint,
+        scope: 'project',
+      });
+      expect(await readFile(join(project, '.gitignore'), 'utf8')).toBe('# added after review\n');
+      expect(await readProjectManifest(project)).toBeUndefined();
+      expect(await readProjectLock(project)).toBeUndefined();
+      expect(
+        await readFile(join(project, '.codex', 'skills', 'review-ui', 'SKILL.md'), 'utf8').catch(
+          () => undefined,
+        ),
+      ).toBeUndefined();
+      expect(await readdir(storage(root).journalDirectory).catch(() => [])).toEqual([]);
+    });
+  });
+
   it('makes an identical reinstall a byte-and-mtime no-op', async () => {
     await withTempDirectory('skill-sync-idempotent-service-', async (root) => {
       const project = join(root, 'project');

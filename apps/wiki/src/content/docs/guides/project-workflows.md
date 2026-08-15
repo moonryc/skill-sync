@@ -17,17 +17,26 @@ skill-sync tui
 The command center groups the catalog, supports search and multi-selection,
 shows managed reconciliation badges, and reports valid Codex/Claude skill
 directories that exist on disk but are not represented by this project's state.
+Project and global dashboards honor a valid effective `defaults.targets` set
+and fall back to Codex only when no valid target set is available.
 The inventory is read-only while browsing. An eligible entry can be adopted only
 after choosing an explicit compatible qualified canonical ID and accepting a
 review; the final exact-digest verification writes tracking state only and never
 overwrites the target directory. Install and sync actions always show a review
 and use the normal collision, backup, and local-edit safety rules. `tui` is
-unavailable with redirected streams, `--json`, or `--no-input`; use the commands
+unavailable with redirected streams, `--json`, `--no-input`, or `--yes`; use the commands
 in this guide for automation.
 
 Run `skill-sync --global` or `skill-sync --global tui` to use the same visual
 workflow against user-level state; its inventory then identifies global skills
 that exist on disk but are not globally tracked.
+
+On first run, `Create GitHub library (starts empty)` makes the authoring state
+explicit. After setup, a populated library opens the catalog with
+`Space` selection and `i` install-review guidance. An empty library remains on
+the overview and points exactly to `skill-sync add <path> --dry-run`. A catalog
+with no search or group matches reports that filtered state separately and does
+not suggest adding a skill.
 
 ## Adopt an existing exact copy
 
@@ -55,7 +64,19 @@ skill-sync install frontend/review-ui \
   --dry-run
 ```
 
-Remove `--dry-run` after reviewing the planned destinations. Repeat `--target` for each agent or use configured defaults. `--all` selects every eligible skill. `--gitignore` and `--no-gitignore` explicitly control the project's managed ignore block.
+Run the complete `Next: skill-sync ... --expect-plan ...` command printed by the human preview to
+apply it. That handoff uses the resolved exact qualified IDs, or preserves `--all`, sorts repeated
+`--target` flags, includes the resolved `--gitignore` or `--no-gitignore` project policy, and keeps
+project/global scope; global handoffs omit the inapplicable policy flag. If you supplied an explicit
+project, replace its safe `--project <project-path>` placeholder with the labeled path from the
+preview. Repeat `--target` for each agent or use configured defaults. `--all` selects every eligible
+skill. `--gitignore` and `--no-gitignore` explicitly control the project's managed ignore block.
+
+A direct `install` with neither `--expect-plan` nor explicit `--yes` is still preview-first.
+Interactive human use prints the plan and asks before applying it. When confirmation is unavailable
+because of `--no-input`, `--json`, CI, or redirected streams, it returns a cache-only preview and
+makes no project or global writes. `--expect-plan` applies the reviewed plan; explicit `--yes` is
+the intentional one-command automation opt-in.
 
 `install` creates new managed copies; it never acts as an update. Existing IDs, path collisions, invalid content, or unsafe destination state stop before writes.
 
@@ -65,7 +86,7 @@ Use explicit global scope when the skill belongs in your user-level agent setup:
 
 ```sh
 skill-sync --global install frontend/review-ui --target codex --dry-run
-skill-sync --global install frontend/review-ui --target codex
+# Run the exact --expect-plan command printed by the preview.
 ```
 
 Global copies use `~/.codex/skills/<name>` or `~/.claude/skills/<name>`, with

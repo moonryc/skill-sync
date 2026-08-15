@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -7,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 
 import { type NormalizedGitRemote } from '../../src/infrastructure/git.js';
 import {
+  createFilesystemLibraryCacheLock,
   LibraryCache,
   LibraryCacheError,
   type LibraryCacheLock,
@@ -94,6 +96,78 @@ describe('library cache', () => {
     });
   });
 
+  it('blocks a second-process cache refresh with the same identity without blocking inspection', async () => {
+    await withTempDirectory('skill-sync-cache-process-lock-', async (directory) => {
+      const fixture = await createRemote(directory);
+      const remote = localRemote(fixture.bare);
+      const cacheRoot = join(directory, 'cache');
+      const locksDirectory = join(directory, 'locks');
+      const key = createHash('sha256').update(remote.identity).digest('hex');
+      const lockPath = join(locksDirectory, `cache-${key}.lock`);
+      const childScript = `
+        import { mkdir, open } from 'node:fs/promises';
+        import { dirname } from 'node:path';
+        import { randomUUID } from 'node:crypto';
+        const [path, identity] = process.argv.slice(1);
+        await mkdir(dirname(path), { recursive: true });
+        const handle = await open(path, 'wx', 0o600);
+        await handle.writeFile(JSON.stringify({
+          createdAt: new Date().toISOString(),
+          hostname: 'cache-child',
+          operationId: 'child-cache-refresh',
+          ownerToken: randomUUID(),
+          pid: process.pid,
+          schemaVersion: 1,
+          scope: { id: identity, kind: 'library' }
+        }));
+        await handle.sync();
+        await handle.close();
+      `;
+      await execFileAsync(process.execPath, [
+        '--input-type=module',
+        '-e',
+        childScript,
+        lockPath,
+        key,
+      ]);
+      const childLock = await readFile(lockPath, 'utf8');
+      const cache = new LibraryCache({
+        rootDirectory: cacheRoot,
+        withLock: createFilesystemLibraryCacheLock({ locksDirectory }),
+      });
+
+      await expect(
+        cache.refresh({ remote, branch: 'main', access: 'mutation' }),
+      ).rejects.toMatchObject({
+        lockPath,
+        owner: {
+          hostname: 'cache-child',
+          operationId: 'child-cache-refresh',
+          scope: { id: key, kind: 'library' },
+        },
+      });
+      await expect(
+        cache.promoteExact({
+          remote,
+          branch: 'main',
+          revision: fixture.revision,
+          sourceRepositoryDirectory: fixture.worktree,
+        }),
+      ).rejects.toMatchObject({ lockPath });
+      await expect(readdir(cacheRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+
+      await expect(cache.inspect({ remote, branch: 'main' })).rejects.toMatchObject({
+        code: 'STALE_CACHE_UNAVAILABLE',
+      });
+      expect(await readFile(lockPath, 'utf8')).toBe(childLock);
+
+      await rm(lockPath);
+      const refreshed = await cache.refresh({ remote, branch: 'main', access: 'mutation' });
+      expect(refreshed.revision).toBe(fixture.revision);
+      await expect(readFile(lockPath, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+  });
+
   it('refreshes a configured branch to its new exact revision', async () => {
     await withTempDirectory('skill-sync-cache-refresh-', async (directory) => {
       const fixture = await createRemote(directory);
@@ -113,6 +187,75 @@ describe('library cache', () => {
       expect(second.revision).not.toBe(first.revision);
       expect(second.branch).toBe('main');
       expect(second.freshness).toBe('fetched');
+    });
+  });
+
+  it('promotes the reviewed exact commit from prepared local storage without fetching it again', async () => {
+    await withTempDirectory('skill-sync-cache-promote-', async (directory) => {
+      const fixture = await createRemote(directory);
+      const cacheRoot = join(directory, 'cache');
+      const cache = new LibraryCache({
+        rootDirectory: cacheRoot,
+        now: () => new Date('2026-08-03T00:00:00.000Z'),
+      });
+      const remote = localRemote(fixture.bare);
+
+      const promoted = await cache.promoteExact({
+        remote,
+        branch: 'main',
+        revision: fixture.revision,
+        sourceRepositoryDirectory: fixture.worktree,
+      });
+
+      expect(promoted).toMatchObject({
+        branch: 'main',
+        revision: fixture.revision,
+        freshness: 'fetched',
+        stale: false,
+        usableForMutation: true,
+        refreshedAt: '2026-08-03T00:00:00.000Z',
+      });
+      expect(promoted.treeDirectory).toBeDefined();
+      expect(await readFile(join(promoted.treeDirectory ?? '', 'README.md'), 'utf8')).toBe(
+        'first\n',
+      );
+      const inspected = await cache.inspect({ remote, branch: 'main' });
+      expect(inspected.revision).toBe(fixture.revision);
+    });
+  });
+
+  it('rejects remote drift before creating or changing persistent cache state', async () => {
+    await withTempDirectory('skill-sync-cache-promote-race-', async (directory) => {
+      const fixture = await createRemote(directory);
+      const prepared = join(directory, 'prepared.git');
+      await git(directory, ['init', '--bare', '--quiet', prepared]);
+      await git(prepared, ['remote', 'add', 'origin', fixture.bare]);
+      await git(prepared, [
+        'fetch',
+        '--quiet',
+        'origin',
+        '+refs/heads/main:refs/remotes/origin/main',
+      ]);
+
+      await writeFile(join(fixture.worktree, 'README.md'), 'advanced after review\n');
+      await git(fixture.worktree, ['add', 'README.md']);
+      await git(fixture.worktree, ['commit', '--quiet', '-m', 'advance after review']);
+      await git(fixture.worktree, ['push', '--quiet', 'origin', 'main']);
+
+      const cacheRoot = join(directory, 'cache');
+      const cache = new LibraryCache({ rootDirectory: cacheRoot });
+      await expect(
+        cache.promoteExact({
+          remote: localRemote(fixture.bare),
+          branch: 'main',
+          revision: fixture.revision,
+          sourceRepositoryDirectory: prepared,
+        }),
+      ).rejects.toMatchObject({
+        code: 'EXPECTED_REVISION_CHANGED',
+        expectedRevision: fixture.revision,
+      });
+      await expect(readdir(cacheRoot)).rejects.toMatchObject({ code: 'ENOENT' });
     });
   });
 
@@ -186,15 +329,25 @@ describe('library cache', () => {
     await withTempDirectory('skill-sync-cache-inspect-', async (directory) => {
       const fixture = await createRemote(directory);
       const cacheRoot = join(directory, 'cache');
-      const cache = new LibraryCache({ rootDirectory: cacheRoot });
+      const lockKeys: string[] = [];
+      const cache = new LibraryCache({
+        rootDirectory: cacheRoot,
+        withLock: async (key, operation) => {
+          lockKeys.push(key);
+          return await operation();
+        },
+      });
       const remote = localRemote(fixture.bare);
 
       await expect(cache.inspect({ remote, branch: 'main' })).rejects.toMatchObject({
         code: 'STALE_CACHE_UNAVAILABLE',
       });
+      expect(lockKeys).toEqual([]);
       await expect(readdir(cacheRoot)).rejects.toMatchObject({ code: 'ENOENT' });
 
       const fetched = await cache.refresh({ remote, branch: 'main', access: 'read-only' });
+      expect(lockKeys).toHaveLength(1);
+      lockKeys.length = 0;
       const statePath = join(fetched.repositoryDirectory, '..', 'state.json');
       const beforeState = await readFile(statePath, 'utf8');
       const beforeEntries = await readdir(join(fetched.repositoryDirectory, '..'));
@@ -209,6 +362,7 @@ describe('library cache', () => {
       });
       expect(await readFile(statePath, 'utf8')).toBe(beforeState);
       expect(await readdir(join(fetched.repositoryDirectory, '..'))).toEqual(beforeEntries);
+      expect(lockKeys).toEqual([]);
     });
   });
 

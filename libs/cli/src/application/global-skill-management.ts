@@ -3,9 +3,11 @@ import { lstat, rm, writeFile } from 'node:fs/promises';
 import { basename, dirname, relative, resolve, sep } from 'node:path';
 
 import type { CatalogSkillRecord } from './catalog.js';
+import { installPlanFingerprint, type ReviewedInstallOriginal } from './install-plan.js';
 import type { ProjectMutationStorage } from './project-installation.js';
 import {
   type LibraryRevisionProvider,
+  formatReconciliationReportHuman,
   type ProjectDiffReport,
   type ProjectSkillStatus,
   type ProjectStatusReport,
@@ -16,6 +18,7 @@ import {
 } from './project-reconciliation.js';
 import { resolveSkillSelectors, selectAllSkills } from './selectors.js';
 import { inspectRegularFileTree, type RegularFileInventoryEntry } from '../domain/digest.js';
+import { comparePortableStrings } from '../domain/identifiers.js';
 import { validateLibrary, validateSkillDirectory, type ValidatedSkill } from '../domain/library.js';
 import {
   PROJECT_LOCK_SCHEMA_VERSION,
@@ -37,7 +40,8 @@ import {
   GLOBAL_LOCK_FILENAME,
   GLOBAL_MANIFEST_FILENAME,
 } from '../infrastructure/global-state.js';
-import { assertProjectStatePair, isPathContained } from '../infrastructure/project-state.js';
+import { loadManagedStatePair } from '../infrastructure/managed-state.js';
+import { isPathContained } from '../infrastructure/project-state.js';
 import { stableJsonStringify } from '../infrastructure/stable-json.js';
 import {
   acquireAdvisoryLock,
@@ -45,8 +49,10 @@ import {
   createStagingDirectory,
   replacePathsAtomically,
   stageRegularPath,
+  transactionContentDigest,
   type AtomicReplacement,
 } from '../infrastructure/transactions.js';
+import type { OperationGuard } from '../runtime/operation-guard.js';
 import {
   resolveContainedGlobalDestination,
   TargetRegistry,
@@ -59,6 +65,7 @@ type ResolvedInstallSkill = Pick<CatalogSkillRecord, 'digest' | 'id' | 'name' | 
 export interface GlobalInstallPlan {
   readonly applied: boolean;
   readonly dryRun: boolean;
+  readonly fingerprint: string;
   readonly libraryRevision: string;
   readonly operation: 'install';
   readonly scope: 'global';
@@ -108,6 +115,7 @@ export interface AdoptGlobalSkillOptions {
   readonly libraryIdentity: string;
   readonly libraryRevision: string;
   readonly operationId?: string;
+  readonly operationGuard?: OperationGuard;
   readonly paths: ApplicationPaths;
   readonly registry?: TargetRegistry;
   readonly skill: ResolvedGlobalAdoptSkill;
@@ -283,77 +291,38 @@ function relativeFrom(root: string, path: string): string {
   return value;
 }
 
-async function readSnapshot(paths: ApplicationPaths): Promise<GlobalSnapshot> {
-  const [manifest, lock] = await Promise.all([readGlobalManifest(paths), readGlobalLock(paths)]);
+async function readSnapshot(
+  paths: ApplicationPaths,
+  registry: TargetRegistry,
+): Promise<GlobalSnapshot> {
+  const { lock, manifest } = await loadManagedStatePair({
+    readLock: async () => await readGlobalLock(paths),
+    readManifest: async () => await readGlobalManifest(paths),
+    required: true,
+    resolveDestination: async (projection) =>
+      await destinationFor(registry, projection.target, projection.destination),
+    scope: 'global',
+  });
   if (manifest === undefined || lock === undefined) {
-    throw globalError(
-      'GLOBAL_STATE_REQUIRED',
-      `Both ${GLOBAL_MANIFEST_FILENAME} and ${GLOBAL_LOCK_FILENAME} are required for global skill operations.`,
-      EXIT_CODES.validation,
-    );
-  }
-  if (manifest.library.identity !== lock.library.identity) {
-    throw globalError(
-      'INVALID_GLOBAL_STATE',
-      'Global manifest and lock reference different libraries.',
-      EXIT_CODES.validation,
-    );
-  }
-  const desiredIds = manifest.skills.map((skill) => skill.id).sort();
-  const lockedIds = lock.skills.map((skill) => skill.id).sort();
-  if (desiredIds.join('\n') !== lockedIds.join('\n')) {
-    throw globalError(
-      'INVALID_GLOBAL_STATE',
-      'Global manifest and lock must contain the same skill IDs.',
-      EXIT_CODES.validation,
-    );
+    throw new Error('Required global state was not returned by the managed-state loader.');
   }
   return { lock, manifest, stateDirectory: stateDirectory(paths) };
 }
 
-async function readOptionalSnapshot(paths: ApplicationPaths): Promise<{
+async function readOptionalSnapshot(
+  paths: ApplicationPaths,
+  registry: TargetRegistry,
+): Promise<{
   readonly lock: ProjectLock | undefined;
   readonly manifest: ProjectManifest | undefined;
 }> {
-  const [manifest, lock] = await Promise.all([readGlobalManifest(paths), readGlobalLock(paths)]);
-  if ((manifest === undefined) !== (lock === undefined)) {
-    throw globalError(
-      'INCOMPLETE_GLOBAL_STATE',
-      `Both ${GLOBAL_MANIFEST_FILENAME} and ${GLOBAL_LOCK_FILENAME} must be present together.`,
-      EXIT_CODES.validation,
-    );
-  }
-  if (
-    manifest !== undefined &&
-    lock !== undefined &&
-    manifest.library.identity !== lock.library.identity
-  ) {
-    throw globalError(
-      'INVALID_GLOBAL_STATE',
-      'Global manifest and lock reference different libraries.',
-      EXIT_CODES.validation,
-    );
-  }
-  if (manifest !== undefined && lock !== undefined) {
-    try {
-      assertProjectStatePair(manifest, lock);
-    } catch (error) {
-      throw globalError(
-        'INVALID_GLOBAL_STATE',
-        error instanceof Error ? error.message : 'Global manifest and lock state is invalid.',
-        EXIT_CODES.validation,
-      );
-    }
-    const manifestIds = manifest.skills.map((skill) => skill.id).sort();
-    const lockIds = lock.skills.map((skill) => skill.id).sort();
-    if (manifestIds.join('\n') !== lockIds.join('\n')) {
-      throw globalError(
-        'INVALID_GLOBAL_STATE',
-        'Global manifest and lock must contain the same skill IDs.',
-        EXIT_CODES.validation,
-      );
-    }
-  }
+  const { lock, manifest } = await loadManagedStatePair({
+    readLock: async () => await readGlobalLock(paths),
+    readManifest: async () => await readGlobalManifest(paths),
+    resolveDestination: async (projection) =>
+      await destinationFor(registry, projection.target, projection.destination),
+    scope: 'global',
+  });
   return { lock, manifest };
 }
 
@@ -454,7 +423,7 @@ async function inspectRevision(
   registry: TargetRegistry,
   revision: ResolvedLibraryRevision,
 ): Promise<GlobalInspection> {
-  const snapshot = await readSnapshot(paths);
+  const snapshot = await readSnapshot(paths, registry);
   if (snapshot.manifest.library.identity !== revision.identity) {
     throw globalError(
       'GLOBAL_LIBRARY_MISMATCH',
@@ -526,19 +495,46 @@ interface InstallBuild {
   }[];
   readonly nextLock: ProjectLock;
   readonly nextManifest: ProjectManifest;
+  readonly originalDigests: ReadonlyMap<string, string | null>;
   readonly plan: GlobalInstallPlan;
 }
 
 export interface InstallGlobalSkillsOptions {
   readonly dryRun?: boolean;
+  readonly expectedPlanFingerprint?: string;
   readonly libraryIdentity: string;
   readonly libraryRevision: string;
   readonly operationId?: string;
+  readonly operationGuard?: OperationGuard;
   readonly paths: ApplicationPaths;
   readonly registry?: TargetRegistry;
   readonly skills: readonly ResolvedInstallSkill[];
   readonly storage?: ProjectMutationStorage;
   readonly targets: readonly TargetName[];
+}
+
+interface GlobalInstallOriginal extends ReviewedInstallOriginal {
+  readonly path: string;
+}
+
+async function inspectGlobalInstallOriginals(
+  entries: readonly { readonly destination: string; readonly path: string }[],
+): Promise<readonly GlobalInstallOriginal[]> {
+  return await Promise.all(
+    [...entries]
+      .sort((left, right) => left.destination.localeCompare(right.destination))
+      .map(async (entry) => ({
+        ...entry,
+        digest: (await pathExists(entry.path)) ? await transactionContentDigest(entry.path) : null,
+      })),
+  );
+}
+
+function requiredOriginalDigest(build: InstallBuild, path: string): string | null {
+  if (!build.originalDigests.has(path)) {
+    throw new Error(`Global install build is missing an original digest for ${path}.`);
+  }
+  return build.originalDigests.get(path) ?? null;
 }
 
 async function buildInstall(options: InstallGlobalSkillsOptions): Promise<InstallBuild> {
@@ -560,7 +556,7 @@ async function buildInstall(options: InstallGlobalSkillsOptions): Promise<Instal
     );
   }
   await Promise.all(options.skills.map(validateSource));
-  const snapshot = await readOptionalSnapshot(options.paths);
+  const snapshot = await readOptionalSnapshot(options.paths, registry);
   if (
     snapshot.manifest?.library.identity !== undefined &&
     snapshot.manifest.library.identity !== options.libraryIdentity
@@ -723,24 +719,52 @@ async function buildInstall(options: InstallGlobalSkillsOptions): Promise<Instal
   const changedManifest = stateChanged(snapshot.manifest, nextManifest);
   const changedLock = stateChanged(snapshot.lock, nextLock);
   const files = stateFiles(options.paths);
+  const writes = uniqueSorted([
+    ...mutations.map((mutation) => mutation.destination),
+    ...(changedManifest ? [files.manifest] : []),
+    ...(changedLock ? [files.lock] : []),
+  ]);
+  const originals = await inspectGlobalInstallOriginals([
+    ...mutations.map((mutation) => ({
+      destination: mutation.destination,
+      path: mutation.destination,
+    })),
+    ...(changedManifest ? [{ destination: files.manifest, path: files.manifest }] : []),
+    ...(changedLock ? [{ destination: files.lock, path: files.lock }] : []),
+  ]);
+  const fingerprint = installPlanFingerprint({
+    gitignore: null,
+    libraryIdentity: options.libraryIdentity,
+    libraryRevision: options.libraryRevision,
+    location: stateDirectory(options.paths),
+    originals: originals.map(({ destination, digest }) => ({ destination, digest })),
+    scope: 'global',
+    skills: skillPlans,
+    state: {
+      after: { lock: nextLock, manifest: nextManifest },
+      before: {
+        lock: snapshot.lock ?? null,
+        manifest: snapshot.manifest ?? null,
+      },
+    },
+    writes,
+  });
   return {
     mutations,
     nextLock,
     nextManifest,
+    originalDigests: new Map(originals.map((original) => [original.path, original.digest])),
     plan: {
       applied: false,
       dryRun: options.dryRun === true,
+      fingerprint,
       libraryRevision: options.libraryRevision,
       operation: 'install',
       scope: 'global',
       stateDirectory: stateDirectory(options.paths),
       skills: skillPlans,
       state: { lockChanged: changedLock, manifestChanged: changedManifest },
-      writes: uniqueSorted([
-        ...mutations.map((mutation) => mutation.destination),
-        ...(changedManifest ? [files.manifest] : []),
-        ...(changedLock ? [files.lock] : []),
-      ]),
+      writes,
     },
   };
 }
@@ -763,14 +787,33 @@ async function writeStagedJson(path: string, value: unknown): Promise<void> {
 export async function installGlobalSkills(
   options: InstallGlobalSkillsOptions,
 ): Promise<GlobalInstallPlan> {
-  const initial = await buildInstall(options);
-  if (options.dryRun === true || initial.plan.writes.length === 0) return initial.plan;
+  if (options.dryRun === true) return (await buildInstall(options)).plan;
+  if (options.expectedPlanFingerprint === undefined) {
+    const initial = await buildInstall(options);
+    if (initial.plan.writes.length === 0) return initial.plan;
+  }
   const storage = requireStorage(options.storage);
   const operationId = options.operationId ?? `global-install-${randomUUID()}`;
   const lock = await acquireAdvisoryLock(storage.lockPath, { operationId });
   let staging: string | undefined;
   try {
     const build = await buildInstall(options);
+    if (
+      options.expectedPlanFingerprint !== undefined &&
+      build.plan.fingerprint !== options.expectedPlanFingerprint
+    ) {
+      throw globalError(
+        'INSTALL_PLAN_CHANGED',
+        'The global install plan changed after review; review the new plan before applying it.',
+        EXIT_CODES.conflict,
+        {
+          actualFingerprint: build.plan.fingerprint,
+          expectedFingerprint: options.expectedPlanFingerprint,
+          location: build.plan.stateDirectory,
+          scope: 'global',
+        },
+      );
+    }
     if (build.plan.writes.length === 0) return build.plan;
     staging = await createStagingDirectory(storage.stagingRoot, operationId);
     const staged = new Map<string, string>();
@@ -796,6 +839,7 @@ export async function installGlobalSkills(
       replacements.push({
         action: 'replace',
         destinationPath: mutation.destination,
+        expectedOriginalDigest: requiredOriginalDigest(build, mutation.destination),
         stagedPath: stagedSkill,
       });
     }
@@ -803,18 +847,30 @@ export async function installGlobalSkills(
     if (build.plan.state.manifestChanged) {
       const path = `${staging}/${GLOBAL_MANIFEST_FILENAME}`;
       await writeStagedJson(path, build.nextManifest);
-      replacements.push({ action: 'replace', destinationPath: files.manifest, stagedPath: path });
+      replacements.push({
+        action: 'replace',
+        destinationPath: files.manifest,
+        expectedOriginalDigest: requiredOriginalDigest(build, files.manifest),
+        stagedPath: path,
+      });
     }
     if (build.plan.state.lockChanged) {
       const path = `${staging}/${GLOBAL_LOCK_FILENAME}`;
       await writeStagedJson(path, build.nextLock);
-      replacements.push({ action: 'replace', destinationPath: files.lock, stagedPath: path });
+      replacements.push({
+        action: 'replace',
+        destinationPath: files.lock,
+        expectedOriginalDigest: requiredOriginalDigest(build, files.lock),
+        stagedPath: path,
+      });
     }
     await replacePathsAtomically({
       journalDirectory: storage.journalDirectory,
       kind: 'global-install',
       operationId,
+      ...(options.operationGuard === undefined ? {} : { operationGuard: options.operationGuard }),
       replacements,
+      reviewedPlanFingerprint: build.plan.fingerprint,
       root: commonRoot([
         ...replacements.map((replacement) => replacement.destinationPath),
         stateDirectory(options.paths),
@@ -908,7 +964,7 @@ async function buildAdopt(options: AdoptGlobalSkillOptions): Promise<AdoptGlobal
     );
   }
 
-  const snapshot = await readOptionalSnapshot(options.paths);
+  const snapshot = await readOptionalSnapshot(options.paths, registry);
   if (
     snapshot.manifest?.library.identity !== undefined &&
     snapshot.manifest.library.identity !== options.libraryIdentity
@@ -1054,6 +1110,7 @@ export async function adoptGlobalSkill(options: AdoptGlobalSkillOptions): Promis
       journalDirectory: storage.journalDirectory,
       kind: 'global-adopt',
       operationId,
+      ...(options.operationGuard === undefined ? {} : { operationGuard: options.operationGuard }),
       replacements: [
         { action: 'replace', destinationPath: files.manifest, stagedPath: manifest },
         { action: 'replace', destinationPath: files.lock, stagedPath: stateLock },
@@ -1073,6 +1130,7 @@ export interface UninstallGlobalSkillsOptions {
   readonly discardLocal?: boolean;
   readonly dryRun?: boolean;
   readonly operationId?: string;
+  readonly operationGuard?: OperationGuard;
   readonly paths: ApplicationPaths;
   readonly registry?: TargetRegistry;
   readonly skillIds: readonly string[];
@@ -1098,7 +1156,7 @@ async function buildUninstall(options: UninstallGlobalSkillsOptions): Promise<Un
     );
   }
   const registry = options.registry ?? new TargetRegistry();
-  const snapshot = await readSnapshot(options.paths);
+  const snapshot = await readSnapshot(options.paths, registry);
   const desired = new Map(snapshot.manifest.skills.map((skill) => [skill.id, skill]));
   const resolved = new Map(snapshot.lock.skills.map((skill) => [skill.id, skill]));
   const unknown = ids.filter((id) => !desired.has(id));
@@ -1238,6 +1296,7 @@ export async function uninstallGlobalSkills(
       journalDirectory: storage.journalDirectory,
       kind: 'global-uninstall',
       operationId,
+      ...(options.operationGuard === undefined ? {} : { operationGuard: options.operationGuard }),
       replacements,
       root: build.transactionRoot,
     });
@@ -1491,6 +1550,7 @@ export interface GlobalReconciliationOptions {
   readonly library: LibraryRevisionProvider;
   readonly offlineRevision?: string;
   readonly operationId?: string;
+  readonly operationGuard?: OperationGuard;
   readonly paths: ApplicationPaths;
   readonly registry?: TargetRegistry;
   readonly selectors?: readonly string[];
@@ -1687,6 +1747,7 @@ async function reconcile(
         journalDirectory: storage.journalDirectory,
         kind: `global-${operation}`,
         operationId,
+        ...(options.operationGuard === undefined ? {} : { operationGuard: options.operationGuard }),
         replacements,
         root: transactionRoot,
       });
@@ -1725,43 +1786,116 @@ export async function updateGlobalSkills(
 }
 
 export function formatGlobalStatusHuman(report: GlobalStatusReport): string {
+  const freshness = report.authoritative ? report.freshness : `${report.freshness}, not current`;
+  const ordered = [...report.skills].sort((left, right) =>
+    comparePortableStrings(left.id, right.id),
+  );
+  const visible = ordered.slice(0, 20);
+  const counts = new Map<string, number>();
+  for (const skill of ordered) counts.set(skill.state, (counts.get(skill.state) ?? 0) + 1);
   const lines = [
     `Scope: global`,
     `State: ${report.stateDirectory}`,
-    `Library: ${report.libraryIdentity} @ ${report.libraryRevision}`,
+    `Library: ${report.libraryIdentity} @ ${report.libraryRevision} (${freshness})`,
+    `Managed skills: ${String(ordered.length)}${
+      counts.size === 0
+        ? ''
+        : ` (${[...counts.entries()]
+            .sort(([left], [right]) => comparePortableStrings(left, right))
+            .map(([state, count]) => `${state} ${String(count)}`)
+            .join(', ')})`
+    }`,
   ];
-  if (report.skills.length === 0) lines.push('No managed global skills.');
-  for (const skill of report.skills) {
+  if (report.warning !== undefined) lines.push(`Warning: ${report.warning.message}`);
+  else if (report.stale) lines.push('Warning: Cached status may differ from the remote library.');
+  if (ordered.length === 0) lines.push('No managed global skills.');
+  for (const skill of visible) {
     lines.push(`${skill.id}: ${skill.state}`);
-    for (const destination of skill.destinations)
-      lines.push(`  ${destination.target} ${destination.path}`);
+    for (const destination of skill.destinations) {
+      const detail = destination.exists
+        ? destination.digest === undefined
+          ? 'unreadable'
+          : 'present'
+        : 'missing';
+      lines.push(`  ${destination.target} ${destination.path}: ${detail}`);
+    }
   }
+  if (visible.length < ordered.length) {
+    lines.push(`… ${String(ordered.length - visible.length)} more managed skills omitted`);
+  }
+  const review = ordered.find((skill) =>
+    ['conflicted', 'locally-modified', 'unmanaged-collision'].includes(skill.state),
+  );
+  const orphaned = ordered.find((skill) => skill.state === 'orphaned');
+  const reconcile = ordered.find((skill) => ['missing', 'outdated'].includes(skill.state));
+  lines.push(
+    report.stale
+      ? 'Next: Re-run skill-sync status --global without --offline before making changes.'
+      : review !== undefined
+        ? `Next: Review ${review.id} with skill-sync diff ${review.id} --global before deciding whether to sync.`
+        : orphaned !== undefined
+          ? `Next: ${orphaned.id} no longer exists in the canonical library. Preview removal with skill-sync uninstall ${orphaned.id} --global --dry-run, or restore that skill to the library.`
+          : reconcile !== undefined
+            ? 'Next: Run skill-sync sync --global to update or restore the non-current skills.'
+            : ordered[0] === undefined
+              ? 'Next: Run skill-sync list --global and follow its preview-ready global install command.'
+              : `Next: Inspect ${ordered[0].id} with skill-sync diff ${ordered[0].id} --global, or run skill-sync list --global to install more skills.`,
+  );
   return lines.join('\n');
 }
 
 export function formatGlobalDiffHuman(report: GlobalDiffReport): string {
+  const freshness = report.authoritative ? report.freshness : `${report.freshness}, not current`;
+  const targets = [...report.targets].sort((left, right) => {
+    const targetOrder = comparePortableStrings(left.target, right.target);
+    return targetOrder === 0
+      ? comparePortableStrings(left.destination, right.destination)
+      : targetOrder;
+  });
+  const differenceCount = targets.reduce((total, target) => total + target.differences.length, 0);
   const lines = [
-    `Scope: global`,
-    `${report.id}: ${report.state}`,
-    `Library revision: ${report.libraryRevision}`,
+    `Scope: global (${report.stateDirectory})`,
+    `Skill: ${report.id}`,
+    `State: ${report.state}`,
+    `Library: ${report.libraryIdentity} @ ${report.libraryRevision} (${freshness})`,
+    `Targets: ${String(targets.length)}; differences: ${String(differenceCount)}`,
   ];
-  for (const target of report.targets) {
-    lines.push(`${target.target} ${target.destination}:`);
+  if (report.warning !== undefined) lines.push(`Warning: ${report.warning.message}`);
+  else if (report.stale)
+    lines.push('Warning: Cached differences may not reflect the remote library.');
+  for (const target of targets) {
+    const differences = [...target.differences].sort((left, right) => {
+      const pathOrder = comparePortableStrings(left.path, right.path);
+      return pathOrder === 0 ? comparePortableStrings(left.kind, right.kind) : pathOrder;
+    });
+    const visible = differences.slice(0, 25);
+    lines.push(`${target.target} ${target.destination} (${String(differences.length)}):`);
     lines.push(
-      ...(target.differences.length === 0
+      ...(differences.length === 0
         ? ['  no content differences']
-        : target.differences.map((difference) => `  ${difference.kind}: ${difference.path}`)),
+        : visible.map((difference) => `  ${difference.kind}: ${difference.path}`)),
     );
+    if (visible.length < differences.length) {
+      lines.push(`  … ${String(differences.length - visible.length)} more differences omitted`);
+    }
   }
+  lines.push(
+    report.stale
+      ? `Next: Re-run skill-sync diff ${report.id} --global when remote access is available before making changes.`
+      : report.state === 'orphaned'
+        ? `Next: ${report.id} no longer exists in the canonical library. Preview removal with skill-sync uninstall ${report.id} --global --dry-run, or restore that skill to the library.`
+        : differenceCount === 0
+          ? 'Next: No sync is needed; run skill-sync status --global to review all managed skills.'
+          : ['conflicted', 'locally-modified', 'unmanaged-collision'].includes(report.state)
+            ? 'Next: Keep the local edits, or run skill-sync sync --global --discard-local only if canonical content should replace them.'
+            : 'Next: Run skill-sync sync --global to reconcile this skill, then verify with skill-sync status --global.',
+  );
   return lines.join('\n');
 }
 
 export function formatGlobalReconciliationHuman(report: GlobalReconciliationReport): string {
-  const mode = report.check ? 'check' : report.dryRun ? 'dry-run' : 'apply';
-  const lines = [
-    `${report.operation} (${mode}, global): ${report.stateDirectory}`,
-    `Library: ${report.libraryIdentity} @ ${report.libraryRevision}`,
-  ];
-  for (const skill of report.skills) lines.push(`${skill.id}: ${skill.state} -> ${skill.outcome}`);
-  return lines.join('\n');
+  return formatReconciliationReportHuman(report, {
+    label: `global ${report.stateDirectory}`,
+    optionSuffix: ' --global',
+  });
 }

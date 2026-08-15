@@ -27,6 +27,7 @@ function execute(command, args, options = {}) {
     encoding: 'utf8',
     env: environment,
     shell: options.shell ?? false,
+    input: options.input,
   });
 }
 
@@ -83,7 +84,7 @@ function verifyInteractiveCancellation(executable, options) {
   const script = [
     'set timeout 10',
     'spawn $env(SKILL_SYNC_SMOKE_BIN) init',
-    'expect "GitHub skill library URL"',
+    'expect "Skill library repository URL"',
     'send -- "\\003"',
     'expect eof',
     'catch wait result',
@@ -99,7 +100,7 @@ function verifyInteractiveCancellation(executable, options) {
   const output = `${result.stdout}${result.stderr}`;
   if (
     result.status !== 0 ||
-    !output.includes('GitHub skill library URL') ||
+    !output.includes('Skill library repository URL') ||
     !output.includes('CANCELLED: Operation cancelled.')
   ) {
     throw new Error(`globally installed interactive cancellation failed:\n${output}`);
@@ -175,6 +176,45 @@ try {
       `globally installed skill-sync --version failed:\n${version.stderr || version.stdout}`,
     );
   }
+  const completionPrefixes = {
+    bash: '# Bash completion for skill-sync.',
+    fish: '# Fish completion for skill-sync.',
+    powershell: '# PowerShell completion for skill-sync.',
+    zsh: '#compdef skill-sync',
+  };
+  const completionScripts = {};
+  for (const [shell, prefixText] of Object.entries(completionPrefixes)) {
+    const completion = runInstalled(executable, ['completion', '--shell', shell], runtime);
+    if (
+      completion.status !== 0 ||
+      completion.stderr !== '' ||
+      !completion.stdout.startsWith(prefixText) ||
+      !completion.stdout.includes('--target')
+    ) {
+      throw new Error(
+        `globally installed ${shell} completion failed:\n${completion.stderr || completion.stdout}`,
+      );
+    }
+    completionScripts[shell] = completion.stdout;
+  }
+  if (process.platform !== 'win32') {
+    const bashSyntax = execute('bash', ['-n'], { input: completionScripts.bash });
+    if (bashSyntax.status !== 0) {
+      throw new Error(`globally installed Bash completion is invalid:\n${bashSyntax.stderr}`);
+    }
+  }
+  if (process.platform === 'darwin') {
+    const zshSyntax = execute('zsh', ['-n'], { input: completionScripts.zsh });
+    if (zshSyntax.status !== 0) {
+      throw new Error(`globally installed Zsh completion is invalid:\n${zshSyntax.stderr}`);
+    }
+  }
+  try {
+    await access(configHome);
+    throw new Error('completion generation unexpectedly created application state');
+  } catch (error) {
+    if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error;
+  }
   const invalid = runInstalled(executable, ['not-a-command'], runtime);
   if (
     invalid.status !== 2 ||
@@ -189,7 +229,7 @@ try {
   const invalidJsonBody = JSON.parse(invalidJson.stdout);
   if (
     invalidJson.status !== 2 ||
-    !invalidJson.stderr.includes("missing required argument 'id'") ||
+    invalidJson.stderr !== '' ||
     invalidJson.stdout.trim().split('\n').length !== 1 ||
     invalidJsonBody.ok !== false ||
     invalidJsonBody.errors?.[0]?.code !== 'USAGE_ERROR'
@@ -198,11 +238,24 @@ try {
       `globally installed JSON usage failure was incorrect:\n${invalidJson.stderr || invalidJson.stdout}`,
     );
   }
+  const unsupportedPromptOption = runInstalled(executable, ['--json', 'status', '--yes'], runtime);
+  const unsupportedPromptOptionBody = JSON.parse(unsupportedPromptOption.stdout);
+  if (
+    unsupportedPromptOption.status !== 2 ||
+    unsupportedPromptOption.stderr !== '' ||
+    unsupportedPromptOptionBody.ok !== false ||
+    unsupportedPromptOptionBody.command !== 'status' ||
+    unsupportedPromptOptionBody.errors?.[0]?.code !== 'OPTION_UNSUPPORTED'
+  ) {
+    throw new Error(
+      `globally installed unsupported prompt option was incorrect:\n${unsupportedPromptOption.stderr || unsupportedPromptOption.stdout}`,
+    );
+  }
   verifyInteractiveCancellation(executable, runtime);
 
   const configured = runInstalled(
     executable,
-    ['--no-input', '--json', 'config', 'set', 'defaults.targets', 'codex,claude'],
+    ['--json', 'config', 'set', 'defaults.targets', 'codex,claude'],
     runtime,
   );
   const configuredJson = JSON.parse(configured.stdout);
@@ -217,11 +270,7 @@ try {
     );
   }
 
-  const validated = runInstalled(
-    executable,
-    ['--no-input', '--json', 'validate', localSkill],
-    runtime,
-  );
+  const validated = runInstalled(executable, ['--json', 'validate', localSkill], runtime);
   const validatedJson = JSON.parse(validated.stdout);
   if (
     validated.status !== 0 ||

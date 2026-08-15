@@ -1,4 +1,3 @@
-import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, lstat, readFile, readdir } from 'node:fs/promises';
@@ -13,6 +12,7 @@ import {
   type ApplicationPaths,
   type UserConfig,
 } from '../infrastructure/config.js';
+import { readGlobalLock, readGlobalManifest } from '../infrastructure/global-state.js';
 import { normalizeGitRemote, type NormalizedGitRemote } from '../infrastructure/git.js';
 import {
   assertProjectStatePair,
@@ -20,13 +20,18 @@ import {
   readProjectManifest,
   resolveProjectRoot,
 } from '../infrastructure/project-state.js';
-import { readGlobalLock, readGlobalManifest } from '../infrastructure/global-state.js';
+import {
+  nonInteractiveProcessEnvironment,
+  ProcessRunError,
+  runProcess,
+} from '../infrastructure/process-runner.js';
 import {
   TargetRegistry,
   resolveContainedDestination,
   resolveContainedGlobalDestination,
 } from '../targets/index.js';
 import { globalMutationStorage } from './managed-scope.js';
+import { inspectRecoveryState } from './recovery.js';
 
 export type DoctorCheckStatus = 'pass' | 'warning' | 'fail' | 'skipped';
 export type DoctorCheckScope = 'local' | 'remote';
@@ -51,6 +56,8 @@ export interface DoctorReport {
 export interface DoctorCommandOptions {
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
 }
 
 export interface DoctorCommandOutput {
@@ -65,6 +72,7 @@ export type DoctorCommandRunner = (
 ) => Promise<DoctorCommandOutput>;
 
 export interface DoctorRequest {
+  readonly commandTimeoutMs?: number;
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
   readonly global?: boolean;
@@ -73,6 +81,7 @@ export interface DoctorRequest {
   readonly paths?: ApplicationPaths;
   readonly project?: string;
   readonly runCommand?: DoctorCommandRunner;
+  readonly signal?: AbortSignal;
   readonly targets?: TargetRegistry;
 }
 
@@ -86,33 +95,22 @@ interface CacheInspection {
   readonly library?: CachedLibrary;
 }
 
-function runCommand(
+const DOCTOR_PROCESS_TIMEOUT_MS = 30_000;
+const PROCESS_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024;
+
+async function runCommand(
   executable: string,
   arguments_: readonly string[],
   options: DoctorCommandOptions = {},
 ): Promise<DoctorCommandOutput> {
-  return new Promise((resolve, reject) => {
-    execFile(
-      executable,
-      [...arguments_],
-      {
-        cwd: options.cwd,
-        encoding: 'utf8',
-        env: options.env,
-        maxBuffer: 4 * 1024 * 1024,
-        windowsHide: true,
-      },
-      (error, stdout, stderr) => {
-        if (error !== null) {
-          const commandError =
-            error instanceof Error ? error : new Error('The diagnostic command failed.');
-          Object.assign(commandError, { stdout, stderr });
-          reject(commandError);
-          return;
-        }
-        resolve({ stdout, stderr });
-      },
-    );
+  return await runProcess({
+    arguments: arguments_,
+    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+    ...(options.env === undefined ? {} : { env: options.env }),
+    executable,
+    maxOutputBytes: PROCESS_OUTPUT_LIMIT_BYTES,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    timeoutMs: options.timeoutMs ?? DOCTOR_PROCESS_TIMEOUT_MS,
   });
 }
 
@@ -136,6 +134,9 @@ function makeCheck(
 }
 
 function errorMessage(error: unknown): string {
+  if (error instanceof ProcessRunError && error.output.stderr.trim() !== '') {
+    return redactSecrets(error.output.stderr.trim());
+  }
   if (typeof error === 'object' && error !== null) {
     const stderr: unknown = (error as { readonly stderr?: unknown }).stderr;
     if (typeof stderr === 'string' && stderr.trim() !== '') return redactSecrets(stderr.trim());
@@ -146,12 +147,16 @@ function errorMessage(error: unknown): string {
 function commandNotFound(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) return false;
   const code: unknown = (error as { readonly code?: unknown }).code;
-  return code === 'ENOENT' || code === 127;
+  if (code === 'ENOENT' || code === 127) return true;
+  if (error instanceof ProcessRunError) {
+    return error.output.exitCode === 127 || commandNotFound(error.cause);
+  }
+  return false;
 }
 
 function gitEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return {
-    ...environment,
+    ...nonInteractiveProcessEnvironment(environment),
     GIT_CONFIG_COUNT: '2',
     GIT_CONFIG_KEY_0: 'core.hooksPath',
     GIT_CONFIG_KEY_1: 'protocol.file.allow',
@@ -172,6 +177,51 @@ async function safeLstat(path: string): Promise<Awaited<ReturnType<typeof lstat>
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
+  }
+}
+
+async function inspectRecoveryEvidence(paths: ApplicationPaths): Promise<DoctorCheck> {
+  const remediation =
+    'Run skill-sync recovery list to get a stable record ID, then skill-sync recovery inspect <id>.';
+  try {
+    const inspection = await inspectRecoveryState(paths);
+    const counts = `${String(inspection.locks.length)} lock(s), ${String(inspection.journals.length)} incomplete journal(s), ${String(inspection.backups.length)} backup(s), and ${String(inspection.problems.length)} validation problem(s)`;
+    if (inspection.problems.length > 0) {
+      return makeCheck(
+        'recovery-state',
+        'fail',
+        'local',
+        `Application recovery evidence is unsafe or malformed: ${counts}.`,
+        remediation,
+      );
+    }
+    if (
+      inspection.locks.length > 0 ||
+      inspection.journals.length > 0 ||
+      inspection.backups.length > 0
+    ) {
+      return makeCheck(
+        'recovery-state',
+        'warning',
+        'local',
+        `Application recovery evidence needs review: ${counts}.`,
+        remediation,
+      );
+    }
+    return makeCheck(
+      'recovery-state',
+      'pass',
+      'local',
+      'No application recovery locks, incomplete journals, backups, or validation problems were found.',
+    );
+  } catch (error) {
+    return makeCheck(
+      'recovery-state',
+      'fail',
+      'local',
+      `Application recovery evidence could not be inspected safely: ${errorMessage(error)}`,
+      remediation,
+    );
   }
 }
 
@@ -577,121 +627,17 @@ function reportExitCode(checks: readonly DoctorCheck[]): ExitCode {
   return EXIT_CODES.success;
 }
 
-export interface DoctorReportFormatOptions {
-  readonly color?: boolean;
-}
-
-const CHECK_LABELS: Readonly<Record<string, string>> = {
-  cache: 'Library cache',
-  config: 'Configuration',
-  git: 'Git',
-  'github-auth': 'GitHub authentication',
-  'github-cli': 'GitHub CLI',
-  'global-recovery': 'Global recovery paths',
-  'global-state': 'Global managed state',
-  'global-target-permissions': 'Global target permissions',
-  'library-access': 'Library access',
-  'library-schema': 'Library schema',
-  'library-url': 'Library URL',
-  node: 'Node.js',
-  'project-root': 'Project root',
-  'project-state': 'Project managed state',
-  'target-permissions': 'Target permissions',
-};
-
-const STATUS_ORDER: readonly DoctorCheckStatus[] = ['fail', 'warning', 'skipped', 'pass'];
-
-const STATUS_DETAILS: Readonly<
-  Record<
-    DoctorCheckStatus,
-    { readonly color: number; readonly glyph: string; readonly label: string }
-  >
-> = {
-  fail: { color: 31, glyph: '✕', label: 'BLOCKED' },
-  warning: { color: 33, glyph: '!', label: 'ATTENTION' },
-  skipped: { color: 36, glyph: '•', label: 'SKIPPED' },
-  pass: { color: 32, glyph: '✓', label: 'PASS' },
-};
-
-function colour(value: string, code: number, enabled: boolean): string {
-  return enabled ? `\u001B[${String(code)}m${value}\u001B[0m` : value;
-}
-
-function formattedStatus(status: DoctorCheckStatus, color: boolean): string {
-  const detail = STATUS_DETAILS[status];
-  return color ? colour(detail.glyph, detail.color, true) : detail.label;
-}
-
-function checkLabel(check: DoctorCheck): string {
-  return CHECK_LABELS[check.id] ?? check.id.replaceAll('-', ' ');
-}
-
-function reportScope(report: DoctorReport): string {
-  if (report.scope === 'global') {
-    return `global${report.globalStateDirectory === undefined ? '' : ` (${report.globalStateDirectory})`}`;
-  }
-  if (report.scope === 'project' || report.projectRoot !== undefined) {
-    return `project${report.projectRoot === undefined ? '' : ` (${report.projectRoot})`}`;
-  }
-  return 'current environment';
-}
-
-function overallStatus(checks: readonly DoctorCheck[]): DoctorCheckStatus {
-  if (checks.some((check) => check.status === 'fail')) return 'fail';
-  if (checks.some((check) => check.status === 'warning')) return 'warning';
-  return 'pass';
-}
-
-function overallLabel(status: DoctorCheckStatus): string {
-  if (status === 'fail') return 'Doctor found blocking issues';
-  if (status === 'warning') return 'Doctor found items that need attention';
-  return 'Your skill-sync setup looks healthy';
-}
-
-/** Render the existing structured report for people without changing its JSON contract. */
-export function formatDoctorReport(
-  report: DoctorReport,
-  options: DoctorReportFormatOptions = {},
-): string {
-  const color = options.color === true;
-  const overall = overallStatus(report.checks);
-  const lines = [
-    colour(`skill-sync doctor · ${overallLabel(overall)}`, STATUS_DETAILS[overall].color, color),
-    `Scope: ${reportScope(report)}`,
-    report.offline ? 'Remote checks: skipped (--offline)' : 'Remote checks: included',
-  ];
-
-  for (const status of STATUS_ORDER) {
-    const checks = report.checks.filter((check) => check.status === status);
-    if (checks.length === 0) continue;
-    const heading = color
-      ? `${formattedStatus(status, true)} ${STATUS_DETAILS[status].label}`
-      : STATUS_DETAILS[status].label;
-    lines.push('', `${heading} (${String(checks.length)})`);
-    for (const check of checks) {
-      lines.push(`  ${checkLabel(check)}${check.scope === 'remote' ? ' · remote' : ''}`);
-      lines.push(`    ${check.message}`);
-    }
-  }
-
-  const remediations = report.checks.filter(
-    (check): check is DoctorCheck & { readonly remediation: string } =>
-      (check.status === 'fail' || check.status === 'warning') && check.remediation !== undefined,
-  );
-  if (remediations.length > 0) {
-    lines.push('', colour('Next actions', 35, color));
-    for (const [index, check] of remediations.entries()) {
-      lines.push(`${String(index + 1)}. ${checkLabel(check)} — ${check.remediation}`);
-    }
-  }
-
-  return lines.join('\n');
-}
-
 export async function runDoctor(request: DoctorRequest = {}): Promise<DoctorReport> {
   const checks: DoctorCheck[] = [];
   const environment = request.env ?? process.env;
-  const command = request.runCommand ?? runCommand;
+  const subprocessEnvironment = nonInteractiveProcessEnvironment(environment);
+  const baseCommand = request.runCommand ?? runCommand;
+  const command: DoctorCommandRunner = async (executable, arguments_, options = {}) =>
+    await baseCommand(executable, arguments_, {
+      ...options,
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
+      ...(request.commandTimeoutMs === undefined ? {} : { timeoutMs: request.commandTimeoutMs }),
+    });
   const offline = request.offline === true;
   const paths =
     request.paths ??
@@ -733,7 +679,7 @@ export async function runDoctor(request: DoctorRequest = {}): Promise<DoctorRepo
 
   let githubCliAvailable = false;
   try {
-    const github = await command('gh', ['--version'], { env: environment });
+    const github = await command('gh', ['--version'], { env: subprocessEnvironment });
     githubCliAvailable = true;
     const githubVersion = github.stdout.split(/\r?\n/u)[0]?.trim();
     checks.push(
@@ -793,6 +739,8 @@ export async function runDoctor(request: DoctorRequest = {}): Promise<DoctorRepo
       ),
     );
   }
+
+  checks.push(await inspectRecoveryEvidence(paths));
 
   let remote: NormalizedGitRemote | undefined;
   if (!configValid) {
@@ -872,7 +820,7 @@ export async function runDoctor(request: DoctorRequest = {}): Promise<DoctorRepo
     } else {
       try {
         await command('gh', ['auth', 'status', '--hostname', remote.host], {
-          env: { ...environment, GH_PROMPT_DISABLED: '1' },
+          env: subprocessEnvironment,
         });
         checks.push(
           makeCheck(

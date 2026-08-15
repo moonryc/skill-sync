@@ -9,6 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  completion-shells:
+    name: Validate generated shell completions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: sudo apt-get update && sudo apt-get install --yes fish zsh
+      - run: npm ci
+      - run: npx vitest run --config libs/cli/vitest.config.ts tests/unit/completion.test.ts
+        env:
+          SKILL_SYNC_REQUIRE_COMPLETION_SHELLS: '1'
+
   test:
     name: Node ${{ matrix.node }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

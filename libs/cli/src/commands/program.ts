@@ -1,11 +1,32 @@
-import { readFileSync } from 'node:fs';
+import { Command, Help, type Option } from 'commander';
 
-import { Command, Option } from 'commander';
-
-import { resultFromUnknown, type CommandResult } from '../domain/result.js';
+import {
+  EXIT_CODES,
+  resultFromUnknown,
+  SkillSyncError,
+  success,
+  type CommandResult,
+} from '../domain/result.js';
+import { readCliPackageMetadata } from '../infrastructure/package-metadata.js';
 import type { RuntimeIo } from '../ports/index.js';
 import { colorIsEnabled, renderResult } from '../ui/output.js';
 import type { TuiLauncher } from '../ui/tui/types.js';
+import {
+  commandCommonOptionDefinitions,
+  commandDefinition,
+  commandDefinitions,
+  commandHelpDefinition,
+  commandParents,
+  createCommandFromDefinition,
+  createOptionFromDefinition,
+  supportedCommonOptions,
+  topLevelCommandOrder,
+  validateCommandInvocation,
+  type CommandDefinition,
+  type CommandHelpGroup,
+  type CompletionShell,
+} from './command-registry.js';
+import { generateCompletionScript } from './completion.js';
 
 export interface CommandInvocation {
   readonly command: string;
@@ -21,20 +42,75 @@ export interface ProgramDependencies {
   readonly tui?: TuiLauncher;
 }
 
-function packageVersion(): string {
-  const value = JSON.parse(
-    readFileSync(new URL('../../package.json', import.meta.url), 'utf8'),
-  ) as { version?: unknown };
-  return typeof value.version === 'string' ? value.version : '0.0.0';
+const WIKI_URL = 'https://github.com/moonryc/skill-sync/tree/main/apps/wiki/src/content/docs';
+
+const COMMAND_HELP_GROUPS = {
+  lifecycle: 'Lifecycle:',
+  setup: 'Setup:',
+  discovery: 'Discovery:',
+  project: 'Managed skills (project or global):',
+  library: 'Library management:',
+  recovery: 'Recovery:',
+  diagnostics: 'Diagnostics:',
+} as const;
+
+const COMMAND_HELP_GROUP_ORDER: readonly string[] = Object.values(COMMAND_HELP_GROUPS);
+const commanderHelp = new Help();
+
+const ROOT_QUICK_START = [
+  'Quick start (preview setup → apply → list → install):',
+  '  skill-sync init <repository-url> --dry-run',
+  '  or: skill-sync init --create <owner/name> --dry-run',
+  '  then run the exact --expect-plan command printed by the preview',
+  '  skill-sync list',
+  '  skill-sync install <group/skill> --target codex --gitignore',
+].join('\n');
+
+function addNoviceHelp(command: Command, definition: CommandDefinition): Command {
+  const inheritedOptions = supportedCommonOptions(definition);
+  command.configureHelp({ showGlobalOptions: false });
+  return command.addHelpText(
+    'after',
+    [
+      ...(inheritedOptions.length === 0
+        ? []
+        : ['', 'Common options:', ...inheritedOptions.map((option) => `  ${option}`)]),
+      ...(definition.choices.length === 0
+        ? []
+        : ['', 'Choices:', ...definition.choices.map((choice) => `  ${choice}`)]),
+      '',
+      'Examples:',
+      ...definition.examples.map((example) => `  ${example}`),
+      '',
+      'Safety:',
+      `  ${definition.safety}`,
+      '',
+      `Wiki: ${definition.documentation}`,
+    ].join('\n'),
+  );
 }
 
-function repeat(value: string, previous: readonly string[]): readonly string[] {
-  return [...previous, value];
+function helpGroupOrder(heading: string): number {
+  const index = COMMAND_HELP_GROUP_ORDER.indexOf(heading);
+  return index === -1 ? COMMAND_HELP_GROUP_ORDER.length : index;
+}
+
+function orderHelpGroups<T extends Command | Option>(
+  unsortedItems: T[],
+  visibleItems: T[],
+  getGroup: (item: T) => string,
+): Map<string, T[]> {
+  const groups = commanderHelp.groupItems(unsortedItems, visibleItems, getGroup);
+  return new Map(
+    [...groups.entries()].sort(
+      ([leftHeading], [rightHeading]) => helpGroupOrder(leftHeading) - helpGroupOrder(rightHeading),
+    ),
+  );
 }
 
 function registerAction(
   command: Command,
-  name: string,
+  definition: CommandDefinition,
   dependencies: ProgramDependencies,
   program: Command,
 ): void {
@@ -49,12 +125,25 @@ function registerAction(
 
     let result: CommandResult<unknown>;
     try {
-      result = await dependencies.execute({ command: name, arguments: args, options });
+      const issue = validateCommandInvocation(
+        definition,
+        args,
+        options,
+        rawProgramArguments(program),
+      );
+      if (issue !== undefined) {
+        throw new SkillSyncError(issue.code, issue.message, EXIT_CODES.usage);
+      }
+      result = await dependencies.execute({
+        command: definition.id,
+        arguments: args,
+        options,
+      });
     } catch (error) {
       result = resultFromUnknown(error);
     }
     renderResult(
-      name,
+      definition.id,
       result,
       { json: options.json === true, color: options.color === true },
       dependencies.io,
@@ -72,6 +161,15 @@ async function launchTui(
   invocationOptions.noInput = invocationOptions.input === false;
   invocationOptions.color = colorIsEnabled(invocationOptions.color !== false, dependencies.io);
   try {
+    const issue = validateCommandInvocation(
+      commandDefinition('tui'),
+      [],
+      invocationOptions,
+      rawProgramArguments(program),
+    );
+    if (issue !== undefined) {
+      throw new SkillSyncError(issue.code, issue.message, EXIT_CODES.usage);
+    }
     if (dependencies.tui === undefined) {
       throw new Error('The interactive terminal UI is unavailable in this runtime.');
     }
@@ -93,187 +191,163 @@ export async function launchImplicitTui(
   await launchTui(dependencies, program, program.opts(), true);
 }
 
-function idsCommand(name: string, description: string): Command {
-  return new Command(name).description(description).argument('[ids...]', 'qualified skill IDs');
+function helpGroup(name: CommandHelpGroup): string {
+  return COMMAND_HELP_GROUPS[name];
+}
+
+function rawProgramArguments(program: Command): readonly string[] {
+  const value: unknown = Reflect.get(program, 'rawArgs');
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string')
+    : [];
+}
+
+function configureOutputTree(
+  command: Command,
+  root: Command,
+  dependencies: ProgramDependencies,
+): void {
+  command.configureOutput({
+    writeOut: (value) => dependencies.io.writeStdout(value),
+    writeErr: (value) => {
+      if (root.opts().json !== true && !rawProgramArguments(root).includes('--json')) {
+        dependencies.io.writeStderr(value);
+      }
+    },
+  });
+  for (const child of command.commands) configureOutputTree(child, root, dependencies);
 }
 
 export function createProgram(dependencies: ProgramDependencies): Command {
   const program = new Command()
     .name('skill-sync')
     .description('Manage Git-backed AI skills across projects.')
-    .version(packageVersion())
-    .option('--json', 'emit one machine-readable JSON object')
-    .option('--no-color', 'disable ANSI styling')
-    .option('--no-input', 'disable interactive prompts')
-    .option('--yes', 'confirm ordinary prompts when destructive options are explicit')
-    .option('--project <path>', 'override the project root')
-    .option('--global', 'operate on user-level global skills')
+    .version(readCliPackageMetadata().version)
     .showHelpAfterError('(run skill-sync --help for usage)');
 
-  program.configureOutput({
-    writeOut: (value) => dependencies.io.writeStdout(value),
-    writeErr: (value) => dependencies.io.writeStderr(value),
-  });
+  for (const option of commandCommonOptionDefinitions) {
+    program.addOption(createOptionFromDefinition(option));
+  }
 
-  const init = new Command('init')
-    .description('Connect or create the default skill library')
-    .argument('[url]', 'HTTP(S) or SSH Git repository URL')
-    .option('--create <owner/name>', 'create a GitHub repository')
-    .addOption(new Option('--visibility <visibility>').choices(['private', 'public', 'internal']))
-    .addOption(new Option('--transport <transport>').choices(['https', 'ssh']))
-    .option('--branch <branch>', 'library branch');
-  registerAction(init, 'init', dependencies, program);
-  program.addCommand(init);
+  program
+    .configureHelp({ groupItems: orderHelpGroups })
+    .addHelpText('before', ROOT_QUICK_START)
+    .addHelpText('after', `\nWiki: ${WIKI_URL}`);
 
-  const tui = new Command('tui').description('Open the interactive skill workflow');
-  tui.action(async () => {
-    await launchTui(dependencies, program, program.opts(), false);
-  });
-  program.addCommand(tui);
+  program.addHelpCommand(
+    new Command(commandHelpDefinition.name)
+      .description(commandHelpDefinition.description)
+      .argument(commandHelpDefinition.argument.syntax, commandHelpDefinition.argument.description)
+      .helpOption(false)
+      .helpGroup(COMMAND_HELP_GROUPS.diagnostics),
+  );
 
-  const install = idsCommand('install', 'Install skills into this project')
-    .option('--target <target>', 'target agent (repeatable)', repeat, [])
-    .option('--all', 'select every eligible skill')
-    .option('--gitignore', 'add exact managed paths to .gitignore')
-    .option('--no-gitignore', 'do not manage .gitignore')
-    .option('--dry-run', 'preview without writes');
-  registerAction(install, 'install', dependencies, program);
-  program.addCommand(install);
+  const parents = new Map<string, Command>(
+    commandParents.map((definition) => {
+      const parent = new Command(definition.name)
+        .description(definition.description)
+        .helpGroup(helpGroup(definition.helpGroup))
+        .configureHelp({ showGlobalOptions: false })
+        .addHelpText(
+          'after',
+          `\nRun skill-sync ${definition.name} <command> --help for examples and safety details.\n\nWiki: ${WIKI_URL}`,
+        );
+      return [definition.name, parent] as const;
+    }),
+  );
+  const leaves = new Map<string, Command>();
 
-  const adopt = new Command('adopt')
-    .description('Track an exact existing unmanaged skill copy without replacing it')
-    .argument('<id>', 'exact qualified library skill ID')
-    .requiredOption('--target <target>', 'existing target agent containing the skill')
-    .option('--dry-run', 'verify adoption without writing tracking state');
-  registerAction(adopt, 'adopt', dependencies, program);
-  program.addCommand(adopt);
+  for (const definition of commandDefinitions) {
+    const command = addNoviceHelp(createCommandFromDefinition(definition), definition).helpGroup(
+      helpGroup(definition.helpGroup),
+    );
+    if (definition.handler === 'executor') {
+      registerAction(command, definition, dependencies, program);
+    } else if (definition.handler === 'terminal-ui') {
+      command.action(async () => {
+        await launchTui(dependencies, program, program.opts(), false);
+      });
+    } else if (definition.handler === 'completion') {
+      command.action(() => {
+        const options = { ...program.opts(), ...command.opts() } as Record<string, unknown>;
+        options.color = colorIsEnabled(options.color !== false, dependencies.io);
+        let result: CommandResult<unknown>;
+        const issue = validateCommandInvocation(
+          definition,
+          [],
+          options,
+          rawProgramArguments(program),
+        );
+        if (issue === undefined && typeof options.shell === 'string') {
+          const script = generateCompletionScript(options.shell as CompletionShell);
+          result = success(options.json === true ? { shell: options.shell, script } : script);
+        } else if (issue !== undefined) {
+          result = resultFromUnknown(
+            new SkillSyncError(issue.code, issue.message, EXIT_CODES.usage),
+          );
+        } else {
+          result = resultFromUnknown(
+            new SkillSyncError(
+              'USAGE_ERROR',
+              'Pass --shell bash, zsh, fish, or powershell. Example: skill-sync completion --shell zsh.',
+              EXIT_CODES.usage,
+            ),
+          );
+        }
+        renderResult(
+          definition.id,
+          result,
+          { json: options.json === true, color: options.color === true },
+          dependencies.io,
+        );
+      });
+    } else {
+      command.action(() => {
+        const options = program.opts();
+        options.color = colorIsEnabled(options.color !== false, dependencies.io);
+        let result: CommandResult<unknown>;
+        const issue = validateCommandInvocation(
+          definition,
+          [],
+          options,
+          rawProgramArguments(program),
+        );
+        if (issue === undefined) {
+          const installedVersion = readCliPackageMetadata().version;
+          result = success(
+            options.json === true ? { version: installedVersion } : installedVersion,
+          );
+        } else {
+          result = resultFromUnknown(
+            new SkillSyncError(issue.code, issue.message, EXIT_CODES.usage),
+          );
+        }
+        renderResult(
+          definition.id,
+          result,
+          { json: options.json === true, color: options.color === true },
+          dependencies.io,
+        );
+      });
+    }
+    leaves.set(definition.id, command);
+    if (definition.path.length > 1) {
+      const parentName = definition.path[0];
+      const parent = parentName === undefined ? undefined : parents.get(parentName);
+      if (parent === undefined) {
+        throw new Error(`Missing parent command for ${definition.id}.`);
+      }
+      parent.addCommand(command);
+    }
+  }
 
-  const sync = new Command('sync')
-    .description('Refresh every tracked skill from the library')
-    .option('--check', 'report drift without writes')
-    .option('--dry-run', 'preview without writes')
-    .option('--discard-local', 'allow replacement of local edits')
-    .option('--offline <revision>', 'use an explicit cached revision');
-  registerAction(sync, 'sync', dependencies, program);
-  program.addCommand(sync);
-
-  const update = idsCommand('update', 'Refresh selected tracked skills')
-    .option('--all', 'refresh every tracked skill')
-    .option('--dry-run', 'preview without writes')
-    .option('--discard-local', 'allow replacement of local edits')
-    .option('--offline <revision>', 'use an explicit cached revision');
-  registerAction(update, 'update', dependencies, program);
-  program.addCommand(update);
-
-  const add = new Command('add')
-    .description('Add a new local skill to the library')
-    .argument('<path>', 'local skill directory')
-    .option('--group <group>', 'destination group')
-    .option('--dry-run', 'preview without writes');
-  registerAction(add, 'add', dependencies, program);
-  program.addCommand(add);
-
-  const publish = idsCommand('publish', 'Publish edits to existing library skills')
-    .option('--all', 'publish every eligible modified skill')
-    .option('--from <target>', 'explicit source target')
-    .option('--dry-run', 'preview without writes');
-  registerAction(publish, 'publish', dependencies, program);
-  program.addCommand(publish);
-
-  const list = new Command('list')
-    .description('List the grouped skill catalog')
-    .option('--group <group>', 'group subtree (repeatable)', repeat, [])
-    .option('--query <text>', 'identifier or description query (repeatable)', repeat, [])
-    .option('--agent <agent>', 'compatible agent (repeatable)', repeat, [])
-    .option('--state <state>', 'project state (repeatable)', repeat, []);
-  registerAction(list, 'list', dependencies, program);
-  program.addCommand(list);
-
-  for (const [name, description] of [
-    ['info', 'Inspect one skill without changing it'],
-    ['diff', 'Compare a project skill with the library'],
-  ] as const) {
-    const command = new Command(name)
-      .description(description)
-      .argument('<id>', 'qualified skill ID');
-    registerAction(command, name, dependencies, program);
+  for (const entry of topLevelCommandOrder) {
+    const command = leaves.get(entry) ?? parents.get(entry);
+    if (command === undefined) throw new Error(`Missing top-level command ${entry}.`);
     program.addCommand(command);
   }
 
-  const status = new Command('status')
-    .description('Show reconciliation state for managed skills')
-    .option('--offline', 'inspect cached state without remote access');
-  registerAction(status, 'status', dependencies, program);
-  program.addCommand(status);
-
-  const uninstall = idsCommand('uninstall', 'Remove managed project copies')
-    .option('--all', 'select every managed skill')
-    .option('--discard-local', 'allow removal of local edits')
-    .option('--dry-run', 'preview without writes');
-  registerAction(uninstall, 'uninstall', dependencies, program);
-  program.addCommand(uninstall);
-
-  const validate = new Command('validate')
-    .description('Validate a library, skill ID, installed skill, or local path')
-    .argument('[id-or-path]', 'qualified ID or filesystem path');
-  registerAction(validate, 'validate', dependencies, program);
-  program.addCommand(validate);
-
-  const config = new Command('config').description('Inspect or change non-secret defaults');
-  for (const name of ['path', 'list'] as const) {
-    const child = new Command(name).description(`${name} configuration`);
-    registerAction(child, `config:${name}`, dependencies, program);
-    config.addCommand(child);
-  }
-  for (const name of ['get', 'unset'] as const) {
-    const child = new Command(name).description(`${name} a configuration value`).argument('<key>');
-    registerAction(child, `config:${name}`, dependencies, program);
-    config.addCommand(child);
-  }
-  const configSet = new Command('set')
-    .description('Set a configuration value')
-    .argument('<key>')
-    .argument('<value>');
-  registerAction(configSet, 'config:set', dependencies, program);
-  config.addCommand(configSet);
-  program.addCommand(config);
-
-  const doctor = new Command('doctor')
-    .description('Diagnose configuration and environment health without mutation')
-    .option('--offline', 'skip remote checks');
-  registerAction(doctor, 'doctor', dependencies, program);
-  program.addCommand(doctor);
-
-  const library = new Command('library').description('Manage canonical library content');
-  const libraryRemove = new Command('remove')
-    .description('Delete one canonical library skill')
-    .argument('<id>')
-    .option('--dry-run', 'preview without writes');
-  registerAction(libraryRemove, 'library:remove', dependencies, program);
-  library.addCommand(libraryRemove);
-  program.addCommand(library);
-
-  const group = new Command('group').description('Manage library groups');
-  const groupList = new Command('list').description('List library groups');
-  registerAction(groupList, 'group:list', dependencies, program);
-  group.addCommand(groupList);
-  const groupCreate = new Command('create').description('Create a group').argument('<group>');
-  registerAction(groupCreate, 'group:create', dependencies, program);
-  group.addCommand(groupCreate);
-  const groupRename = new Command('rename')
-    .description('Rename a group')
-    .argument('<from>')
-    .argument('<to>');
-  registerAction(groupRename, 'group:rename', dependencies, program);
-  group.addCommand(groupRename);
-  const groupRemove = new Command('remove')
-    .description('Remove a group')
-    .argument('<group>')
-    .option('--recursive', 'allow removal of a nonempty group')
-    .option('--dry-run', 'preview without writes');
-  registerAction(groupRemove, 'group:remove', dependencies, program);
-  group.addCommand(groupRemove);
-  program.addCommand(group);
+  configureOutputTree(program, program, dependencies);
 
   return program;
 }

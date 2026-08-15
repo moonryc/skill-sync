@@ -12,6 +12,7 @@ import {
   filterCatalogRecords,
   formatCatalogListHuman,
   formatCatalogSkillInfoHuman,
+  formatReadOnlyValidationHuman,
   getCatalogSkillInfo,
   listCatalog,
   validateReadOnlySource,
@@ -178,6 +179,18 @@ describe('read-only catalog list and info services', () => {
     if (result.ok) {
       expect(formatCatalogSkillInfoHuman(result.info)).toContain('SKILL.md (20 bytes, sha256:');
       expect(formatCatalogSkillInfoHuman(result.info)).not.toContain('/not-exposed/');
+
+      const bounded = formatCatalogSkillInfoHuman({
+        ...result.info,
+        inventory: Array.from({ length: 30 }, (_, index) => ({
+          relativePath: `assets/file-${String(index).padStart(2, '0')}.txt`,
+          sha256: FILE_HASH,
+          size: index,
+        })),
+      });
+      expect(bounded).toContain('Files (30):');
+      expect(bounded).toContain('… 5 more files omitted');
+      expect(bounded).not.toContain('file-29.txt');
     }
   });
 
@@ -200,6 +213,19 @@ describe('read-only catalog list and info services', () => {
         {
           code: 'ambiguous-selector',
           candidates: ['backend/review-ui', 'frontend/review-ui'],
+        },
+      ],
+    });
+  });
+
+  it('preserves bounded exact candidates for an unknown info typo', () => {
+    expect(getCatalogSkillInfo(catalog(), 'backend/review-aip')).toMatchObject({
+      ok: false,
+      errors: [
+        {
+          code: 'unknown-selector',
+          value: 'backend/review-aip',
+          candidates: ['backend/review-api'],
         },
       ],
     });
@@ -239,6 +265,93 @@ describe('read-only validation source routing', () => {
       expect(result).toMatchObject({ valid: true, skills: [{ id: 'local-skill' }], errors: [] });
       expect(after).toEqual(before);
       expect(JSON.stringify(result)).not.toContain('LOCAL-BODY-MUST-STAY');
+    });
+  });
+
+  it('formats valid and invalid validation results as concise deterministic guidance', async () => {
+    await withTempDirectory('skill-sync-validation-human-', async (root) => {
+      await createLibrary(root);
+      const valid = await validateReadOnlySource({ kind: 'library', rootPath: root });
+      const catalog = await scanCatalog(root, { sourceRevision: 'e'.repeat(40) });
+      const validId = await validateReadOnlySource({
+        kind: 'skill-id',
+        catalog,
+        selector: 'frontend/review-ui',
+      });
+      expect(formatReadOnlyValidationHuman(valid)).toBe(
+        [
+          'Validation passed.',
+          'Kind: library',
+          'Skills checked: 1',
+          'Issues: 0',
+          'Details:',
+          '  frontend/review-ui — 1 file (library:frontend/review-ui)',
+          'Next: Run skill-sync list to browse the validated skills.',
+        ].join('\n'),
+      );
+      expect(formatReadOnlyValidationHuman(validId)).toContain(
+        'Next: Run skill-sync info frontend/review-ui to review compatibility and get a complete install preview command.',
+      );
+      expect(
+        formatReadOnlyValidationHuman(validId, { scope: 'global', selectorProvided: true }),
+      ).toContain(
+        'Next: Run skill-sync --global info frontend/review-ui to review compatibility and get a complete install preview command.',
+      );
+
+      expect(
+        formatReadOnlyValidationHuman({
+          kind: 'installed-skill',
+          valid: false,
+          skills: [],
+          errors: [
+            {
+              candidates: ['codex:/z', 'claude:/a'],
+              code: 'divergent-installed-copies',
+              message: 'Copies differ.',
+              source: 'frontend/review-ui',
+            },
+            {
+              candidates: [],
+              code: 'invalid-skill',
+              message: 'Missing front matter.',
+              source: 'claude:/a',
+            },
+          ],
+        }),
+      ).toBe(
+        [
+          'Validation failed.',
+          'Kind: installed skill copies',
+          'Skills checked: 0',
+          'Issues: 2',
+          'Details:',
+          '  [invalid-skill] claude:/a: Missing front matter.',
+          '  [divergent-installed-copies] frontend/review-ui: Copies differ.',
+          '    Candidates: claude:/a, codex:/z',
+          'Next: Fix the issues above, then run skill-sync validate again.',
+        ].join('\n'),
+      );
+
+      expect(
+        formatReadOnlyValidationHuman(
+          {
+            kind: 'local-path',
+            valid: false,
+            skills: [],
+            errors: [
+              {
+                candidates: [],
+                code: 'invalid-skill',
+                message: 'Missing front matter.',
+                source: '/work/skill',
+              },
+            ],
+          },
+          { explicitProject: true, scope: 'project', selectorProvided: true },
+        ),
+      ).toContain(
+        'Next: Fix the issues above, then rerun skill-sync --project <project-path> validate <same-id-or-path>.',
+      );
     });
   });
 

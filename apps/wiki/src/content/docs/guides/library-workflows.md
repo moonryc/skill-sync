@@ -8,7 +8,8 @@ Library commands change the canonical Git repository. Use `--dry-run` where avai
 ## Connect an existing repository
 
 ```sh
-skill-sync init git@github.com:you/ai-skills.git
+skill-sync init git@github.com:you/ai-skills.git --dry-run
+# Run the printed command containing --expect-plan to apply.
 ```
 
 Use `--branch <branch>` when the library lives on a non-default branch. The remote may use HTTPS or SSH, but credentials cannot be embedded in its URL. When the remote is empty, initialization requires confirmation before creating the library metadata and skill root.
@@ -20,10 +21,24 @@ skill-sync init \
   --create you/ai-skills \
   --visibility private \
   --transport ssh \
-  --branch main
+  --branch main \
+  --dry-run
 ```
 
 Repository creation requires an authenticated `gh` installation. `--visibility` accepts `private`, `public`, or `internal`; `--transport` accepts `https` or `ssh`. Those two options apply only with `--create`.
+
+Both routes return an exact, write-free setup plan. Apply the printed `--expect-plan
+<init-v1-fingerprint>` command. The CLI revalidates the remote and configuration before it crosses
+the mutation boundary and returns `INIT_PLAN_CHANGED` with an exact re-preview command when another
+review is required. For an existing library, it rechecks the branch before persistent cache writes
+and promotes the reviewed exact commit from disposable storage instead of refetching it.
+
+A direct `skill-sync init ...` without `--dry-run`, `--expect-plan`, or `--yes` is also
+preview-first. In an interactive human terminal, skill-sync prints the plan before asking whether to
+apply it. When confirmation is unavailable—such as with `--no-input`, `--json`, CI, or redirected
+streams—the command returns the preview without applying it. `--expect-plan` applies the reviewed
+fingerprint. Explicit `--yes` is the intentional one-command automation opt-in to plan and apply
+without a prompt; keep routine workflows on the two-step examples above.
 
 ## Add a new skill
 

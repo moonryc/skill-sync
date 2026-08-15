@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdir, readFile, readdir, readlink, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import {
   GitClient,
@@ -8,6 +8,7 @@ import {
   redactGitCredentials,
   type NormalizedGitRemote,
 } from './git.js';
+import { acquireAdvisoryLock } from './transactions.js';
 
 const CACHE_STATE_SCHEMA_VERSION = 1 as const;
 const FULL_OBJECT_ID = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u;
@@ -19,6 +20,7 @@ export interface LibraryCacheRefreshRequest {
   readonly remote: NormalizedGitRemote;
   readonly branch?: string;
   readonly access: LibraryCacheAccess;
+  readonly signal?: AbortSignal;
   /** Stale fallback is honored only for read-only access. */
   readonly allowStale?: boolean;
   /** An exact full object ID already present in the cache; no network request is made. */
@@ -28,6 +30,15 @@ export interface LibraryCacheRefreshRequest {
 export interface LibraryCacheInspectRequest {
   readonly remote: NormalizedGitRemote;
   readonly branch?: string;
+}
+
+export interface LibraryCachePromotionRequest {
+  readonly remote: NormalizedGitRemote;
+  readonly branch: string;
+  readonly revision: string;
+  readonly signal?: AbortSignal;
+  /** A callback-scoped Git repository that already contains the reviewed exact commit. */
+  readonly sourceRepositoryDirectory: string;
 }
 
 export interface LibraryCacheWarning {
@@ -70,9 +81,14 @@ export interface LibraryCacheOptions {
   readonly now?: () => Date;
 }
 
+export interface FilesystemLibraryCacheLockOptions {
+  readonly locksDirectory: string;
+}
+
 export type LibraryCacheErrorCode =
   | 'INVALID_BRANCH'
   | 'INVALID_CACHE'
+  | 'EXPECTED_REVISION_CHANGED'
   | 'REMOTE_REFRESH_FAILED'
   | 'DEFAULT_BRANCH_UNRESOLVED'
   | 'STALE_CACHE_UNAVAILABLE'
@@ -85,6 +101,23 @@ export class LibraryCacheError extends Error {
     super(redactGitCredentials(message));
     this.name = 'LibraryCacheError';
     this.code = code;
+  }
+}
+
+export class LibraryCacheExpectedRevisionError extends LibraryCacheError {
+  readonly expectedRevision: string;
+  readonly actualRevision: string | undefined;
+
+  constructor(expectedRevision: string, actualRevision: string | undefined) {
+    super(
+      'EXPECTED_REVISION_CHANGED',
+      actualRevision === undefined
+        ? 'The reviewed library branch is no longer present on the remote.'
+        : 'The library remote changed after the setup plan was reviewed.',
+    );
+    this.name = 'LibraryCacheExpectedRevisionError';
+    this.expectedRevision = expectedRevision;
+    this.actualRevision = actualRevision;
   }
 }
 
@@ -111,6 +144,35 @@ export const withInProcessLibraryCacheLock: LibraryCacheLock = async <T>(
     }
   }
 };
+
+/**
+ * Coordinate persistent cache publication across processes. The key is the
+ * SHA-256 cache identity used for the repository, snapshot, state, and lock.
+ */
+export function createFilesystemLibraryCacheLock(
+  options: FilesystemLibraryCacheLockOptions,
+): LibraryCacheLock {
+  return async <T>(key: string, operation: () => Promise<T>): Promise<T> => {
+    if (!/^[a-f0-9]{64}$/u.test(key)) {
+      throw new LibraryCacheError('INVALID_CACHE', 'The library cache lock identity is invalid.');
+    }
+    const lockPath = join(options.locksDirectory, `cache-${key}.lock`);
+    return await withInProcessLibraryCacheLock(
+      `filesystem-cache:${resolve(lockPath)}`,
+      async () => {
+        const lock = await acquireAdvisoryLock(lockPath, {
+          operationId: `cache-${key}`,
+          scope: { id: key, kind: 'library' },
+        });
+        try {
+          return await operation();
+        } finally {
+          await lock.release();
+        }
+      },
+    );
+  };
+}
 
 function cacheKey(identity: string): string {
   return createHash('sha256').update(identity).digest('hex');
@@ -321,11 +383,17 @@ export class LibraryCache {
         );
       }
 
-      await this.prepareRepository(request.remote, repositoryDirectory);
+      await this.prepareRepository(request.remote, repositoryDirectory, request.signal);
       try {
-        const branch = request.branch ?? (await this.resolveDefaultBranch(request.remote.cloneUrl));
-        const revision = await this.fetchBranch(repositoryDirectory, branch);
-        const snapshot = await this.materializeSnapshot(repositoryDirectory, revision);
+        const branch =
+          request.branch ??
+          (await this.resolveDefaultBranch(request.remote.cloneUrl, request.signal));
+        const revision = await this.fetchBranch(repositoryDirectory, branch, request.signal);
+        const snapshot = await this.materializeSnapshot(
+          repositoryDirectory,
+          revision,
+          request.signal,
+        );
         const state: CacheState = {
           schemaVersion: CACHE_STATE_SCHEMA_VERSION,
           identity: request.remote.identity,
@@ -364,59 +432,215 @@ export class LibraryCache {
   }
 
   /**
+   * Revalidate an already inspected exact commit against the remote, then
+   * promote it from disposable local storage without fetching network content
+   * into the persistent cache. Drift is rejected before any persistent write.
+   */
+  async promoteExact(request: LibraryCachePromotionRequest): Promise<LibraryCacheRevision> {
+    assertBranchName(request.branch);
+    if (!FULL_OBJECT_ID.test(request.revision)) {
+      throw new LibraryCacheError(
+        'INVALID_CACHE',
+        'The reviewed library revision is not an exact commit object ID.',
+      );
+    }
+
+    let sourceRevision: string;
+    try {
+      const resolved = await this.git.run(
+        ['rev-parse', '--verify', '--end-of-options', `${request.revision}^{commit}`],
+        {
+          cwd: request.sourceRepositoryDirectory,
+          profile: 'content',
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
+        },
+      );
+      sourceRevision = parseRevision(resolved.stdout, 'INVALID_CACHE');
+    } catch (error) {
+      if (error instanceof LibraryCacheError) throw error;
+      throw new LibraryCacheError(
+        'INVALID_CACHE',
+        `The reviewed exact commit is unavailable from its prepared repository: ${safeFailureMessage(error)}`,
+      );
+    }
+    if (sourceRevision.toLowerCase() !== request.revision.toLowerCase()) {
+      throw new LibraryCacheExpectedRevisionError(request.revision, sourceRevision);
+    }
+    let sourceBranchRevision: string;
+    try {
+      const resolved = await this.git.run(
+        [
+          'rev-parse',
+          '--verify',
+          '--end-of-options',
+          `refs/remotes/origin/${request.branch}^{commit}`,
+        ],
+        {
+          cwd: request.sourceRepositoryDirectory,
+          profile: 'content',
+          ...(request.signal === undefined ? {} : { signal: request.signal }),
+        },
+      );
+      sourceBranchRevision = parseRevision(resolved.stdout, 'INVALID_CACHE');
+    } catch (error) {
+      if (error instanceof LibraryCacheError) throw error;
+      throw new LibraryCacheError(
+        'INVALID_CACHE',
+        `The prepared repository no longer contains the reviewed branch: ${safeFailureMessage(error)}`,
+      );
+    }
+    if (sourceBranchRevision.toLowerCase() !== request.revision.toLowerCase()) {
+      throw new LibraryCacheExpectedRevisionError(request.revision, sourceBranchRevision);
+    }
+
+    const key = cacheKey(request.remote.identity);
+    return await this.withLock(key, async () => {
+      const libraryDirectory = join(this.rootDirectory, key);
+      const repositoryDirectory = join(libraryDirectory, 'repository.git');
+      const statePath = join(libraryDirectory, 'state.json');
+      try {
+        const advertised = await this.git.run(
+          ['ls-remote', request.remote.cloneUrl, `refs/heads/${request.branch}`],
+          {
+            profile: 'network',
+            ...(request.signal === undefined ? {} : { signal: request.signal }),
+          },
+        );
+        const advertisedRevision = advertised.stdout.trim().split(/\s+/u)[0];
+        const currentRemoteRevision =
+          advertisedRevision !== undefined && FULL_OBJECT_ID.test(advertisedRevision)
+            ? advertisedRevision
+            : undefined;
+        if (currentRemoteRevision?.toLowerCase() !== request.revision.toLowerCase()) {
+          throw new LibraryCacheExpectedRevisionError(request.revision, currentRemoteRevision);
+        }
+        await this.prepareRepository(request.remote, repositoryDirectory, request.signal);
+        await this.git.run(
+          [
+            'fetch',
+            '--force',
+            '--no-tags',
+            '--no-recurse-submodules',
+            request.sourceRepositoryDirectory,
+            request.revision,
+          ],
+          {
+            cwd: repositoryDirectory,
+            profile: 'content',
+            ...(request.signal === undefined ? {} : { signal: request.signal }),
+          },
+        );
+        const fetched = await this.git.run(
+          ['rev-parse', '--verify', '--end-of-options', 'FETCH_HEAD^{commit}'],
+          {
+            cwd: repositoryDirectory,
+            profile: 'content',
+            ...(request.signal === undefined ? {} : { signal: request.signal }),
+          },
+        );
+        const fetchedRevision = parseRevision(fetched.stdout, 'INVALID_CACHE');
+        if (fetchedRevision.toLowerCase() !== request.revision.toLowerCase()) {
+          throw new LibraryCacheError(
+            'INVALID_CACHE',
+            'The promoted cache commit did not match the reviewed exact revision.',
+          );
+        }
+        await this.git.run(
+          ['update-ref', `refs/remotes/origin/${request.branch}`, request.revision],
+          {
+            cwd: repositoryDirectory,
+            profile: 'content',
+            ...(request.signal === undefined ? {} : { signal: request.signal }),
+          },
+        );
+        const snapshot = await this.materializeSnapshot(
+          repositoryDirectory,
+          request.revision,
+          request.signal,
+        );
+        const state: CacheState = {
+          schemaVersion: CACHE_STATE_SCHEMA_VERSION,
+          identity: request.remote.identity,
+          branch: request.branch,
+          revision: request.revision.toLowerCase(),
+          refreshedAt: this.now().toISOString(),
+          snapshotDigest: snapshot.digest,
+        };
+        await this.writeState(statePath, state);
+        return {
+          repositoryDirectory,
+          treeDirectory: snapshot.directory,
+          identity: state.identity,
+          branch: state.branch,
+          revision: state.revision,
+          refreshedAt: state.refreshedAt,
+          freshness: 'fetched',
+          stale: false,
+          usableForMutation: true,
+        };
+      } catch (error) {
+        if (error instanceof LibraryCacheError) throw error;
+        throw new LibraryCacheError(
+          'REMOTE_REFRESH_FAILED',
+          `Unable to promote the reviewed library into the cache: ${safeFailureMessage(error)}`,
+        );
+      }
+    });
+  }
+
+  /**
    * Resolve the last verified cached commit without network access, directory
    * creation, metadata updates, or any other filesystem write.
    */
   async inspect(request: LibraryCacheInspectRequest): Promise<LibraryCacheRevision> {
     if (request.branch !== undefined) assertBranchName(request.branch);
     const key = cacheKey(request.remote.identity);
-    return await this.withLock(key, async () => {
-      const libraryDirectory = join(this.rootDirectory, key);
-      const repositoryDirectory = join(libraryDirectory, 'repository.git');
-      const statePath = join(libraryDirectory, 'state.json');
-      if ((await pathType(repositoryDirectory)) !== 'directory') {
-        throw new LibraryCacheError(
-          'STALE_CACHE_UNAVAILABLE',
-          'No verified cached library revision is available for cache-only inspection.',
-        );
-      }
-      const state = await this.readState(statePath, request.remote.identity);
-      if (request.branch !== undefined && request.branch !== state.branch) {
-        throw new LibraryCacheError(
-          'STALE_CACHE_UNAVAILABLE',
-          'The cached branch does not match the configured branch.',
-        );
-      }
-      const treeDirectory = this.snapshotDirectory(repositoryDirectory, state.revision);
-      if ((await pathType(treeDirectory)) !== 'directory') {
-        throw new LibraryCacheError(
-          'STALE_CACHE_UNAVAILABLE',
-          'The verified cache has no materialized exact-revision tree for write-free inspection.',
-        );
-      }
-      await this.verifySnapshotIntegrity(treeDirectory, state.snapshotDigest);
-      return {
-        repositoryDirectory,
-        treeDirectory,
-        identity: state.identity,
-        branch: state.branch,
-        revision: state.revision,
-        refreshedAt: state.refreshedAt,
-        freshness: 'cache-only',
-        stale: true,
-        usableForMutation: false,
-        warning: {
-          code: 'CACHE_ONLY',
-          message:
-            'Using the last verified cache without a remote refresh; it must not be reported as current.',
-        },
-      };
-    });
+    const libraryDirectory = join(this.rootDirectory, key);
+    const repositoryDirectory = join(libraryDirectory, 'repository.git');
+    const statePath = join(libraryDirectory, 'state.json');
+    if ((await pathType(repositoryDirectory)) !== 'directory') {
+      throw new LibraryCacheError(
+        'STALE_CACHE_UNAVAILABLE',
+        'No verified cached library revision is available for cache-only inspection.',
+      );
+    }
+    const state = await this.readState(statePath, request.remote.identity);
+    if (request.branch !== undefined && request.branch !== state.branch) {
+      throw new LibraryCacheError(
+        'STALE_CACHE_UNAVAILABLE',
+        'The cached branch does not match the configured branch.',
+      );
+    }
+    const treeDirectory = this.snapshotDirectory(repositoryDirectory, state.revision);
+    if ((await pathType(treeDirectory)) !== 'directory') {
+      throw new LibraryCacheError(
+        'STALE_CACHE_UNAVAILABLE',
+        'The verified cache has no materialized exact-revision tree for write-free inspection.',
+      );
+    }
+    await this.verifySnapshotIntegrity(treeDirectory, state.snapshotDigest);
+    return {
+      repositoryDirectory,
+      treeDirectory,
+      identity: state.identity,
+      branch: state.branch,
+      revision: state.revision,
+      refreshedAt: state.refreshedAt,
+      freshness: 'cache-only',
+      stale: true,
+      usableForMutation: false,
+      warning: {
+        code: 'CACHE_ONLY',
+        message:
+          'Using the last verified cache without a remote refresh; it must not be reported as current.',
+      },
+    };
   }
 
   private async prepareRepository(
     remote: NormalizedGitRemote,
     repositoryDirectory: string,
+    signal?: AbortSignal,
   ): Promise<void> {
     await mkdir(dirname(repositoryDirectory), { recursive: true });
     const type = await pathType(repositoryDirectory);
@@ -427,10 +651,14 @@ export class LibraryCache {
       );
     }
     if (type === 'missing') {
-      await this.git.run(['init', '--bare', repositoryDirectory]);
+      await this.git.run(
+        ['init', '--bare', repositoryDirectory],
+        signal === undefined ? {} : { signal },
+      );
     } else {
       const result = await this.git.run(['rev-parse', '--is-bare-repository'], {
         cwd: repositoryDirectory,
+        ...(signal === undefined ? {} : { signal }),
       });
       if (result.stdout.trim() !== 'true') {
         throw new LibraryCacheError('INVALID_CACHE', 'The library cache is not a bare repository.');
@@ -438,9 +666,13 @@ export class LibraryCache {
     }
 
     try {
-      await this.git.run(['remote', 'get-url', 'origin'], { cwd: repositoryDirectory });
+      await this.git.run(['remote', 'get-url', 'origin'], {
+        cwd: repositoryDirectory,
+        ...(signal === undefined ? {} : { signal }),
+      });
       await this.git.run(['remote', 'set-url', 'origin', remote.cloneUrl], {
         cwd: repositoryDirectory,
+        ...(signal === undefined ? {} : { signal }),
       });
     } catch (error) {
       if (!(error instanceof GitExecutionError) || error.exitCode !== 2) {
@@ -448,26 +680,34 @@ export class LibraryCache {
       }
       await this.git.run(['remote', 'add', 'origin', remote.cloneUrl], {
         cwd: repositoryDirectory,
+        ...(signal === undefined ? {} : { signal }),
       });
     }
   }
 
-  private async resolveDefaultBranch(cloneUrl: string): Promise<string> {
-    const result = await this.git.run(['ls-remote', '--symref', '--exit-code', cloneUrl, 'HEAD']);
+  private async resolveDefaultBranch(cloneUrl: string, signal?: AbortSignal): Promise<string> {
+    const result = await this.git.run(
+      ['ls-remote', '--symref', '--exit-code', cloneUrl, 'HEAD'],
+      signal === undefined ? {} : { signal },
+    );
     return parseDefaultBranch(result.stdout);
   }
 
-  private async fetchBranch(repositoryDirectory: string, branch: string): Promise<string> {
+  private async fetchBranch(
+    repositoryDirectory: string,
+    branch: string,
+    signal?: AbortSignal,
+  ): Promise<string> {
     assertBranchName(branch);
     const remoteReference = `refs/remotes/origin/${branch}`;
     const refspec = `+refs/heads/${branch}:${remoteReference}`;
     await this.git.run(
       ['fetch', '--force', '--prune', '--no-tags', '--no-recurse-submodules', 'origin', refspec],
-      { cwd: repositoryDirectory },
+      { cwd: repositoryDirectory, ...(signal === undefined ? {} : { signal }) },
     );
     const result = await this.git.run(
       ['rev-parse', '--verify', '--end-of-options', `${remoteReference}^{commit}`],
-      { cwd: repositoryDirectory },
+      { cwd: repositoryDirectory, ...(signal === undefined ? {} : { signal }) },
     );
     return parseRevision(result.stdout, 'REMOTE_REFRESH_FAILED');
   }
@@ -594,6 +834,7 @@ export class LibraryCache {
   private async materializeSnapshot(
     repositoryDirectory: string,
     revision: string,
+    signal?: AbortSignal,
   ): Promise<{ readonly directory: string; readonly digest: string }> {
     const destination = this.snapshotDirectory(repositoryDirectory, revision);
     const destinationType = await pathType(destination);
@@ -602,22 +843,35 @@ export class LibraryCache {
     await mkdir(snapshotsRoot, { recursive: true, mode: 0o700 });
     const temporary = join(snapshotsRoot, `.snapshot-${revision}-${randomUUID()}`);
     try {
-      await this.git.run(['init', '--quiet', temporary], { profile: 'content' });
+      await this.git.run(['init', '--quiet', temporary], {
+        profile: 'content',
+        ...(signal === undefined ? {} : { signal }),
+      });
       await this.git.run(['remote', 'add', 'cache', repositoryDirectory], {
         cwd: temporary,
         profile: 'content',
+        ...(signal === undefined ? {} : { signal }),
       });
       await this.git.run(
         ['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', 'cache', revision],
-        { cwd: temporary, profile: 'content' },
+        {
+          cwd: temporary,
+          profile: 'content',
+          ...(signal === undefined ? {} : { signal }),
+        },
       );
       await this.git.run(['checkout', '--quiet', '--detach', 'FETCH_HEAD'], {
         cwd: temporary,
         profile: 'content',
+        ...(signal === undefined ? {} : { signal }),
       });
       const resolved = await this.git.run(
         ['rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}'],
-        { cwd: temporary, profile: 'content' },
+        {
+          cwd: temporary,
+          profile: 'content',
+          ...(signal === undefined ? {} : { signal }),
+        },
       );
       if (
         parseRevision(resolved.stdout, 'INVALID_CACHE').toLowerCase() !== revision.toLowerCase()

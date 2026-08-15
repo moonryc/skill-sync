@@ -6,7 +6,11 @@ description: Find every skill-sync command and jump to its full arguments, optio
 import { CommandExplorer } from '../../../components/CommandExplorer';
 import { commandCategories, commands } from '../../../data/commands';
 
-Every command accepts the [global options documented with configuration](/reference/configuration/#global-options). Mutating commands expose `--dry-run` where a preview is meaningful, and destructive replacement always requires explicit intent beyond a generic confirmation.
+Common options are [capability-based](/reference/configuration/#global-options): argument-driven
+commands broadly support JSON, prompt controls appear only on leaves that may prompt, and scope
+flags appear only where declared. Mutating commands expose `--dry-run` where a preview is
+meaningful, and destructive replacement always requires explicit intent beyond a generic
+confirmation.
 
 <CommandExplorer client:load commands={commands} categories={commandCategories} />
 
@@ -17,4 +21,5 @@ The explorer is progressively enhanced: its complete linked command list is pres
 - [Library commands](/reference/library-commands/) — connect, create, add, publish, group, and remove canonical content.
 - [Project commands](/reference/project-commands/) — install, adopt, synchronize, update, and uninstall managed copies.
 - [Inspection and diagnostics](/reference/inspection/) — browse, inspect, compare, validate, and diagnose.
-- [Configuration and global options](/reference/configuration/) — resolve defaults and control output or project context.
+- [Recovery commands](/reference/recovery-commands/) — identify, inspect, resume, restore, or safely prune interrupted operations.
+- [Configuration, CLI setup, and global options](/reference/configuration/) — inspect lifecycle commands, generate shell completion, resolve defaults, and control output or project context.

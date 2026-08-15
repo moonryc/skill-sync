@@ -2,14 +2,10 @@ import {
   CONFIG_KEYS,
   ConfigService,
   type ConfigKey,
+  type ConfigUnsetResult,
   type ConfigurationListing,
 } from '../application/config-service.js';
-import {
-  formatDoctorReport,
-  runDoctor,
-  type DoctorReport,
-  type DoctorRequest,
-} from '../application/doctor.js';
+import { runDoctor, type DoctorReport, type DoctorRequest } from '../application/doctor.js';
 import {
   EXIT_CODES,
   type CommandResult,
@@ -19,6 +15,7 @@ import {
   SkillSyncError,
   success,
 } from '../domain/result.js';
+import { formatDoctorReport } from '../ui/doctor-output.js';
 
 export interface ExtensibleCommandInvocation {
   readonly command: string;
@@ -37,7 +34,7 @@ export interface ConfigCommandService {
   list(): Promise<ConfigurationListing>;
   get(key: string): Promise<ConfigValue | undefined>;
   set(key: string, value: string): Promise<unknown>;
-  unset(key: string): Promise<unknown>;
+  unset(key: string): Promise<ConfigUnsetResult>;
 }
 
 export interface ConfigListingData {
@@ -83,7 +80,27 @@ function argument(
 
 function valueText(value: ConfigValue | null): string {
   if (value === null) return '<unset>';
-  return typeof value === 'string' ? value : value.join(', ');
+  if (typeof value === 'string') return value;
+  return value.length === 0 ? '<none>' : value.join(', ');
+}
+
+const EFFECTIVE_KEYS: Readonly<
+  Record<ConfigKey, keyof ConfigurationListing['effective']['value']>
+> = {
+  'library.remote': 'libraryUrl',
+  'library.branch': 'branch',
+  'library.transport': 'transport',
+  'defaults.targets': 'defaultTargets',
+  'defaults.gitignore': 'gitignore',
+};
+
+function configKey(value: string): ConfigKey {
+  if (!(CONFIG_KEYS as readonly string[]).includes(value)) {
+    throw new Error(
+      `Unsupported configuration key ${value}. Valid keys: ${CONFIG_KEYS.join(', ')}`,
+    );
+  }
+  return value as ConfigKey;
 }
 
 function listingData(listing: ConfigurationListing): ConfigListingData {
@@ -101,26 +118,74 @@ function listingData(listing: ConfigurationListing): ConfigListingData {
 }
 
 export function formatConfigurationListing(listing: ConfigListingData): string {
-  const effectiveKeys: Readonly<Record<ConfigKey, keyof ConfigListingData['effective']['value']>> =
-    {
-      'library.remote': 'libraryUrl',
-      'library.branch': 'branch',
-      'library.transport': 'transport',
-      'defaults.targets': 'defaultTargets',
-      'defaults.gitignore': 'gitignore',
-    };
-  const lines = [`Configuration: ${listing.path}`, 'Configured:'];
+  const configuredCount = CONFIG_KEYS.filter((key) => listing.configured[key] !== null).length;
+  const lines = [
+    `Configuration path: ${listing.path}`,
+    `Configured values: ${String(configuredCount)} of ${String(CONFIG_KEYS.length)}`,
+    'Values:',
+  ];
   for (const key of CONFIG_KEYS) {
-    lines.push(`  ${key} = ${valueText(listing.configured[key])}`);
-  }
-  lines.push('Effective:');
-  for (const key of CONFIG_KEYS) {
-    const effectiveKey = effectiveKeys[key];
+    const effectiveKey = EFFECTIVE_KEYS[key];
     const value = listing.effective.value[effectiveKey];
     const source = listing.effective.sources[effectiveKey];
-    lines.push(`  ${key} = ${valueText(value ?? null)} (${source})`);
+    lines.push(
+      `  Key: ${key}`,
+      `    Configured: ${valueText(listing.configured[key])}`,
+      `    Effective: ${valueText(value ?? null)}`,
+      `    Effective source: ${source}`,
+    );
   }
+  lines.push('Next: Change a value with skill-sync config set <key> <value>.');
   return lines.join('\n');
+}
+
+function formatConfigurationValue(
+  heading: string,
+  key: ConfigKey,
+  listing: ConfigListingData,
+  next: string,
+): string {
+  const effectiveKey = EFFECTIVE_KEYS[key];
+  return [
+    heading,
+    `Key: ${key}`,
+    `Configuration path: ${listing.path}`,
+    `Configured value: ${valueText(listing.configured[key])}`,
+    `Effective value: ${valueText(listing.effective.value[effectiveKey] ?? null)}`,
+    `Effective source: ${listing.effective.sources[effectiveKey]}`,
+    next,
+  ].join('\n');
+}
+
+function formatConfigurationUnset(
+  key: ConfigKey,
+  listing: ConfigListingData,
+  result: ConfigUnsetResult,
+): string {
+  const effectiveKey = EFFECTIVE_KEYS[key];
+  const configuredValue = listing.configured[key];
+  const heading = !result.changed
+    ? 'No configuration change.'
+    : result.changedKeys.length === 1 && configuredValue === null
+      ? 'Configured value removed.'
+      : 'Configuration updated.';
+  const next = !result.changed
+    ? configuredValue === null
+      ? `Next: Set an override with skill-sync config set ${key} <value>.`
+      : 'Next: No action is needed; run skill-sync config list to review all effective values.'
+    : result.changedKeys.length > 1
+      ? 'Next: Run skill-sync config list to review every effective value changed by this coupled update.'
+      : `Next: Run skill-sync config get ${key} to verify the effective value.`;
+  return [
+    heading,
+    `Requested key: ${key}`,
+    `Changed keys (${String(result.changedKeys.length)}): ${result.changedKeys.length === 0 ? 'none' : result.changedKeys.join(', ')}`,
+    `Configuration path: ${listing.path}`,
+    `Configured value now: ${valueText(configuredValue)}`,
+    `Effective value now: ${valueText(listing.effective.value[effectiveKey] ?? null)}`,
+    `Effective source now: ${listing.effective.sources[effectiveKey]}`,
+    next,
+  ].join('\n');
 }
 
 function configFailure(error: unknown): CommandResult<never> {
@@ -218,7 +283,10 @@ export function createConfigDoctorCommandHandler(
         const report = normalizedDoctorReport(await diagnose(requestDoctor(invocation)));
         const humanReport =
           dependencies.formatDoctor === undefined
-            ? formatDoctorReport(report, { color: invocation.options.color === true })
+            ? formatDoctorReport(report, {
+                color: invocation.options.color === true,
+                explicitProject: typeof invocation.options.project === 'string',
+              })
             : dependencies.formatDoctor(report);
         return doctorResult(report, redactSecrets(humanReport), json);
       } catch (error) {
@@ -230,7 +298,14 @@ export function createConfigDoctorCommandHandler(
       switch (invocation.command) {
         case 'config:path': {
           const path = config.path();
-          return success(json ? { path } : path);
+          return success(
+            json
+              ? { path }
+              : [
+                  `Configuration path: ${path}`,
+                  'Next: Run skill-sync config list to inspect configured and effective values.',
+                ].join('\n'),
+          );
         }
         case 'config:list': {
           const listing = listingData(await config.list());
@@ -240,7 +315,16 @@ export function createConfigDoctorCommandHandler(
           const key = argument(invocation, 0, 'configuration key');
           if (typeof key !== 'string') return key;
           const value = (await config.get(key)) ?? null;
-          return success(json ? { key, configured: value !== null, value } : valueText(value));
+          if (json) return success({ key, configured: value !== null, value });
+          const selectedKey = configKey(key);
+          const listing = listingData(await config.list());
+          const next =
+            value === null
+              ? `Next: Set it with skill-sync config set ${selectedKey} <value>.`
+              : `Next: Change it with skill-sync config set ${selectedKey} <value>, or remove the override with skill-sync config unset ${selectedKey}.`;
+          return success(
+            formatConfigurationValue('Configuration value.', selectedKey, listing, next),
+          );
         }
         case 'config:set': {
           const key = argument(invocation, 0, 'configuration key');
@@ -249,13 +333,33 @@ export function createConfigDoctorCommandHandler(
           if (typeof rawValue !== 'string') return rawValue;
           await config.set(key, rawValue);
           const value = (await config.get(key)) ?? null;
-          return success(json ? { key, value } : `Set ${key} = ${valueText(value)}.`);
+          if (json) return success({ key, value });
+          const selectedKey = configKey(key);
+          const listing = listingData(await config.list());
+          return success(
+            formatConfigurationValue(
+              'Configuration updated.',
+              selectedKey,
+              listing,
+              `Next: Run skill-sync config get ${selectedKey} to verify the effective value.`,
+            ),
+          );
         }
         case 'config:unset': {
           const key = argument(invocation, 0, 'configuration key');
           if (typeof key !== 'string') return key;
-          await config.unset(key);
-          return success(json ? { key, unset: true } : `Unset ${key}.`);
+          const result = await config.unset(key);
+          if (json) {
+            return success({
+              key,
+              unset: result.changed,
+              changed: result.changed,
+              changedKeys: result.changedKeys,
+            });
+          }
+          const selectedKey = configKey(key);
+          const listing = listingData(await config.list());
+          return success(formatConfigurationUnset(selectedKey, listing, result));
         }
       }
     } catch (error) {
