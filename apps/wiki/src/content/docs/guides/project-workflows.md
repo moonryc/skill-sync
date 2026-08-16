@@ -14,9 +14,17 @@ explicit command below:
 skill-sync tui
 ```
 
-The command center groups the catalog, supports search and multi-selection,
-shows managed reconciliation badges, and reports valid Codex/Claude skill
+The command center opens with managed-skill health, not only inventory totals.
+It keeps the selected scope and screen in the header, offers contextual help on
+`?`, supports multi-selection, and reports valid Codex/Claude skill
 directories that exist on disk but are not represented by this project's state.
+In the catalog, press `/` to enter search mode; every character is search text
+until Enter keeps the filter or Esc clears it. Press `f` for the group chooser
+and `c` to clear both filters. Rows stay bounded to terminal width, and wide
+terminals show a selected-skill summary.
+During an in-flight command, Ctrl+C requests cooperative cancellation through
+the normal commit-aware runtime boundary. The interface waits for a safe
+boundary rather than claiming that a committed operation was cancelled.
 Project and global dashboards honor a valid effective `defaults.targets` set
 and fall back to Codex only when no valid target set is available.
 From the catalog, press `x` on the highlighted skill to review canonical
@@ -41,6 +49,19 @@ in this guide for automation.
 Run `skill-sync --global` or `skill-sync --global tui` to use the same visual
 workflow against user-level state; its inventory then identifies global skills
 that exist on disk but are not globally tracked.
+
+From **Managed skills**, press Enter to explain the highlighted state and see
+exact `diff` and single-skill update preview commands. Press `s` to build a real
+`sync --dry-run` review. It shows the library revision and freshness, actions,
+writes, backups, and blocked or skipped skills. Toggling discard-local rebuilds
+the review with a backup warning. Confirmation repeats the preview; a changed
+`sync-review-v1-...` fingerprint is displayed and requires another confirmation.
+Diagnostics remain available from the normal overview after setup.
+
+<figure class="tui-shot">
+  <img src="/images/tui/sync-review.svg" alt="The TUI synchronization review with revision, freshness, actions, writes, backups, and blocked skills" />
+  <figcaption>Synchronization is previewed and fingerprinted before the normal reconciliation workflow can run.</figcaption>
+</figure>
 
 ### Add a local skill visually
 

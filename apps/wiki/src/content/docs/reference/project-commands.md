@@ -14,6 +14,21 @@ invalid choices, and conflicts such as `--global` with `--project`, IDs with `--
 
 Open the interactive, keyboard-driven command center.
 
+The overview prioritizes managed states that need attention and keeps
+Diagnostics available after setup. Press `/` for catalog search mode, `f` for
+the group chooser, `c` to clear filters, and `?` for contextual help. Because
+search is modal, shortcut letters are searchable text instead of actions while
+the field is active. Managed-skill Enter shows state guidance and exact
+`diff`/`update --dry-run` handoffs.
+While an operation is running, Ctrl+C requests cooperative runtime cancellation
+and waits for the current safe commit boundary.
+
+Synchronization is preview-first inside the TUI. `s` runs `sync --dry-run` and
+shows revision, freshness, per-skill actions, writes, backups, and skipped or
+blocked entries. Changing discard-local rebuilds the plan. Confirmation repeats
+the preview and requires a second confirmation whenever its deterministic
+`sync-review-v1-...` fingerprint changes.
+
 ```text
 skill-sync tui
 ```

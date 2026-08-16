@@ -113,9 +113,17 @@ skill-sync
 skill-sync tui
 ```
 
-The TUI lets users browse groups, search, select skills/targets, inspect managed
-state, remove a selected canonical skill, and view valid untracked skills in
-supported Codex/Claude target roots.
+The TUI overview leads with managed-skill health and keeps catalog, unmanaged
+inventory, and diagnostics as explicit actions. The header identifies scope and
+current screen; `?` opens contextual keyboard help. It lets users browse groups,
+search, select skills/targets, inspect managed state, remove a selected canonical
+skill, and view valid untracked skills in supported Codex/Claude target roots.
+Catalog search is a deliberate `/` mode so shortcut letters remain search text
+until Enter keeps or Esc clears the query. Use `f` for the visible group chooser
+and `c` to clear both filters.
+While a TUI command is busy, Ctrl+C emits the runtime's cooperative SIGINT
+request and waits for its commit-aware safe boundary; do not describe it as an
+immediate process exit.
 For project and global dashboards, initialize selected targets from the effective
 `defaults.targets` value. Honor a valid configured set in either scope and use Codex
 as the fallback only when no valid target set is available.
@@ -169,7 +177,17 @@ exact fingerprint.
 Long TUI lists use cursor-aware windows, so the highlighted item remains the one
 acted on.
 
-The TUI diagnostics screen parses the structured `doctor` report from either a
+On Managed skills, Enter explains the highlighted reconciliation state and
+prints exact `diff` and single-skill `update --dry-run` handoffs. `s` opens a
+real `sync --dry-run` review containing revision, freshness, per-skill action,
+writes, backup paths, and blocked/skipped counts. Toggling `d` regenerates the
+review with discard-local enabled and an explicit backup warning. On `y`, the
+TUI repeats the preview and compares its deterministic `sync-review-v1-...`
+fingerprint. A changed preview returns to review and requires another `y`; an
+unchanged preview delegates application to the normal reconciliation command.
+
+The TUI diagnostics screen is available during first run and from the normal
+overview. It parses the structured `doctor` report from either a
 successful or failed command result. Read the pass, warning, fail, and skipped
 counts first; failures are listed before warnings and skipped checks, with each
 remediation labeled `Next:`. Long issue lists are terminal-bounded and report

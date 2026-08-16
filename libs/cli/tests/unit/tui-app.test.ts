@@ -13,6 +13,7 @@ import {
   TuiCatalogEmptyState,
   TuiFirstRunMenu,
   TuiGitignorePolicy,
+  TuiHelp,
   TuiInstallPreviewReview,
   TuiLibraryRemoveReview,
   TuiReleaseUpdateIndicator,
@@ -20,6 +21,7 @@ import {
   TuiSetupForm,
   TuiSetupGuide,
   TuiSetupReview,
+  TuiSyncPreviewReview,
   TUI_SETUP_GUIDE_URL,
   TuiWindowIndicator,
 } from '../../src/ui/tui/app.js';
@@ -143,6 +145,7 @@ describe('TUI renderer and action port', () => {
           add: () => Promise.resolve(success({})),
           adopt: () => Promise.resolve(success({})),
           applyLibrarySetup: () => Promise.resolve(success({})),
+          cancel: () => false,
           checkForUpdate: () => Promise.resolve(undefined),
           diagnose: () => Promise.resolve(success(doctorSummary(0))),
           install: () => Promise.resolve(success({})),
@@ -167,6 +170,20 @@ describe('TUI renderer and action port', () => {
                 id: 'frontend/review-ui',
                 revision: 'a'.repeat(40),
                 warning: 'Installed copies remain orphaned.',
+              }),
+            ),
+          previewSync: () =>
+            Promise.resolve(
+              success({
+                authoritative: true,
+                fingerprint: `sync-review-v1-${'f'.repeat(64)}`,
+                freshness: 'fetched',
+                libraryRevision: 'a'.repeat(40),
+                location: '/workspace',
+                scope: 'project' as const,
+                skills: [],
+                stale: false,
+                wouldChange: false,
               }),
             ),
           removeLibrarySkill: () => Promise.resolve(success({})),
@@ -413,6 +430,45 @@ describe('TUI renderer and action port', () => {
     expect(managed).toContain('Manage exact skill paths in .gitignore');
     expect(global).toContain('not applicable to global installs');
     expect(global).not.toContain('Manage exact skill paths');
+  });
+
+  it('renders contextual keyboard help and a bounded synchronization plan', () => {
+    const help = renderToString(createElement(TuiHelp, { color: false, screen: 'catalog' }));
+    const review = renderToString(
+      createElement(TuiSyncPreviewReview, {
+        color: false,
+        discardLocal: true,
+        preview: {
+          authoritative: true,
+          fingerprint: `sync-review-v1-${'f'.repeat(64)}`,
+          freshness: 'fetched',
+          libraryRevision: 'a'.repeat(40),
+          location: '/workspace',
+          scope: 'project',
+          skills: [
+            {
+              action: 'discard-local',
+              backupPaths: ['.skill-sync/backups/review-ui'],
+              id: 'frontend/review-ui',
+              outcome: 'planned',
+              state: 'locally-modified',
+              writes: ['.codex/skills/review-ui'],
+            },
+          ],
+          stale: false,
+          wouldChange: true,
+        },
+        rows: 30,
+      }),
+    );
+
+    expect(help).toContain('/ search · f choose group · c clear filters');
+    expect(help).toContain('?/Esc close help');
+    expect(review).toContain('1 action(s) · 1 write(s) · 1 backup(s)');
+    expect(review).toContain('locally-modified → discard-local');
+    expect(review).toContain('Discard-local is enabled');
+    expect(review).toContain('Reviewed plan:');
+    expect(review).toContain('sync-review-v1-');
   });
 
   it('renders every safety-relevant field from an install dry-run', () => {

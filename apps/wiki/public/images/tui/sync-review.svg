@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title desc">
+  <title id="title">skill-sync synchronization review</title>
+  <desc id="desc">The skill-sync terminal synchronization review showing revision, freshness, planned actions, writes, backups, and revalidation controls.</desc>
+  <defs>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#020617" flood-opacity="0.42"/>
+    </filter>
+  </defs>
+  <rect width="1200" height="680" fill="#f8fafc"/>
+  <rect x="70" y="54" width="1060" height="572" rx="22" fill="url(#screen)" stroke="#334155" filter="url(#shadow)"/>
+  <path d="M70 112h1060" stroke="#334155"/>
+  <circle cx="108" cy="83" r="8" fill="#fb7185"/>
+  <circle cx="136" cy="83" r="8" fill="#fbbf24"/>
+  <circle cx="164" cy="83" r="8" fill="#34d399"/>
+  <text x="600" y="90" fill="#94a3b8" font-family="SFMono-Regular,Consolas,Liberation Mono,monospace" font-size="18" text-anchor="middle">skill-sync tui</text>
+  <g font-family="SFMono-Regular,Consolas,Liberation Mono,monospace" font-size="19">
+    <rect x="104" y="140" width="992" height="52" rx="10" fill="#0f172a" stroke="#d946ef"/>
+    <text x="126" y="173" fill="#f0abfc" font-weight="700">✦ skill-sync command center · project scope · Sync review</text>
+    <text x="104" y="226" fill="#f8fafc" font-weight="700">Review synchronization</text>
+    <text x="104" y="264" fill="#cbd5e1">d ○ Allow discard-local (requires backup and confirmation)</text>
+    <text x="104" y="302" fill="#cbd5e1">Scope: project (/Users/you/project)</text>
+    <text x="104" y="340" fill="#cbd5e1">Library revision: 8ce35d74594f…</text>
+    <text x="104" y="378" fill="#34d399">Freshness: fetched · authoritative</text>
+    <text x="104" y="416" fill="#cbd5e1">Plan: 2 actions · 4 writes · 1 backup · 1 blocked/skipped</text>
+    <text x="126" y="454" fill="#cbd5e1">frontend/review-ui · outdated → update · 3 writes</text>
+    <text x="126" y="492" fill="#fbbf24">tools/release · conflicted → skip-conflict · 0 writes</text>
+    <text x="104" y="538" fill="#94a3b8">y revalidate and sync · d toggle discard-local · ? help · Esc cancel</text>
+    <text x="104" y="583" fill="#64748b">Reviewed plan: sync-review-v1-92c64d…</text>
+  </g>
+</svg>

@@ -8,6 +8,7 @@ import {
   confirmTuiInstallReview,
   confirmTuiLibraryRemoveReview,
   confirmTuiSetupReview,
+  confirmTuiSyncReview,
   describeTuiItemWindow,
   firstRunDestination,
   moveTuiCursor,
@@ -43,6 +44,7 @@ import type {
   TuiLibrarySetupIntent,
   TuiReleaseUpdate,
   TuiSkill,
+  TuiSyncPreview,
 } from './types.js';
 
 export const TUI_SETUP_GUIDE_URL =
@@ -116,7 +118,21 @@ function Header(props: {
   readonly color: boolean;
   readonly compact: boolean;
   readonly scope: string;
+  readonly screen: TuiScreen;
 }): ReactElement {
+  const screenName: Partial<Record<TuiScreen, string>> = {
+    catalog: 'Catalog',
+    diagnostics: 'Diagnostics',
+    detail: 'Skill details',
+    'group-filter': 'Group filter',
+    'install-review': 'Install review',
+    managed: 'Managed skills',
+    'managed-detail': 'Managed skill details',
+    overview: 'Overview',
+    'sync-review': 'Sync review',
+    unmanaged: 'Unmanaged inventory',
+  };
+  const context = screenName[props.screen];
   return createElement(
     Box,
     {
@@ -128,9 +144,36 @@ function Header(props: {
       Text,
       { bold: props.color, ...withColor(props.color ? palette.accent : undefined) },
       props.compact
-        ? `skill-sync · ${props.scope}`
-        : `✦ skill-sync command center · ${props.scope} scope`,
+        ? `skill-sync · ${props.scope}${context === undefined ? '' : ` · ${context}`}`
+        : `✦ skill-sync command center · ${props.scope} scope${context === undefined ? '' : ` · ${context}`}`,
     ),
+  );
+}
+
+export function TuiHelp(props: {
+  readonly color: boolean;
+  readonly screen: TuiScreen;
+}): ReactElement {
+  const screenControls: Partial<Record<TuiScreen, readonly string[]>> = {
+    catalog: [
+      '/ search · f choose group · c clear filters',
+      'Space select · Enter details · i install · x remove',
+    ],
+    managed: ['Enter inspect · s review synchronization · r refresh'],
+    'managed-detail': ['s review synchronization · Esc managed skills'],
+    unmanaged: ['Enter/a add to library · d adopt existing · r refresh'],
+    overview: ['↑↓ move · Enter open · r refresh'],
+    'sync-review': ['d toggle discard-local · y revalidate and sync'],
+  };
+  return createElement(
+    Box,
+    { flexDirection: 'column', gap: 1 },
+    createElement(Text, { bold: props.color }, 'Keyboard help'),
+    ...(
+      screenControls[props.screen] ?? ['Follow the controls shown at the bottom of this screen.']
+    ).map((line) => createElement(Text, { key: line }, line)),
+    createElement(Text, null, 'Global while idle: ? help · Esc back/cancel · q quit · Ctrl+C quit'),
+    createElement(Text, withColor(props.color ? palette.muted : undefined), '?/Esc close help'),
   );
 }
 
@@ -646,6 +689,71 @@ export function TuiInstallPreviewReview(props: {
   );
 }
 
+export function TuiSyncPreviewReview(props: {
+  readonly color: boolean;
+  readonly discardLocal: boolean;
+  readonly preview: TuiSyncPreview;
+  readonly rows: number;
+}): ReactElement {
+  const muted = props.color ? palette.muted : undefined;
+  const warning = props.color ? palette.warning : undefined;
+  const actionable = props.preview.skills.filter((skill) => skill.action !== 'none');
+  const skipped = props.preview.skills.filter((skill) => skill.action.startsWith('skip-'));
+  const writes = actionable.flatMap((skill) => skill.writes);
+  const backups = actionable.flatMap((skill) => skill.backupPaths);
+  const limit = Math.max(1, Math.min(8, Math.floor(props.rows) - 18));
+  const visible = actionable.slice(0, limit);
+  return createElement(
+    Box,
+    { flexDirection: 'column', gap: 1 },
+    createElement(
+      Text,
+      null,
+      `Scope: ${props.preview.scope} (${terminalSafe(props.preview.location)})`,
+    ),
+    createElement(Text, null, `Library revision: ${terminalSafe(props.preview.libraryRevision)}`),
+    createElement(
+      Text,
+      withColor(props.color && props.preview.stale ? warning : undefined),
+      `Freshness: ${terminalSafe(props.preview.freshness)} · ${props.preview.authoritative ? 'authoritative' : 'non-authoritative'}`,
+    ),
+    createElement(
+      Text,
+      null,
+      `Plan: ${String(actionable.length)} action(s) · ${String(writes.length)} write(s) · ${String(backups.length)} backup(s) · ${String(skipped.length)} blocked/skipped`,
+    ),
+    actionable.length === 0
+      ? createElement(
+          Text,
+          withColor(muted),
+          'All managed skills are current; no files would change.',
+        )
+      : null,
+    ...visible.map((skill) =>
+      createElement(
+        Text,
+        { key: skill.id, ...withColor(skill.action.startsWith('skip-') ? warning : undefined) },
+        `  ${terminalSafe(skill.id)} · ${terminalSafe(skill.state)} → ${terminalSafe(skill.action)} · ${String(skill.writes.length)} write(s)${skill.backupPaths.length === 0 ? '' : ` · ${String(skill.backupPaths.length)} backup(s)`}`,
+      ),
+    ),
+    actionable.length > visible.length
+      ? createElement(
+          Text,
+          withColor(muted),
+          `  … ${String(actionable.length - visible.length)} more actions omitted for this terminal`,
+        )
+      : null,
+    props.discardLocal
+      ? createElement(
+          Text,
+          withColor(warning),
+          'Discard-local is enabled. Modified content is replaced only after backup creation.',
+        )
+      : null,
+    createElement(Text, withColor(muted), `Reviewed plan: ${props.preview.fingerprint}`),
+  );
+}
+
 export function TuiLibraryRemoveReview(props: {
   readonly color: boolean;
   readonly preview: TuiLibraryRemovePreview;
@@ -683,11 +791,14 @@ export function TuiApp(props: {
   const [screen, setScreen] = useState<TuiScreen>('overview');
   const [cursor, setCursor] = useState(0);
   const [query, setQuery] = useState('');
+  const [searching, setSearching] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
   const [activeGroup, setActiveGroup] = useState<string | null>(null);
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
   const [targets, setTargets] = useState<ReadonlySet<string>>(() => new Set(['codex']));
   const [manageGitignore, setManageGitignore] = useState(false);
   const [discardLocal, setDiscardLocal] = useState(false);
+  const [managedDetailId, setManagedDetailId] = useState<string | undefined>();
   const [adoptionEntry, setAdoptionEntry] = useState<TuiInventorySkill | undefined>();
   const [adoptionSkillId, setAdoptionSkillId] = useState<string | undefined>();
   const [additionEntry, setAdditionEntry] = useState<TuiInventorySkill | undefined>();
@@ -704,6 +815,7 @@ export function TuiApp(props: {
   const [setupPlan, setSetupPlan] = useState<TuiLibraryInitPlan | undefined>();
   const [releaseUpdate, setReleaseUpdate] = useState<TuiReleaseUpdate | undefined>();
   const [installPreview, setInstallPreview] = useState<TuiInstallPreview | undefined>();
+  const [syncPreview, setSyncPreview] = useState<TuiSyncPreview | undefined>();
   const [libraryRemovePreview, setLibraryRemovePreview] = useState<
     TuiLibraryRemovePreview | undefined
   >();
@@ -713,6 +825,7 @@ export function TuiApp(props: {
   const targetsRef = useRef(targets);
   const manageGitignoreRef = useRef(manageGitignore);
   const installPreviewRef = useRef<TuiInstallPreview | undefined>(undefined);
+  const syncPreviewRef = useRef<TuiSyncPreview | undefined>(undefined);
   const libraryRemovePreviewRef = useRef<TuiLibraryRemovePreview | undefined>(undefined);
   const setupPlanRef = useRef<TuiLibraryInitPlan | undefined>(undefined);
   const setupIntentRef = useRef<TuiLibrarySetupIntent | undefined>(undefined);
@@ -811,6 +924,8 @@ export function TuiApp(props: {
   const unmanagedWindow = windowTuiItems(dashboard?.inventory ?? [], cursor, rowLimit);
   const adoptionWindow = windowTuiItems(adoptionCandidates, cursor, rowLimit);
   const additionLocationWindow = windowTuiItems(additionLocationItems, cursor, rowLimit);
+  const groupFilterItems = useMemo(() => [null, ...groups] as const, [groups]);
+  const groupFilterWindow = windowTuiItems(groupFilterItems, cursor, rowLimit);
   const move = (amount: number): void => {
     const nextLength =
       screen === 'catalog'
@@ -823,11 +938,15 @@ export function TuiApp(props: {
               ? adoptionCandidates.length
               : screen === 'add-location'
                 ? additionLocationItems.length
-                : screen === 'setup-diagnostics'
-                  ? (diagnostics?.issues.length ?? 0)
-                  : screen === 'first-run'
-                    ? 5
-                    : 4;
+                : screen === 'group-filter'
+                  ? groupFilterItems.length
+                  : screen === 'setup-diagnostics'
+                    ? (diagnostics?.issues.length ?? 0)
+                    : screen === 'first-run'
+                      ? 5
+                      : screen === 'overview'
+                        ? 5
+                        : 4;
     setCursor((value) => moveTuiCursor({ cursor: value, screen }, amount, nextLength).cursor);
   };
 
@@ -1007,13 +1126,69 @@ export function TuiApp(props: {
     }
   };
 
-  const sync = async (): Promise<void> => {
+  const refreshSyncPreview = async (nextDiscardLocal = discardLocal): Promise<void> => {
     setBusy(true);
-    const result = await props.actions.sync(discardLocal);
-    setNotice(operationMessage(result));
-    setBusy(false);
-    setScreen('managed');
-    if (result.ok) await reload();
+    try {
+      const result = await props.actions.previewSync(nextDiscardLocal);
+      if (result.ok) {
+        setSyncPreview(result.data);
+        syncPreviewRef.current = result.data;
+        setNotice(undefined);
+      } else {
+        setSyncPreview(undefined);
+        syncPreviewRef.current = undefined;
+        setNotice(operationMessage(result));
+      }
+    } catch (error) {
+      setNotice(
+        terminalSafe(error instanceof Error ? error.message : 'Unable to preview synchronization.'),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openSyncReview = (): void => {
+    setScreen('sync-review');
+    setSyncPreview(undefined);
+    syncPreviewRef.current = undefined;
+    setNotice(undefined);
+    void refreshSyncPreview();
+  };
+
+  const sync = async (): Promise<void> => {
+    const reviewed = syncPreviewRef.current;
+    if (reviewed === undefined) {
+      setNotice('Create and review the synchronization preview before applying it.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const outcome = await confirmTuiSyncReview({
+        apply: () => props.actions.sync(discardLocal),
+        preview: () => props.actions.previewSync(discardLocal),
+        reviewed,
+      });
+      if (outcome.kind === 'changed') {
+        setSyncPreview(outcome.preview);
+        syncPreviewRef.current = outcome.preview;
+        setNotice('The synchronization plan changed. Review it and press y again.');
+        return;
+      }
+      if (outcome.kind === 'preview-failed') {
+        setNotice(operationMessage(outcome.result));
+        return;
+      }
+      setNotice(operationMessage(outcome.result));
+      if (outcome.result.ok) {
+        setSyncPreview(undefined);
+        syncPreviewRef.current = undefined;
+        setScreen('managed');
+        await reload();
+      }
+    } finally {
+      setBusy(false);
+    }
   };
 
   const adopt = async (): Promise<void> => {
@@ -1205,8 +1380,10 @@ export function TuiApp(props: {
     }
   };
 
-  const diagnose = async (): Promise<void> => {
-    setScreen('setup-diagnostics');
+  const diagnose = async (
+    destination: 'diagnostics' | 'setup-diagnostics' = 'setup-diagnostics',
+  ): Promise<void> => {
+    setScreen(destination);
     setCursor(0);
     setNotice(undefined);
     setDiagnostics(undefined);
@@ -1226,9 +1403,44 @@ export function TuiApp(props: {
   };
 
   useInput((input, key) => {
-    if (busy) return;
+    if (busy) {
+      if (key.ctrl && input === 'c' && props.actions.cancel()) {
+        setNotice('Cancellation requested. Waiting for the current safe boundary…');
+      }
+      return;
+    }
     if (key.ctrl && input === 'c') {
       exit();
+      return;
+    }
+    if (showHelp) {
+      if (key.escape || input === '?') setShowHelp(false);
+      return;
+    }
+    if (input === '?' && !searching) {
+      setShowHelp(true);
+      return;
+    }
+    if (screen === 'catalog' && searching) {
+      if (key.escape) {
+        setSearching(false);
+        setQuery('');
+        setCursor(0);
+        return;
+      }
+      if (key.return) {
+        setSearching(false);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        setQuery((value) => value.slice(0, -1));
+        setCursor(0);
+        return;
+      }
+      if (!key.ctrl && !key.meta && input.length > 0) {
+        setQuery((value) => value + terminalSafe(input));
+        setCursor(0);
+      }
       return;
     }
     if (screen === 'setup-connect' || screen === 'setup-create') {
@@ -1328,15 +1540,15 @@ export function TuiApp(props: {
           setupIntentRef.current = undefined;
         }
         if (screen === 'add-review') setAdditionPreview(undefined);
-        if (screen === 'setup-diagnostics') clearDiagnostics();
+        if (screen === 'setup-diagnostics' || screen === 'diagnostics') clearDiagnostics();
         setScreen(destination);
         setCursor(0);
       }
       return;
     }
     if (input === 'r') {
-      if (screen === 'setup-diagnostics') {
-        void diagnose();
+      if (screen === 'setup-diagnostics' || screen === 'diagnostics') {
+        void diagnose(screen);
         return;
       }
       void reload();
@@ -1364,6 +1576,12 @@ export function TuiApp(props: {
       if (screen === 'setup-guide') setNotice(undefined);
       return;
     }
+    if (screen === 'diagnostics' && key.return) {
+      clearDiagnostics();
+      setScreen('overview');
+      setCursor(0);
+      return;
+    }
     if (screen === 'setup-connect-review' || screen === 'setup-create-review') {
       if (input === 'y') void applyLibrarySetup();
       return;
@@ -1371,6 +1589,7 @@ export function TuiApp(props: {
     if (screen === 'overview' && key.return) {
       const destination = overviewDestination(cursor);
       if (destination === 'quit') exit();
+      else if (destination === 'diagnostics') void diagnose('diagnostics');
       else setScreen(destination);
       setCursor(0);
       return;
@@ -1398,23 +1617,28 @@ export function TuiApp(props: {
         void openLibraryRemoveReview();
         return;
       }
-      if (input === 'g') {
-        setActiveGroup((value) => {
-          const index = value === null ? -1 : groups.indexOf(value);
-          return index >= groups.length - 1 ? null : (groups[index + 1] ?? null);
-        });
+      if (input === '/') {
+        setSearching(true);
+        return;
+      }
+      if (input === 'f') {
+        const index = activeGroup === null ? 0 : Math.max(0, groups.indexOf(activeGroup) + 1);
+        setCursor(index);
+        setScreen('group-filter');
+        return;
+      }
+      if (input === 'c') {
+        setQuery('');
+        setActiveGroup(null);
         setCursor(0);
         return;
       }
-      if (key.backspace) {
-        setQuery((value) => value.slice(0, -1));
-        setCursor(0);
-        return;
-      }
-      if (!key.ctrl && !key.meta && input.length === 1 && input !== ' ') {
-        setQuery((value) => value + terminalSafe(input));
-        setCursor(0);
-      }
+      return;
+    }
+    if (screen === 'group-filter' && key.return) {
+      setActiveGroup(groupFilterItems[cursor] ?? null);
+      setScreen('catalog');
+      setCursor(0);
       return;
     }
     if (screen === 'detail') {
@@ -1461,11 +1685,28 @@ export function TuiApp(props: {
       return;
     }
     if (screen === 'managed') {
-      if (input === 's') setScreen('sync-review');
+      if (key.return) {
+        const skill = dashboard?.managed[cursor];
+        if (skill !== undefined) {
+          setManagedDetailId(skill.id);
+          setScreen('managed-detail');
+        }
+      }
+      if (input === 's') openSyncReview();
+      return;
+    }
+    if (screen === 'managed-detail') {
+      if (input === 's') openSyncReview();
       return;
     }
     if (screen === 'sync-review') {
-      if (input === 'd') setDiscardLocal((value) => !value);
+      if (input === 'd') {
+        const next = !discardLocal;
+        setDiscardLocal(next);
+        setSyncPreview(undefined);
+        syncPreviewRef.current = undefined;
+        void refreshSyncPreview(next);
+      }
       if (input === 'y') void sync();
       return;
     }
@@ -1534,6 +1775,7 @@ export function TuiApp(props: {
 
   const muted = props.color ? palette.muted : undefined;
   const content = (() => {
+    if (showHelp) return createElement(TuiHelp, { color: props.color, screen });
     if (dashboard === undefined) {
       return createElement(Text, withColor(muted), 'Loading your skill library…');
     }
@@ -1602,20 +1844,51 @@ export function TuiApp(props: {
         ...(diagnostics === undefined ? {} : { summary: diagnostics }),
       });
     }
+    if (screen === 'diagnostics') {
+      return createElement(TuiSetupDiagnostics, {
+        color: props.color,
+        columns,
+        cursor,
+        ...(diagnosticsError === undefined ? {} : { error: diagnosticsError }),
+        rows,
+        ...(diagnostics === undefined ? {} : { summary: diagnostics }),
+      });
+    }
     if (screen === 'setup-guide') {
       return createElement(TuiSetupGuide, { color: props.color });
     }
     if (screen === 'overview') {
+      const needsAttention = dashboard.managed.filter(
+        (skill) => skill.state !== 'current' && skill.state !== 'managed',
+      ).length;
+      const conflicts = dashboard.managed.filter((skill) =>
+        skill.state.includes('conflict'),
+      ).length;
+      const unmanaged = dashboard.inventory.filter((item) => item.status === 'unmanaged').length;
       const items = [
+        needsAttention === 0
+          ? `Managed skills (${String(dashboard.managed.length)} · all current)`
+          : `Review managed skills (${String(needsAttention)} need attention${conflicts === 0 ? '' : ` · ${String(conflicts)} conflicted`})`,
         `Browse library (${String(dashboard.skills.length)} skills)`,
-        `Managed skills (${String(dashboard.managed.length)})`,
-        `Unmanaged inventory (${String(dashboard.inventory.filter((item) => item.status === 'unmanaged').length)})`,
+        `Unmanaged inventory (${String(unmanaged)})`,
+        'Diagnostics',
         'Quit',
       ];
       return createElement(
         Box,
         { flexDirection: 'column', gap: 1 },
-        createElement(Text, { bold: props.color }, 'What would you like to do?'),
+        createElement(Text, { bold: props.color }, 'Skill health and next actions'),
+        createElement(
+          Text,
+          withColor(
+            props.color && (needsAttention > 0 || conflicts > 0)
+              ? palette.warning
+              : palette.positive,
+          ),
+          needsAttention === 0
+            ? 'Managed copies are current.'
+            : `${String(needsAttention)} managed skill(s) need review.`,
+        ),
         ...items.map((item, index) =>
           createElement(
             Text,
@@ -1626,7 +1899,28 @@ export function TuiApp(props: {
             `${cursor === index ? '❯' : ' '} ${item}`,
           ),
         ),
-        createElement(Text, withColor(muted), '↑↓ move · Enter open · r refresh · q quit'),
+        createElement(Text, withColor(muted), '↑↓ move · Enter open · r refresh · ? help · q quit'),
+      );
+    }
+    if (screen === 'group-filter') {
+      return createElement(
+        Box,
+        { flexDirection: 'column', gap: 1 },
+        createElement(Text, { bold: props.color }, 'Choose catalog group'),
+        ...groupFilterWindow.items.map((group, offset) => {
+          const index = groupFilterWindow.start + offset;
+          const label = group ?? 'All groups';
+          return createElement(
+            Text,
+            {
+              key: label,
+              ...withColor(cursor === index && props.color ? palette.accent : undefined),
+            },
+            `${cursor === index ? '❯' : ' '} ${activeGroup === group ? '◉' : '○'} ${label}`,
+          );
+        }),
+        createElement(TuiWindowIndicator, { color: props.color, window: groupFilterWindow }),
+        createElement(Text, withColor(muted), '↑↓ move · Enter apply · Esc catalog'),
       );
     }
     if (screen === 'catalog') {
@@ -1638,7 +1932,7 @@ export function TuiApp(props: {
         createElement(
           Text,
           withColor(muted),
-          `Group: ${activeGroup ?? 'all'} · Search: ${query || 'all skills'} · ${String(selected.size)} selected`,
+          `Group: ${activeGroup ?? 'all'} · Search: ${searching ? `/${query}▏` : query || 'none'} · ${String(selected.size)} selected`,
         ),
         skills.length === 0
           ? createElement(TuiCatalogEmptyState, {
@@ -1654,16 +1948,31 @@ export function TuiApp(props: {
               key: skill.id,
               ...withColor(cursor === index && props.color ? palette.accent : undefined),
             },
-            `${cursor === index ? '❯' : ' '} ${selected.has(skill.id) ? '◉' : '○'} ${skill.id} · ${group(skill)} · ${skill.description} [${skill.installationState}]`,
+            boundedTerminalLine(
+              `${cursor === index ? '❯' : ' '} ${selected.has(skill.id) ? '◉' : '○'} ${skill.id} · ${group(skill)} · ${skill.description} [${skill.installationState}]`,
+              columns,
+            ),
           );
         }),
         createElement(TuiWindowIndicator, { color: props.color, window: catalogWindow }),
+        columns >= 100 && selectedSkill !== undefined
+          ? createElement(
+              Text,
+              withColor(muted),
+              boundedTerminalLine(
+                `Selected: ${selectedSkill.id} · ${selectedSkill.description} · targets ${selectedSkill.compatibleAgents.join(', ') || 'none'} · ${selectedSkill.installationState}`,
+                columns,
+              ),
+            )
+          : null,
         createElement(
           Text,
           withColor(muted),
           dashboard.skills.length === 0
             ? 'r refresh · Esc back · q quit'
-            : '↑↓ move · g group · Type search · Space toggle · Enter details · i install · x remove · Esc back',
+            : searching
+              ? 'Type search · Enter keep filter · Esc clear search'
+              : '↑↓ move · / search · f group · c clear filters · Space toggle · Enter details · i install · x remove · ? help · Esc back',
         ),
       );
     }
@@ -1769,7 +2078,48 @@ export function TuiApp(props: {
               );
             })),
         createElement(TuiWindowIndicator, { color: props.color, window: managedWindow }),
-        createElement(Text, withColor(muted), '↑↓ move · s review sync · r refresh · Esc back'),
+        createElement(
+          Text,
+          withColor(muted),
+          '↑↓ move · Enter inspect · s review sync · r refresh · ? help · Esc back',
+        ),
+      );
+    }
+    if (screen === 'managed-detail') {
+      const skill = dashboard.managed.find((entry) => entry.id === managedDetailId);
+      if (skill === undefined) {
+        return createElement(Text, withColor(muted), 'The selected managed skill is unavailable.');
+      }
+      const explanation: Record<string, string> = {
+        conflicted:
+          'Both the local copy and canonical skill changed. Review a diff before choosing a direction.',
+        current: 'The managed copy matches its recorded canonical revision.',
+        'locally-modified':
+          'The local copy changed while canonical content still matches the recorded base.',
+        missing: 'A tracked destination is missing and can be restored by synchronization.',
+        outdated: 'Canonical content changed and the local copy can be updated safely.',
+      };
+      return createElement(
+        Box,
+        { flexDirection: 'column', gap: 1 },
+        createElement(Text, { bold: props.color }, skill.id),
+        createElement(StatusBadge, { color: props.color, state: skill.state }),
+        createElement(
+          Text,
+          null,
+          explanation[skill.state] ?? 'Inspect this state before changing it.',
+        ),
+        createElement(
+          Text,
+          withColor(muted),
+          `Inspect content: ${dashboard.commandPrefix} diff ${skill.id}`,
+        ),
+        createElement(
+          Text,
+          withColor(muted),
+          `Update only this skill: ${dashboard.commandPrefix} update ${skill.id} --dry-run`,
+        ),
+        createElement(Text, withColor(muted), 's review synchronization · Esc managed skills'),
       );
     }
     if (screen === 'sync-review') {
@@ -1779,15 +2129,26 @@ export function TuiApp(props: {
         createElement(Text, { bold: props.color }, 'Review synchronization'),
         createElement(
           Text,
-          null,
-          'The existing reconciliation safeguards will check every tracked skill.',
-        ),
-        createElement(
-          Text,
           withColor(props.color && discardLocal ? palette.warning : undefined),
           `d ${discardLocal ? '◉' : '○'} Allow discard-local (requires backup and confirmation)`,
         ),
-        createElement(Text, withColor(muted), 'y sync · d toggle discard-local · Esc cancel'),
+        syncPreview === undefined
+          ? createElement(
+              Text,
+              withColor(props.color ? palette.warning : undefined),
+              'Preparing the synchronization preview…',
+            )
+          : createElement(TuiSyncPreviewReview, {
+              color: props.color,
+              discardLocal,
+              preview: syncPreview,
+              rows,
+            }),
+        createElement(
+          Text,
+          withColor(muted),
+          'y revalidate and sync · d toggle discard-local · ? help · Esc cancel',
+        ),
       );
     }
     if (screen === 'unmanaged') {
@@ -1811,10 +2172,11 @@ export function TuiApp(props: {
                   key: `${skill.target}:${skill.path}`,
                   ...withColor(cursor === index && props.color ? palette.accent : undefined),
                 },
-                `${cursor === index ? '❯' : ' '} ${skill.target} · ${skill.name} `,
+                boundedTerminalLine(
+                  `${cursor === index ? '❯' : ' '} ${skill.target} · ${skill.name} ${skill.adoptable ? '[actionable]' : '[read-only]'} · ${skill.path}`,
+                  columns,
+                ),
                 createElement(StatusBadge, { color: props.color, state: skill.status }),
-                skill.adoptable ? ' · [actionable]' : ' · [read-only]',
-                ` · ${skill.path}`,
               );
             })),
         createElement(TuiWindowIndicator, { color: props.color, window: unmanagedWindow }),
@@ -1891,7 +2253,8 @@ export function TuiApp(props: {
     );
   })();
 
-  const compactDiagnostics = screen === 'setup-diagnostics' && rows < 16;
+  const compactDiagnostics =
+    (screen === 'setup-diagnostics' || screen === 'diagnostics') && rows < 16;
   return createElement(
     Box,
     {
@@ -1905,6 +2268,7 @@ export function TuiApp(props: {
           color: props.color,
           compact,
           scope: dashboard?.scope ?? 'project',
+          screen,
         }),
     busy ? createElement(Text, withColor(muted), 'Working safely…') : content,
     notice === undefined || screen === 'setup-diagnostics'

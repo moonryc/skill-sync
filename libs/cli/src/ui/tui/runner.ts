@@ -1,5 +1,7 @@
 import { createElement } from 'react';
 import { render } from 'ink';
+import { createHash } from 'node:crypto';
+import process from 'node:process';
 
 import {
   inspectGlobalUnmanagedSkills,
@@ -39,7 +41,9 @@ import type {
   TuiLaunchRequest,
   TuiManagedSkill,
   TuiReleaseUpdate,
+  TuiReconciliationSkillPreview,
   TuiSkill,
+  TuiSyncPreview,
   TuiTarget,
 } from './types.js';
 
@@ -111,6 +115,85 @@ function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
 
 function asString(value: unknown, fallback = ''): string {
   return terminalSafe(typeof value === 'string' ? value : fallback);
+}
+
+function reconciliationReport(result: CommandResult<unknown>): unknown {
+  if (result.ok) return result.data;
+  return result.errors.find((error) => isRecord(error.details?.report))?.details?.report;
+}
+
+function invalidSyncPreview(reason: string): CommandResult<TuiSyncPreview> {
+  return failure(
+    {
+      code: 'INVALID_SYNC_PREVIEW',
+      message: `The synchronization dry-run returned an invalid review plan: ${reason}`,
+    },
+    EXIT_CODES.internal,
+  );
+}
+
+export function parseTuiSyncPreviewResult(
+  result: CommandResult<unknown>,
+): CommandResult<TuiSyncPreview> {
+  const report = reconciliationReport(result);
+  if (!isRecord(report)) {
+    return result.ok ? invalidSyncPreview('expected an object result.') : result;
+  }
+  const libraryRevision = requiredString(report, 'libraryRevision');
+  const freshness = requiredString(report, 'freshness');
+  const location =
+    typeof report.projectRoot === 'string'
+      ? report.projectRoot
+      : typeof report.stateDirectory === 'string'
+        ? report.stateDirectory
+        : undefined;
+  const scope: TuiSyncPreview['scope'] = report.scope === 'global' ? 'global' : 'project';
+  if (
+    libraryRevision === undefined ||
+    freshness === undefined ||
+    location === undefined ||
+    report.dryRun !== true ||
+    typeof report.authoritative !== 'boolean' ||
+    typeof report.stale !== 'boolean' ||
+    typeof report.wouldChange !== 'boolean' ||
+    !Array.isArray(report.skills)
+  ) {
+    return invalidSyncPreview(
+      'required revision, freshness, location, or dry-run fields were missing.',
+    );
+  }
+  const skills: TuiReconciliationSkillPreview[] = [];
+  for (const entry of report.skills) {
+    if (!isRecord(entry)) return invalidSyncPreview('a skill entry was not an object.');
+    const id = requiredString(entry, 'id');
+    const state = requiredString(entry, 'state');
+    const action = requiredString(entry, 'action');
+    const outcome = requiredString(entry, 'outcome');
+    if (id === undefined || state === undefined || action === undefined || outcome === undefined) {
+      return invalidSyncPreview('a skill entry was missing its ID, state, action, or outcome.');
+    }
+    skills.push({
+      action,
+      backupPaths: strings(entry.backupPaths).map(terminalSafe).sort(compareText),
+      id,
+      outcome,
+      state,
+      writes: strings(entry.writes).map(terminalSafe).sort(compareText),
+    });
+  }
+  skills.sort((left, right) => compareText(left.id, right.id));
+  const normalized = {
+    authoritative: report.authoritative,
+    freshness,
+    libraryRevision,
+    location: terminalSafe(location),
+    scope,
+    skills,
+    stale: report.stale,
+    wouldChange: report.wouldChange,
+  };
+  const fingerprint = `sync-review-v1-${createHash('sha256').update(JSON.stringify(normalized)).digest('hex')}`;
+  return success({ ...normalized, fingerprint });
 }
 
 function strings(value: unknown): readonly string[] {
@@ -651,6 +734,7 @@ export class DefaultTuiActionPort implements TuiActionPort {
   public constructor(
     private readonly execute: CommandExecutor,
     private readonly options: Readonly<Record<string, unknown>>,
+    private readonly requestCancellation: () => boolean = () => process.emit('SIGINT'),
   ) {}
 
   private optionsFor(
@@ -685,6 +769,10 @@ export class DefaultTuiActionPort implements TuiActionPort {
       color: this.options.color !== false,
       json: true,
     };
+  }
+
+  public cancel(): boolean {
+    return this.requestCancellation();
   }
 
   public async load(): Promise<TuiDashboard> {
@@ -739,6 +827,12 @@ export class DefaultTuiActionPort implements TuiActionPort {
       inventoryIssues = ['Project inventory is unavailable until project status can be inspected.'];
     }
     return {
+      commandPrefix:
+        this.options.global === true
+          ? 'skill-sync --global'
+          : typeof this.options.project === 'string'
+            ? 'skill-sync --project <project-path>'
+            : 'skill-sync',
       defaultTargets: asEffectiveDefaultTargets(configuration),
       errors,
       firstRun,
@@ -860,6 +954,14 @@ export class DefaultTuiActionPort implements TuiActionPort {
 
   public async sync(discardLocal: boolean): Promise<CommandResult<unknown>> {
     return await this.execute(invocation('sync', [], this.optionsFor({ discardLocal })));
+  }
+
+  public async previewSync(discardLocal: boolean): Promise<CommandResult<TuiSyncPreview>> {
+    return parseTuiSyncPreviewResult(
+      await this.execute(
+        invocation('sync', [], this.optionsFor({ discardLocal, dryRun: true, yes: false })),
+      ),
+    );
   }
 }
 
