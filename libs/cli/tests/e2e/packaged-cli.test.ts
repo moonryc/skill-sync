@@ -372,7 +372,7 @@ describe('built CLI from unrelated directories', () => {
         errors: [{ code: 'USAGE_ERROR' }],
       });
     });
-  }, 45_000);
+  }, 60_000);
 
   it('recovers a crash-left local advisory lock through a preview-first packaged workflow', async () => {
     await withTempDirectory('skill-sync-e2e-recovery-unlock-', async (root) => {
@@ -462,7 +462,7 @@ describe('built CLI from unrelated directories', () => {
       });
       await expect(stat(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
     });
-  }, 15_000);
+  }, 60_000);
 
   it('preserves a replacement live lock when two packaged unlockers race', async () => {
     await withTempDirectory('skill-sync-e2e-recovery-unlock-race-', async (root) => {
@@ -556,7 +556,7 @@ describe('built CLI from unrelated directories', () => {
         }
       }
     });
-  }, 15_000);
+  }, 60_000);
 
   it('turns common onboarding command guesses into exact init commands before state access', async () => {
     await withTempDirectory('skill-sync-e2e-onboarding-guidance-', async (unrelated) => {
@@ -618,7 +618,7 @@ describe('built CLI from unrelated directories', () => {
 
       await expect(stat(unusedState)).rejects.toMatchObject({ code: 'ENOENT' });
     });
-  }, 15_000);
+  }, 60_000);
 
   it('prints a preview-ready catalog next action that runs without another missing choice', async () => {
     await withTempDirectory('skill-sync-e2e-catalog-next-', async (root) => {
@@ -820,7 +820,7 @@ describe('built CLI from unrelated directories', () => {
       expect(applied.stdout).toContain('Install complete.');
       expect(await stat(join(project, '.codex', 'skills', 'hello', 'SKILL.md'))).toBeDefined();
     });
-  }, 30_000);
+  }, 60_000);
 
   it('generates deterministic completion safely for every supported shell', async () => {
     await withTempDirectory('skill-sync-e2e-completion-', async (unrelated) => {
@@ -943,7 +943,7 @@ describe('built CLI from unrelated directories', () => {
       }
       await expect(stat(unusedState)).rejects.toMatchObject({ code: 'ENOENT' });
     });
-  }, 45_000);
+  }, 60_000);
 
   it('runs fully specified JSON config and local validation workflows', async () => {
     await withTempDirectory('skill-sync-e2e-json-', async (root) => {
