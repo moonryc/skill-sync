@@ -155,6 +155,10 @@ try {
     throw new Error('packed npm provenance metadata is missing');
   }
   const packageReadme = await readFile(join(installedPackageRoot, 'README.md'), 'utf8');
+  const sourcePackageReadme = await readFile(join(projectRoot, 'README.md'), 'utf8');
+  if (packageReadme !== sourcePackageReadme) {
+    throw new Error('packed README does not match the user-facing package README');
+  }
   for (const excludedHeading of ['## Exit statuses', '## Development and release checks']) {
     if (packageReadme.includes(excludedHeading)) {
       throw new Error(`packed README contains excluded section: ${excludedHeading}`);

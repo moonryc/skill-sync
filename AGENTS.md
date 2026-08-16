@@ -9,15 +9,17 @@ This is an npm workspace managed by Nx. The CLI package is in `libs/cli/`: appli
 The CLI, the Codex `skill-sync` skill, and the wiki describe the same public
 command surface. Whenever a change is made to `libs/cli/`, review and update
 `skills/skill-sync/SKILL.md` in the same change so the skill teaches the current
-package behavior. When a CLI command, option, output contract, workflow, or
-user-facing behavior changes, also update the relevant pages under
-`apps/wiki/src/content/docs/` and the searchable command catalog in
-`apps/wiki/src/data/commands.ts` when applicable. Keep examples, safety rules,
-option names, and command links synchronized across all three surfaces.
+package behavior. Keep the user-facing npm overview in `libs/cli/README.md`
+aligned with the root README, skill, and wiki. When a CLI command, option,
+output contract, workflow, or user-facing behavior changes, also update the
+relevant pages under `apps/wiki/src/content/docs/` and the searchable command
+catalog in `apps/wiki/src/data/commands.ts` when applicable. Keep examples,
+safety rules, option names, and command links synchronized across all surfaces.
 
 Before completing CLI changes, search for the affected command or option in
-`README.md`, `skills/skill-sync/SKILL.md`, and `apps/wiki/src/`; update stale
-references and run the relevant CLI and wiki checks.
+`README.md`, `libs/cli/README.md`, `skills/skill-sync/SKILL.md`, and
+`apps/wiki/src/`; update stale references and run the relevant CLI and wiki
+checks.
 
 ## Build, Test, and Development Commands
 
