@@ -180,7 +180,7 @@ export const commands = [
   {
     name: 'tui',
     summary:
-      'Open the interactive command center for browsing, installs, adoption, and project state.',
+      'Open the interactive command center for browsing, installs, adding or adopting local skills, and project state.',
     category: 'Project',
     href: '/reference/project-commands/#tui',
     keywords: [
@@ -189,6 +189,10 @@ export const commands = [
       'browse',
       'groups',
       'unmanaged',
+      'add to library',
+      'adopt',
+      'folder browser',
+      'nested groups',
       'gitignore',
       'scroll',
       'dry-run plan',

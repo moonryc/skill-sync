@@ -21,10 +21,15 @@ skill-sync tui
 A bare `skill-sync` invocation starts the same interface when both standard
 input and output are terminals. It supports grouped browsing, search,
 multi-skill installation reviews, managed-skill reconciliation views, and an
-inventory of valid but untracked skills in supported agent directories. Eligible
-inventory entries can be adopted after the user chooses an exact qualified
-canonical ID and confirms a review; this writes tracking state only after an
-exact content match and never replaces the target directory. The interface never
+inventory of valid but untracked skills in supported agent directories. Press
+`Enter` or `a` on an eligible entry to browse library groups with the arrow keys.
+Each location offers `Save in …`, immediate child folders, and `Add folder`.
+Entering one portable folder name opens the new location, allowing repeated
+nested-folder creation before the user previews the canonical ID and digest.
+The new folder path is created only when the reviewed add is confirmed; the TUI
+then tracks the unchanged local copy. Press `d` to adopt an already-canonical skill after choosing
+an exact qualified ID; this writes tracking state only after an exact content
+match and never replaces the target directory. The interface never
 changes files until the user confirms a reviewed operation.
 Project and global dashboards initialize selected install targets from the
 effective `defaults.targets` setting. A valid configured set is honored in
@@ -63,13 +68,13 @@ screen is read-only and prints the wiki URL.
 After setup, a populated library opens the catalog and says
 `Press Space to select a skill, then i to review installation.` An empty library
 stays on the overview and says
-`It has no skills yet. Exit and run skill-sync add <path> --dry-run, then reopen skill-sync.`
+`It has no skills yet. Open Unmanaged inventory to add an on-disk skill, or run skill-sync add <path> --dry-run.`
 The catalog also distinguishes an empty library from an empty filter result. A
 truly empty library says
-`This library has no skills yet. Exit and run skill-sync add <path> --dry-run, then reopen skill-sync.`;
+`This library has no skills yet. Open Unmanaged inventory to add an on-disk skill, or run skill-sync add <path> --dry-run.`;
 a search or group filter with no matches says
 `No skills match the current search and group filter.` and does not suggest the
-author-only add workflow.
+add workflow.
 
 Install review comes from the existing `install --dry-run` planner. It shows the
 selected revision and freshness, every destination, state writes, and the actual

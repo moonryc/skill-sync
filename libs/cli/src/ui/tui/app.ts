@@ -11,14 +11,18 @@ import {
   firstRunDestination,
   moveTuiCursor,
   overviewDestination,
+  tuiAddLocationItems,
   tuiDiagnosticIssueLimit,
+  tuiGroupParent,
   tuiInstallTargetDefaults,
   tuiInstallReviewLimits,
   tuiRowLimit,
   tuiSetupCompletion,
   tuiSetupReviewScreen,
+  validateTuiFolderName,
   validateTuiSetupInput,
   windowTuiItems,
+  type TuiAddLocationItem,
   type TuiItemWindow,
   type TuiInstallReviewLimits,
   type TuiScreen,
@@ -32,6 +36,7 @@ import type {
   TuiDoctorSummary,
   TuiInstallPreview,
   TuiInventorySkill,
+  TuiLibraryAddPreview,
   TuiLibraryInitPlan,
   TuiLibrarySetupIntent,
   TuiReleaseUpdate,
@@ -267,6 +272,102 @@ export function TuiSetupForm(props: {
   );
 }
 
+function addLocationLabel(item: TuiAddLocationItem, currentGroup: string): string {
+  if (item.kind === 'save') return `Save in ${currentGroup === '' ? 'library root' : currentGroup}`;
+  if (item.kind === 'parent')
+    return `.. Back to ${item.group === '' ? 'library root' : item.group}`;
+  if (item.kind === 'add-folder') return '+ Add folder';
+  const name = item.group.split('/').at(-1) ?? item.group;
+  return `${name}/ ${item.pending ? '[new]' : ''}`.trimEnd();
+}
+
+export function TuiAddLocationBrowser(props: {
+  readonly color: boolean;
+  readonly currentGroup: string;
+  readonly cursor: number;
+  readonly entry: TuiInventorySkill | undefined;
+  readonly window: TuiItemWindow<TuiAddLocationItem>;
+}): ReactElement {
+  const muted = props.color ? palette.muted : undefined;
+  return createElement(
+    Box,
+    { flexDirection: 'column', gap: 1 },
+    createElement(Text, { bold: props.color }, 'Choose library location'),
+    createElement(
+      Text,
+      null,
+      props.entry === undefined
+        ? 'No unmanaged skill is selected.'
+        : `Local skill: ${props.entry.target} · ${props.entry.path}`,
+    ),
+    createElement(Text, null, `Location: ${props.currentGroup || 'library root'}`),
+    ...props.window.items.map((item, offset) => {
+      const index = props.window.start + offset;
+      return createElement(
+        Text,
+        {
+          key: `${item.kind}:${'group' in item ? item.group : ''}`,
+          ...withColor(props.cursor === index && props.color ? palette.accent : undefined),
+        },
+        `${props.cursor === index ? '❯' : ' '} ${addLocationLabel(item, props.currentGroup)}`,
+      );
+    }),
+    createElement(TuiWindowIndicator, { color: props.color, window: props.window }),
+    createElement(Text, withColor(muted), '↑↓ move · Enter choose · Esc parent/cancel'),
+  );
+}
+
+export function TuiAddFolderForm(props: {
+  readonly color: boolean;
+  readonly currentGroup: string;
+  readonly error: string | undefined;
+  readonly input: string;
+}): ReactElement {
+  const muted = props.color ? palette.muted : undefined;
+  return createElement(
+    Box,
+    { flexDirection: 'column', gap: 1 },
+    createElement(Text, { bold: props.color }, 'Add folder'),
+    createElement(Text, null, `Inside: ${props.currentGroup || 'library root'}`),
+    createElement(Text, null, `Folder name: ${terminalSafe(props.input) || '▏'}`),
+    props.error === undefined
+      ? null
+      : createElement(
+          Text,
+          withColor(props.color ? palette.negative : undefined),
+          terminalSafe(props.error),
+        ),
+    createElement(
+      Text,
+      withColor(muted),
+      'Use one portable folder name, such as openspec or code-review.',
+    ),
+    createElement(Text, withColor(muted), 'Enter create and open · Esc location'),
+  );
+}
+
+export function TuiAddReview(props: {
+  readonly color: boolean;
+  readonly entry: TuiInventorySkill | undefined;
+  readonly preview: TuiLibraryAddPreview;
+}): ReactElement {
+  const muted = props.color ? palette.muted : undefined;
+  return createElement(
+    Box,
+    { flexDirection: 'column', gap: 1 },
+    createElement(Text, { bold: props.color }, 'Review add to library'),
+    createElement(Text, null, `Local source: ${props.entry?.path ?? 'unknown'}`),
+    createElement(Text, null, `Canonical skill: ${props.preview.id}`),
+    createElement(Text, null, `Content digest: ${props.preview.digest}`),
+    createElement(
+      Text,
+      withColor(props.color ? palette.warning : undefined),
+      'This will commit and push the local skill to the Git library, then track this existing local copy.',
+    ),
+    createElement(Text, withColor(muted), 'y add and track · Esc change location'),
+  );
+}
+
 export function TuiSetupReview(props: {
   readonly color: boolean;
   readonly plan: TuiLibraryInitPlan;
@@ -345,7 +446,7 @@ export function TuiCatalogEmptyState(props: {
     withColor(props.color ? (props.filtered ? palette.muted : palette.warning) : undefined),
     props.filtered
       ? 'No skills match the current search and group filter.'
-      : 'This library has no skills yet. Exit and run skill-sync add <path> --dry-run, then reopen skill-sync.',
+      : 'This library has no skills yet. Open Unmanaged inventory to add an on-disk skill, or run skill-sync add <path> --dry-run.',
   );
 }
 
@@ -562,6 +663,14 @@ export function TuiApp(props: {
   const [discardLocal, setDiscardLocal] = useState(false);
   const [adoptionEntry, setAdoptionEntry] = useState<TuiInventorySkill | undefined>();
   const [adoptionSkillId, setAdoptionSkillId] = useState<string | undefined>();
+  const [additionEntry, setAdditionEntry] = useState<TuiInventorySkill | undefined>();
+  const [additionGroup, setAdditionGroup] = useState('');
+  const [additionPendingGroups, setAdditionPendingGroups] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [additionFolderInput, setAdditionFolderInput] = useState('');
+  const [additionFolderError, setAdditionFolderError] = useState<string | undefined>();
+  const [additionPreview, setAdditionPreview] = useState<TuiLibraryAddPreview | undefined>();
   const [notice, setNotice] = useState<string | undefined>();
   const [setupInput, setSetupInput] = useState('');
   const [setupError, setSetupError] = useState<string | undefined>();
@@ -659,12 +768,18 @@ export function TuiApp(props: {
     );
   }, [adoptionEntry, dashboard?.skills]);
   const selectedAdoptionCandidate = adoptionCandidates[cursor];
+  const additionLocationItems = useMemo(
+    () => tuiAddLocationItems(dashboard?.groups ?? [], [...additionPendingGroups], additionGroup),
+    [additionGroup, additionPendingGroups, dashboard?.groups],
+  );
+  const selectedAdditionLocation = additionLocationItems[cursor];
   const rowLimit = tuiRowLimit(compact, rows);
   const installReviewLimits = tuiInstallReviewLimits(rows);
   const catalogWindow = windowTuiItems(skills, cursor, rowLimit);
   const managedWindow = windowTuiItems(dashboard?.managed ?? [], cursor, rowLimit);
   const unmanagedWindow = windowTuiItems(dashboard?.inventory ?? [], cursor, rowLimit);
   const adoptionWindow = windowTuiItems(adoptionCandidates, cursor, rowLimit);
+  const additionLocationWindow = windowTuiItems(additionLocationItems, cursor, rowLimit);
   const move = (amount: number): void => {
     const nextLength =
       screen === 'catalog'
@@ -675,11 +790,13 @@ export function TuiApp(props: {
             ? (dashboard?.inventory.length ?? 0)
             : screen === 'adopt-candidate'
               ? adoptionCandidates.length
-              : screen === 'setup-diagnostics'
-                ? (diagnostics?.issues.length ?? 0)
-                : screen === 'first-run'
-                  ? 5
-                  : 4;
+              : screen === 'add-location'
+                ? additionLocationItems.length
+                : screen === 'setup-diagnostics'
+                  ? (diagnostics?.issues.length ?? 0)
+                  : screen === 'first-run'
+                    ? 5
+                    : 4;
     setCursor((value) => moveTuiCursor({ cursor: value, screen }, amount, nextLength).cursor);
   };
 
@@ -805,6 +922,95 @@ export function TuiApp(props: {
       setAdoptionEntry(undefined);
       setAdoptionSkillId(undefined);
       await reload();
+    }
+  };
+
+  const reviewAdd = async (): Promise<void> => {
+    if (additionEntry === undefined) {
+      setNotice('Choose an unmanaged skill before adding it to the library.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = await props.actions.previewAdd(additionEntry.path, additionGroup.trim());
+      if (!result.ok) {
+        setNotice(operationMessage(result));
+        return;
+      }
+      setAdditionGroup(additionGroup.trim());
+      setAdditionPreview(result.data);
+      setNotice(undefined);
+      setScreen('add-review');
+    } catch (error) {
+      setNotice(
+        terminalSafe(error instanceof Error ? error.message : 'Unable to preview library add.'),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const createAndOpenAdditionFolder = (): void => {
+    const validation = validateTuiFolderName(additionFolderInput);
+    if (!validation.ok) {
+      setAdditionFolderError(validation.error);
+      return;
+    }
+    const nextGroup =
+      additionGroup === '' ? validation.value : `${additionGroup}/${validation.value}`;
+    if ((dashboard?.groups ?? []).includes(nextGroup) || additionPendingGroups.has(nextGroup)) {
+      setAdditionFolderError(`The folder ${nextGroup} already exists. Choose it from the list.`);
+      return;
+    }
+    setAdditionPendingGroups((groups) => new Set([...groups, nextGroup]));
+    setAdditionGroup(nextGroup);
+    setAdditionFolderInput('');
+    setAdditionFolderError(undefined);
+    setCursor(0);
+    setScreen('add-location');
+  };
+
+  const addAndTrack = async (): Promise<void> => {
+    if (additionEntry === undefined || additionPreview === undefined) {
+      setNotice('Preview the library add before applying it.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const added = await props.actions.add(additionEntry.path, additionGroup);
+      if (!added.ok) {
+        setNotice(operationMessage(added));
+        return;
+      }
+      const adopted = await props.actions.adopt(additionPreview.id, additionEntry.target);
+      if (!adopted.ok) {
+        const addedId = additionPreview.id;
+        setAdditionEntry(undefined);
+        setAdditionGroup('');
+        setAdditionPendingGroups(new Set());
+        setAdditionPreview(undefined);
+        setScreen('unmanaged');
+        setCursor(0);
+        await reload();
+        setNotice(
+          `Added ${addedId} to the library, but tracking the local copy failed. Press d to retry adoption.\n${operationMessage(adopted)}`,
+        );
+        return;
+      }
+      setAdditionEntry(undefined);
+      setAdditionGroup('');
+      setAdditionPendingGroups(new Set());
+      setAdditionPreview(undefined);
+      setScreen('unmanaged');
+      setCursor(0);
+      await reload();
+      setNotice(`Added ${additionPreview.id} to the library and started tracking the local copy.`);
+    } catch (error) {
+      setNotice(
+        terminalSafe(error instanceof Error ? error.message : 'Unable to add the local skill.'),
+      );
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -942,6 +1148,46 @@ export function TuiApp(props: {
       }
       return;
     }
+    if (screen === 'add-folder-name') {
+      if (key.escape) {
+        setScreen('add-location');
+        setCursor(0);
+        setAdditionFolderInput('');
+        setAdditionFolderError(undefined);
+        setNotice(undefined);
+        return;
+      }
+      if (key.return) {
+        createAndOpenAdditionFolder();
+        return;
+      }
+      if (key.backspace || key.delete) {
+        setAdditionFolderInput((value) => value.slice(0, -1));
+        setAdditionFolderError(undefined);
+        setNotice(undefined);
+        return;
+      }
+      if (!key.ctrl && !key.meta && input.length > 0) {
+        setAdditionFolderInput((value) => value + terminalSafe(input));
+        setAdditionFolderError(undefined);
+        setNotice(undefined);
+      }
+      return;
+    }
+    if (screen === 'add-location' && key.escape) {
+      if (additionGroup !== '') {
+        setAdditionGroup(tuiGroupParent(additionGroup));
+        setCursor(0);
+      } else {
+        setScreen('unmanaged');
+        setCursor(0);
+        setAdditionEntry(undefined);
+        setAdditionPendingGroups(new Set());
+        setAdditionPreview(undefined);
+        setNotice(undefined);
+      }
+      return;
+    }
     if (input === 'q') {
       exit();
       return;
@@ -968,6 +1214,7 @@ export function TuiApp(props: {
           setupPlanRef.current = undefined;
           setupIntentRef.current = undefined;
         }
+        if (screen === 'add-review') setAdditionPreview(undefined);
         if (screen === 'setup-diagnostics') clearDiagnostics();
         setScreen(destination);
         setCursor(0);
@@ -1101,15 +1348,27 @@ export function TuiApp(props: {
       return;
     }
     if (screen === 'unmanaged') {
-      if (key.return || input === 'a') {
+      if (key.return || input === 'a' || input === 'd') {
         const entry = dashboard?.inventory[cursor];
         if (entry === undefined) return;
         if (!entry.adoptable) {
           setNotice(
             entry.issues.length > 0
               ? entry.issues.join('\n')
-              : `${entry.name} cannot be adopted until its selected-scope state is reliable.`,
+              : `${entry.name} cannot be changed until its selected-scope state is reliable.`,
           );
+          return;
+        }
+        if (key.return || input === 'a') {
+          setAdditionEntry(entry);
+          setAdditionGroup('');
+          setAdditionPendingGroups(new Set());
+          setAdditionFolderInput('');
+          setAdditionFolderError(undefined);
+          setAdditionPreview(undefined);
+          setNotice(undefined);
+          setCursor(0);
+          setScreen('add-location');
           return;
         }
         setAdoptionEntry(entry);
@@ -1124,6 +1383,26 @@ export function TuiApp(props: {
         setAdoptionSkillId(selectedAdoptionCandidate.id);
         setScreen('adopt-review');
       }
+      return;
+    }
+    if (screen === 'add-location') {
+      if (!key.return || selectedAdditionLocation === undefined) return;
+      if (selectedAdditionLocation.kind === 'save') {
+        void reviewAdd();
+        return;
+      }
+      if (selectedAdditionLocation.kind === 'add-folder') {
+        setAdditionFolderInput('');
+        setAdditionFolderError(undefined);
+        setScreen('add-folder-name');
+        return;
+      }
+      setAdditionGroup(selectedAdditionLocation.group);
+      setCursor(0);
+      return;
+    }
+    if (screen === 'add-review') {
+      if (input === 'y') void addAndTrack();
       return;
     }
     if (input === 'y') {
@@ -1146,6 +1425,32 @@ export function TuiApp(props: {
         kind: 'connect',
         ...(setupError === undefined ? {} : { error: setupError }),
       });
+    }
+    if (screen === 'add-location') {
+      return createElement(TuiAddLocationBrowser, {
+        color: props.color,
+        currentGroup: additionGroup,
+        cursor,
+        entry: additionEntry,
+        window: additionLocationWindow,
+      });
+    }
+    if (screen === 'add-folder-name') {
+      return createElement(TuiAddFolderForm, {
+        color: props.color,
+        currentGroup: additionGroup,
+        error: additionFolderError,
+        input: additionFolderInput,
+      });
+    }
+    if (screen === 'add-review') {
+      return additionPreview === undefined
+        ? createElement(Text, withColor(muted), 'Preparing the add review…')
+        : createElement(TuiAddReview, {
+            color: props.color,
+            entry: additionEntry,
+            preview: additionPreview,
+          });
     }
     if (screen === 'setup-connect-review') {
       return setupPlan === undefined
@@ -1378,7 +1683,7 @@ export function TuiApp(props: {
                 },
                 `${cursor === index ? '❯' : ' '} ${skill.target} · ${skill.name} `,
                 createElement(StatusBadge, { color: props.color, state: skill.status }),
-                skill.adoptable ? ' · [adoptable]' : ' · [read-only]',
+                skill.adoptable ? ' · [actionable]' : ' · [read-only]',
                 ` · ${skill.path}`,
               );
             })),
@@ -1393,7 +1698,7 @@ export function TuiApp(props: {
         createElement(
           Text,
           withColor(muted),
-          '↑↓ move · Enter/a choose adoptable skill · r refresh · Esc back',
+          '↑↓ move · Enter/a add to library · d adopt existing · r refresh · Esc back',
         ),
       );
     }

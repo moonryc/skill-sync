@@ -31,6 +31,7 @@ import type {
   TuiInstallPreview,
   TuiInstallProjection,
   TuiInstallSkillPreview,
+  TuiLibraryAddPreview,
   TuiLibraryInitPlan,
   TuiLibrarySetupIntent,
   TuiLauncher,
@@ -40,6 +41,36 @@ import type {
   TuiSkill,
   TuiTarget,
 } from './types.js';
+
+function invalidAddPreview(reason: string): CommandResult<TuiLibraryAddPreview> {
+  return failure(
+    {
+      code: 'INVALID_ADD_PREVIEW',
+      message: `The add dry-run returned an invalid review plan: ${reason}`,
+    },
+    EXIT_CODES.internal,
+  );
+}
+
+export function parseTuiLibraryAddPreviewResult(
+  result: CommandResult<unknown>,
+): CommandResult<TuiLibraryAddPreview> {
+  if (!result.ok) return result;
+  if (!isRecord(result.data)) return invalidAddPreview('expected an object result.');
+  const id = requiredString(result.data, 'id');
+  const digest = requiredString(result.data, 'digest');
+  const revision = requiredString(result.data, 'revision');
+  if (
+    id === undefined ||
+    digest === undefined ||
+    revision === undefined ||
+    result.data.changed !== true ||
+    result.data.dryRun !== true
+  ) {
+    return invalidAddPreview('required ID, digest, revision, or dry-run fields were missing.');
+  }
+  return success({ changed: true, digest, dryRun: true, id, revision });
+}
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null;
@@ -97,6 +128,19 @@ function asManaged(result: CommandResult<unknown>): readonly TuiManagedSkill[] {
     if (id === '') return [];
     return [{ id, state: asString(entry.state, 'unknown') }];
   });
+}
+
+function asGroups(result: CommandResult<unknown>): readonly string[] {
+  if (!result.ok || !Array.isArray(result.data)) return [];
+  return [
+    ...new Set(
+      result.data.flatMap((entry): readonly string[] => {
+        if (!isRecord(entry)) return [];
+        const path = asString(entry.path);
+        return path === '' ? [] : [path];
+      }),
+    ),
+  ].sort(compareText);
 }
 
 function asProjectRoot(result: CommandResult<unknown>): string | undefined {
@@ -611,10 +655,11 @@ export class DefaultTuiActionPort implements TuiActionPort {
   }
 
   public async load(): Promise<TuiDashboard> {
-    const [catalog, status, configuration] = await Promise.all([
+    const [catalog, status, configuration, groupListing] = await Promise.all([
       this.execute(invocation('list', [], this.optionsFor())),
       this.execute(invocation('status', [], this.optionsFor())),
       this.execute(invocation('config:list', [], this.configurationOptions())),
+      this.execute(invocation('group:list', [], this.setupOptions())),
     ]);
     const firstRun =
       hasErrorCode(catalog, 'LIBRARY_NOT_CONFIGURED') ||
@@ -624,6 +669,7 @@ export class DefaultTuiActionPort implements TuiActionPort {
       ...errorMessages(catalog, setupErrors),
       ...errorMessages(status, setupErrors),
       ...errorMessages(configuration, setupErrors),
+      ...errorMessages(groupListing, setupErrors),
     ];
     const root = asProjectRoot(status);
     const manageGitignore =
@@ -663,6 +709,7 @@ export class DefaultTuiActionPort implements TuiActionPort {
       defaultTargets: asEffectiveDefaultTargets(configuration),
       errors,
       firstRun,
+      groups: asGroups(groupListing),
       inventory,
       inventoryIssues,
       manageGitignore,
@@ -710,6 +757,27 @@ export class DefaultTuiActionPort implements TuiActionPort {
           noInput: true,
           yes: false,
         }),
+      ),
+    );
+  }
+
+  public async add(path: string, group: string): Promise<CommandResult<unknown>> {
+    return await this.execute(
+      invocation('add', [path], this.setupOptions(group === '' ? {} : { group })),
+    );
+  }
+
+  public async previewAdd(
+    path: string,
+    group: string,
+  ): Promise<CommandResult<TuiLibraryAddPreview>> {
+    return parseTuiLibraryAddPreviewResult(
+      await this.execute(
+        invocation(
+          'add',
+          [path],
+          this.setupOptions({ dryRun: true, ...(group === '' ? {} : { group }) }),
+        ),
       ),
     );
   }

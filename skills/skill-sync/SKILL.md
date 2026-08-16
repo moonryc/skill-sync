@@ -133,13 +133,22 @@ never forward either scope selector to `init`. A bare noninteractive invocation
 prints a write-free setup preview → exact apply → `list` → `install` quick start; use explicit
 argument-driven commands for automation.
 After setup, a populated library opens the catalog and teaches `Space` to select a skill and `i` to
-review installation. An empty library stays on the overview and gives the exact write-free author
-handoff `skill-sync add <path> --dry-run`. In the catalog, distinguish a truly empty library from a
+review installation. An empty library stays on the overview and points to Unmanaged inventory for
+on-disk skills, while retaining the write-free arbitrary-path handoff
+`skill-sync add <path> --dry-run`. In the catalog, distinguish a truly empty library from a
 search or group filter with no matches: only the truly empty state gives the add preview, while the
 filtered state says that no skills match the current search and group filter.
-An adoptable entry can be paired with a deliberately selected exact qualified
-library ID and reviewed; adoption tracks only a byte-for-byte canonical match and
-never replaces target files. The screen remains read-only until a reviewed action
+An eligible unmanaged entry supports two deliberate actions. `Enter` or `a`
+opens an arrow-key group browser. Each location lists `Save in …`, immediate
+child groups, and `Add folder`. Folder entry accepts one portable segment and
+opens the new virtual location, allowing another nested folder or a save there.
+No group is created before the exact canonical ID and digest review is confirmed;
+then `y` runs `add` and adopts the unchanged local copy so it becomes managed. `d`
+pairs the entry with a deliberately selected exact qualified library ID;
+adoption tracks only a byte-for-byte canonical match and never replaces target
+files. If add succeeds but the follow-up adoption fails, report that the
+canonical library skill now exists and leave the local failure visible for
+recovery. The screen remains read-only until a reviewed action
 is accepted. It cannot be used with `--json`, `--no-input`, `--yes`, redirected
 streams, or CI; those input and machine flags are omitted from TUI help and
 rejected before I/O. Use the explicit commands below for deterministic

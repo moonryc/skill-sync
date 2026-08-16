@@ -266,17 +266,28 @@ describe('TUI launcher', () => {
                       },
                     },
                   })
-                : success({ skills: [] }),
+                : input.command === 'group:list'
+                  ? success([
+                      { description: null, path: 'tools' },
+                      { description: 'OpenSpec workflows', path: 'workflows/openspec' },
+                    ])
+                  : success({ skills: [] }),
             );
           }, options);
 
           const dashboard = await port.load();
           expect(dashboard.defaultTargets).toEqual(['claude', 'codex']);
+          expect(dashboard.groups).toEqual(['tools', 'workflows/openspec']);
           expect(dashboard.manageGitignore).toBe(scope === 'project');
           expect(calls.find((call) => call.command === 'config:list')).toEqual({
             arguments: [],
             command: 'config:list',
             options: { color: true, json: true },
+          });
+          expect(calls.find((call) => call.command === 'group:list')).toEqual({
+            arguments: [],
+            command: 'group:list',
+            options: { color: true, json: true, noInput: true, yes: false },
           });
         } finally {
           vi.unstubAllEnvs();

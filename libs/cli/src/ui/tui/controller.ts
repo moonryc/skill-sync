@@ -1,9 +1,13 @@
 import { isValidGitHubRepositoryName } from '../../application/library-lifecycle.js';
 import type { CommandResult } from '../../domain/result.js';
+import { validatePortableSlug } from '../../domain/identifiers.js';
 import { GitRemoteUrlError, normalizeGitRemote } from '../../infrastructure/git.js';
 import type { TuiInstallPreview, TuiLibraryInitPlan, TuiTarget } from './types.js';
 
 export type TuiScreen =
+  | 'add-folder-name'
+  | 'add-location'
+  | 'add-review'
   | 'adopt-candidate'
   | 'adopt-review'
   | 'catalog'
@@ -33,6 +37,55 @@ export type TuiSetupInputValidation =
 
 export const TUI_CONNECT_REPOSITORY_EXAMPLE = 'https://github.com/you/ai-skills.git';
 export const TUI_CREATE_REPOSITORY_EXAMPLE = 'you/ai-skills';
+
+export type TuiAddLocationItem =
+  | { readonly kind: 'add-folder' }
+  | { readonly group: string; readonly kind: 'group'; readonly pending: boolean }
+  | { readonly group: string; readonly kind: 'parent' }
+  | { readonly kind: 'save' };
+
+export function tuiGroupParent(group: string): string {
+  const separator = group.lastIndexOf('/');
+  return separator === -1 ? '' : group.slice(0, separator);
+}
+
+export function tuiAddLocationItems(
+  groups: readonly string[],
+  pendingGroups: readonly string[],
+  currentGroup: string,
+): readonly TuiAddLocationItem[] {
+  const known = new Set([...groups, ...pendingGroups]);
+  const children = [...known]
+    .filter((group) => group !== '' && tuiGroupParent(group) === currentGroup)
+    .sort((left, right) => left.localeCompare(right));
+  return [
+    { kind: 'save' },
+    ...(currentGroup === ''
+      ? []
+      : [{ group: tuiGroupParent(currentGroup), kind: 'parent' as const }]),
+    ...children.map((group) => ({
+      group,
+      kind: 'group' as const,
+      pending: pendingGroups.includes(group),
+    })),
+    { kind: 'add-folder' },
+  ];
+}
+
+export type TuiFolderNameValidation =
+  { readonly error: string; readonly ok: false } | { readonly ok: true; readonly value: string };
+
+export function validateTuiFolderName(input: string): TuiFolderNameValidation {
+  const value = input.trim();
+  const issues = validatePortableSlug(value);
+  return issues.length === 0
+    ? { ok: true, value }
+    : {
+        error:
+          'Use lowercase letters, numbers, and single hyphens, such as openspec or code-review.',
+        ok: false,
+      };
+}
 
 export function tuiSetupReviewScreen(
   kind: TuiSetupInputKind,
@@ -194,7 +247,7 @@ export function tuiSetupCompletion(
     };
   }
   return {
-    notice: `${result} It has no skills yet. Exit and run skill-sync add <path> --dry-run, then reopen skill-sync.`,
+    notice: `${result} It has no skills yet. Open Unmanaged inventory to add an on-disk skill, or run skill-sync add <path> --dry-run.`,
     screen: 'overview',
   };
 }
@@ -212,6 +265,8 @@ export function backFromTuiScreen(screen: TuiScreen): TuiScreen | 'quit' {
     return 'first-run';
   }
   if (screen === 'detail' || screen === 'install-review') return 'catalog';
+  if (screen === 'add-location') return 'unmanaged';
+  if (screen === 'add-folder-name' || screen === 'add-review') return 'add-location';
   if (screen === 'adopt-candidate') return 'unmanaged';
   if (screen === 'adopt-review') return 'adopt-candidate';
   if (screen === 'sync-review') return 'managed';

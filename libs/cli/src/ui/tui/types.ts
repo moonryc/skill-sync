@@ -38,6 +38,7 @@ export interface TuiDashboard {
   readonly defaultTargets: readonly TuiTarget[];
   readonly errors: readonly string[];
   readonly firstRun: boolean;
+  readonly groups: readonly string[];
   readonly inventory: readonly TuiInventorySkill[];
   readonly inventoryIssues: readonly string[];
   readonly manageGitignore: boolean;
@@ -116,6 +117,14 @@ export interface TuiLibrarySetupIntent {
   readonly value: string;
 }
 
+export interface TuiLibraryAddPreview {
+  readonly changed: true;
+  readonly digest: string;
+  readonly dryRun: true;
+  readonly id: string;
+  readonly revision: string;
+}
+
 export interface TuiLibraryInitPlan {
   readonly action: 'connect' | 'create' | 'initialize-empty';
   readonly branch: string;
@@ -143,6 +152,7 @@ export interface TuiLibraryInitPlan {
 }
 
 export interface TuiActionPort {
+  add(path: string, group: string): Promise<CommandResult<unknown>>;
   adopt(id: string, target: string): Promise<CommandResult<unknown>>;
   applyLibrarySetup(
     intent: TuiLibrarySetupIntent,
@@ -163,5 +173,6 @@ export interface TuiActionPort {
     targets: readonly string[],
     manageGitignore: boolean,
   ): Promise<CommandResult<TuiInstallPreview>>;
+  previewAdd(path: string, group: string): Promise<CommandResult<TuiLibraryAddPreview>>;
   sync(discardLocal: boolean): Promise<CommandResult<unknown>>;
 }

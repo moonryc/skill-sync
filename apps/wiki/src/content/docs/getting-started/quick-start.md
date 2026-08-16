@@ -42,8 +42,9 @@ plan and apply in one command.
 The guided create action is labeled `Create GitHub library (starts empty)`. A
 connected library that already has skills opens the catalog and teaches `Space`
 selection followed by `i` to review installation. An empty result remains on the
-overview and points to the write-free author preview
-`skill-sync add <path> --dry-run` instead of opening an unusable catalog.
+overview and points to Unmanaged inventory, where an eligible on-disk skill can
+be added to the library and tracked after review. The write-free
+`skill-sync add <path> --dry-run` command remains available for arbitrary paths.
 
 There are no top-level `setup` or `create` commands. If you try one, skill-sync
 makes no changes and points to the matching `init` command above.

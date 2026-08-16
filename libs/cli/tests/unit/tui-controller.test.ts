@@ -10,6 +10,7 @@ import {
   initialTuiNavigation,
   moveTuiCursor,
   overviewDestination,
+  tuiAddLocationItems,
   tuiDiagnosticIssueLimit,
   tuiInstallTargetDefaults,
   tuiInstallReviewLimits,
@@ -17,6 +18,7 @@ import {
   tuiRowLimit,
   tuiSetupCompletion,
   tuiSetupReviewScreen,
+  validateTuiFolderName,
   validateTuiSetupInput,
   windowTuiItems,
 } from '../../src/ui/tui/controller.js';
@@ -139,6 +141,9 @@ describe('TUI navigation controller', () => {
     expect(tuiSetupReviewScreen('create')).toBe('setup-create-review');
     expect(backFromTuiScreen('catalog')).toBe('overview');
     expect(backFromTuiScreen('detail')).toBe('catalog');
+    expect(backFromTuiScreen('add-location')).toBe('unmanaged');
+    expect(backFromTuiScreen('add-folder-name')).toBe('add-location');
+    expect(backFromTuiScreen('add-review')).toBe('add-location');
     expect(backFromTuiScreen('adopt-candidate')).toBe('unmanaged');
     expect(backFromTuiScreen('adopt-review')).toBe('adopt-candidate');
     expect(backFromTuiScreen('setup-connect')).toBe('first-run');
@@ -149,6 +154,28 @@ describe('TUI navigation controller', () => {
     expect(backFromTuiScreen('setup-guide')).toBe('first-run');
     expect(backFromTuiScreen('first-run')).toBe('quit');
     expect(backFromTuiScreen('overview')).toBe('quit');
+  });
+
+  it('builds one-level folder choices for each add location', () => {
+    expect(
+      tuiAddLocationItems(
+        ['tools', 'workflows', 'workflows/shared', 'workflows/shared/frontend'],
+        ['workflows/openspec', 'workflows/openspec/changes'],
+        'workflows',
+      ),
+    ).toEqual([
+      { kind: 'save' },
+      { group: '', kind: 'parent' },
+      { group: 'workflows/openspec', kind: 'group', pending: true },
+      { group: 'workflows/shared', kind: 'group', pending: false },
+      { kind: 'add-folder' },
+    ]);
+  });
+
+  it('validates one portable folder segment at a time', () => {
+    expect(validateTuiFolderName(' openspec ')).toEqual({ ok: true, value: 'openspec' });
+    expect(validateTuiFolderName('nested/folder')).toMatchObject({ ok: false });
+    expect(validateTuiFolderName('OpenSpec')).toMatchObject({ ok: false });
   });
 
   it('uses configured targets and provides a Codex fallback only when none are configured', () => {
@@ -165,7 +192,7 @@ describe('TUI navigation controller', () => {
     });
     expect(tuiSetupCompletion('create', 0)).toEqual({
       notice:
-        'Skill library initialized. It has no skills yet. Exit and run skill-sync add <path> --dry-run, then reopen skill-sync.',
+        'Skill library initialized. It has no skills yet. Open Unmanaged inventory to add an on-disk skill, or run skill-sync add <path> --dry-run.',
       screen: 'overview',
     });
     const emptyRemote = tuiSetupCompletion('initialize-empty', 0);

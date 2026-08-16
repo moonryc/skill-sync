@@ -7,6 +7,9 @@ import { describe, expect, it } from 'vitest';
 import { DefaultTuiActionPort } from '../../src/ui/tui/runner.js';
 import {
   TuiApp,
+  TuiAddFolderForm,
+  TuiAddLocationBrowser,
+  TuiAddReview,
   TuiCatalogEmptyState,
   TuiFirstRunMenu,
   TuiGitignorePolicy,
@@ -19,7 +22,11 @@ import {
   TUI_SETUP_GUIDE_URL,
   TuiWindowIndicator,
 } from '../../src/ui/tui/app.js';
-import { tuiInstallReviewLimits, windowTuiItems } from '../../src/ui/tui/controller.js';
+import {
+  tuiAddLocationItems,
+  tuiInstallReviewLimits,
+  windowTuiItems,
+} from '../../src/ui/tui/controller.js';
 import { EXIT_CODES, failure, success } from '../../src/domain/result.js';
 import type { CommandInvocation } from '../../src/commands/program.js';
 import type {
@@ -132,6 +139,7 @@ describe('TUI renderer and action port', () => {
     const output = renderToString(
       createElement(TuiApp, {
         actions: {
+          add: () => Promise.resolve(success({})),
           adopt: () => Promise.resolve(success({})),
           applyLibrarySetup: () => Promise.resolve(success({})),
           checkForUpdate: () => Promise.resolve(undefined),
@@ -139,6 +147,16 @@ describe('TUI renderer and action port', () => {
           install: () => Promise.resolve(success({})),
           load: () => new Promise<TuiDashboard>(() => undefined),
           previewLibrarySetup: () => Promise.resolve(success(libraryInitPlan())),
+          previewAdd: () =>
+            Promise.resolve(
+              success({
+                changed: true as const,
+                digest: 'b'.repeat(64),
+                dryRun: true as const,
+                id: 'workflows/openspec/openspec-propose',
+                revision: 'a'.repeat(40),
+              }),
+            ),
           previewInstall: () => Promise.resolve(success(installPreview())),
           sync: () => Promise.resolve(success({})),
         },
@@ -284,6 +302,7 @@ describe('TUI renderer and action port', () => {
     );
 
     expect(empty).toContain('This library has no skills yet');
+    expect(empty).toContain('Open Unmanaged inventory');
     expect(empty).toContain('skill-sync add <path> --dry-run');
     expect(filtered).toContain('No skills match the current search and group filter');
     expect(filtered).not.toContain('skill-sync add');
@@ -420,6 +439,64 @@ describe('TUI renderer and action port', () => {
     expect(output).not.toContain('skill-sync.lock.json');
   });
 
+  it('renders add-to-library folder browsing, creation, and review details', () => {
+    const entry = {
+      adoptable: true,
+      issues: [],
+      name: 'openspec-propose',
+      path: '/workspace/.codex/skills/openspec-propose',
+      status: 'unmanaged',
+      target: 'codex',
+    };
+    const items = tuiAddLocationItems(
+      ['tools', 'workflows', 'workflows/shared'],
+      ['workflows/openspec'],
+      'workflows',
+    );
+    const browser = renderToString(
+      createElement(TuiAddLocationBrowser, {
+        color: false,
+        currentGroup: 'workflows',
+        cursor: 2,
+        entry,
+        window: windowTuiItems(items, 2, 10),
+      }),
+    );
+    const folderForm = renderToString(
+      createElement(TuiAddFolderForm, {
+        color: false,
+        currentGroup: 'workflows/openspec',
+        error: undefined,
+        input: 'changes',
+      }),
+    );
+    const review = renderToString(
+      createElement(TuiAddReview, {
+        color: false,
+        entry,
+        preview: {
+          changed: true,
+          digest: 'b'.repeat(64),
+          dryRun: true,
+          id: 'workflows/openspec/openspec-propose',
+          revision: 'a'.repeat(40),
+        },
+      }),
+    );
+
+    expect(browser).toContain('Choose library location');
+    expect(browser).toContain('Save in workflows');
+    expect(browser).toContain('.. Back to library root');
+    expect(browser).toContain('openspec/ [new]');
+    expect(browser).toContain('+ Add folder');
+    expect(folderForm).toContain('Inside: workflows/openspec');
+    expect(folderForm).toContain('Folder name: changes');
+    expect(folderForm).toContain('Enter create and open');
+    expect(review).toContain('Canonical skill: workflows/openspec/openspec-propose');
+    expect(review).toContain('commit and push');
+    expect(review).toContain('y add and track');
+  });
+
   it('routes confirmed UI operations through the existing command executor contract', async () => {
     const calls: CommandInvocation[] = [];
     const port = new DefaultTuiActionPort(
@@ -463,7 +540,15 @@ describe('TUI renderer and action port', () => {
                           }),
                     ),
                   )
-                : success({}),
+                : input.command === 'add' && input.options.dryRun === true
+                  ? success({
+                      changed: true,
+                      digest: 'b'.repeat(64),
+                      dryRun: true,
+                      id: 'workflows/openspec/openspec-propose',
+                      revision: 'a'.repeat(40),
+                    })
+                  : success({}),
         );
       },
       { project: '/workspace' },
@@ -495,8 +580,15 @@ describe('TUI renderer and action port', () => {
       `init-v1-${'e'.repeat(64)}`,
     );
     await port.diagnose();
+    await expect(
+      port.previewAdd('/workspace/.codex/skills/openspec-propose', 'workflows/openspec'),
+    ).resolves.toMatchObject({
+      ok: true,
+      data: { id: 'workflows/openspec/openspec-propose' },
+    });
+    await port.add('/workspace/.codex/skills/openspec-propose', 'workflows/openspec');
 
-    expect(calls).toHaveLength(9);
+    expect(calls).toHaveLength(11);
     expect(calls[0]?.command).toBe('adopt');
     expect(calls[0]?.arguments).toEqual(['frontend/review-ui']);
     expect(calls[0]?.options).toMatchObject({
@@ -570,6 +662,29 @@ describe('TUI renderer and action port', () => {
       command: 'doctor',
       arguments: [],
       options: { json: true, noInput: true, yes: false },
+    });
+    expect(calls[9]).toEqual({
+      command: 'add',
+      arguments: ['/workspace/.codex/skills/openspec-propose'],
+      options: {
+        color: true,
+        dryRun: true,
+        group: 'workflows/openspec',
+        json: true,
+        noInput: true,
+        yes: false,
+      },
+    });
+    expect(calls[10]).toEqual({
+      command: 'add',
+      arguments: ['/workspace/.codex/skills/openspec-propose'],
+      options: {
+        color: true,
+        group: 'workflows/openspec',
+        json: true,
+        noInput: true,
+        yes: false,
+      },
     });
   });
 
