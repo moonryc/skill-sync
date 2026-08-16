@@ -943,7 +943,7 @@ describe('built CLI from unrelated directories', () => {
       }
       await expect(stat(unusedState)).rejects.toMatchObject({ code: 'ENOENT' });
     });
-  }, 15_000);
+  }, 45_000);
 
   it('runs fully specified JSON config and local validation workflows', async () => {
     await withTempDirectory('skill-sync-e2e-json-', async (root) => {

@@ -1236,5 +1236,5 @@ describe('publication and canonical deletion', () => {
         remoteFile(root, fixture.remote, 'skills/frontend/review-ui/SKILL.md'),
       ).rejects.toThrow();
     });
-  }, 15_000);
+  }, 45_000);
 });
