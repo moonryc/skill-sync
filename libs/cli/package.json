@@ -1,6 +1,6 @@
 {
   "name": "@moonryc/skill-sync",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Safely manage a Git-backed library of AI skills across Codex, Claude, and project repositories.",
   "type": "module",
   "sideEffects": false,

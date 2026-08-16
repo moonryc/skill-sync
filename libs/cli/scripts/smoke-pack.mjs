@@ -154,6 +154,12 @@ try {
   if (packageJson.publishConfig?.provenance !== true) {
     throw new Error('packed npm provenance metadata is missing');
   }
+  const packageReadme = await readFile(join(installedPackageRoot, 'README.md'), 'utf8');
+  for (const excludedHeading of ['## Exit statuses', '## Development and release checks']) {
+    if (packageReadme.includes(excludedHeading)) {
+      throw new Error(`packed README contains excluded section: ${excludedHeading}`);
+    }
+  }
 
   const unrelated = join(smokeRoot, 'unrelated-project');
   const configHome = join(smokeRoot, 'config-home');
