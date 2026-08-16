@@ -1,7 +1,5 @@
-import { execFile } from 'node:child_process';
 import { readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { promisify } from 'node:util';
 
 import {
   PROJECT_LOCK_FILENAME,
@@ -16,9 +14,8 @@ import {
   type ProjectLock,
   type ProjectManifest,
 } from '../domain/project-state.js';
+import { runProcess } from './process-runner.js';
 import { writeJsonAtomic } from './stable-json.js';
-
-const execFileAsync = promisify(execFile);
 
 export type ProjectStateFileKind = 'manifest' | 'lock';
 
@@ -126,16 +123,17 @@ export interface ProjectRootResolutionOptions {
 
 async function defaultGitRootResolver(cwd: string): Promise<string | undefined> {
   try {
-    const { stdout } = await execFileAsync('git', ['rev-parse', '--show-toplevel'], {
+    const { stdout } = await runProcess({
+      arguments: ['rev-parse', '--show-toplevel'],
       cwd,
-      encoding: 'utf8',
+      executable: 'git',
       env: {
         ...process.env,
         GIT_CONFIG_COUNT: '1',
         GIT_CONFIG_KEY_0: 'core.hooksPath',
         GIT_CONFIG_VALUE_0: '',
       },
-      windowsHide: true,
+      timeoutMs: 10_000,
     });
     const result = stdout.trim();
     return result === '' ? undefined : result;
@@ -228,6 +226,13 @@ export function assertProjectStatePair(manifest: ProjectManifest, lock: ProjectL
   }
 
   const manifestById = new Map(manifest.skills.map((skill) => [skill.id, skill]));
+  const lockById = new Map(lock.skills.map((skill) => [skill.id, skill]));
+  if (
+    manifestById.size !== lockById.size ||
+    [...manifestById.keys()].some((id) => !lockById.has(id))
+  ) {
+    throw new Error('Project manifest and lock must contain exactly the same managed skill IDs.');
+  }
   for (const lockedSkill of lock.skills) {
     const desiredSkill = manifestById.get(lockedSkill.id);
     if (desiredSkill === undefined) {

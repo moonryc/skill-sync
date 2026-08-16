@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+
 import { describe, expect, it } from 'vitest';
 
 import { ConfigService } from '../../src/application/config-service.js';
@@ -29,6 +31,9 @@ describe('ConfigService', () => {
       const service = new ConfigService(env, resolveApplicationPaths({ cwd: root, env }));
       await expect(service.set('unknown', 'value')).rejects.toThrow(/Unsupported/);
       await expect(service.set('defaults.targets', 'cursor')).rejects.toThrow(/codex or claude/);
+      await expect(service.set('library.branch', 'develop')).rejects.toThrow(
+        'skill-sync config set library.remote <repository-url>',
+      );
       await expect(
         service.set('library.remote', 'https://user:secret@github.com/example/skills.git'),
       ).rejects.toThrow(/credentials/i);
@@ -43,5 +48,58 @@ describe('ConfigService', () => {
       expect(listing.configured['defaults.gitignore']).toBeUndefined();
       expect(listing.effective.value.gitignore).toBe('manage');
       expect(listing.effective.sources.gitignore).toBe('environment');
+    }));
+
+  it('reports every coupled key removed with library.remote and preserves independent defaults', async () =>
+    withTempDirectory('skill-sync-config-service-coupled-unset-', async (root) => {
+      const env = { SKILL_SYNC_CONFIG_HOME: root };
+      const service = new ConfigService(env, resolveApplicationPaths({ cwd: root, env }));
+      await service.set('library.remote', 'https://github.com/example/skills.git');
+      await service.set('library.branch', 'stable');
+      await service.set('library.transport', 'ssh');
+      await service.set('defaults.gitignore', 'manage');
+
+      await expect(service.unset('library.remote')).resolves.toEqual({
+        changed: true,
+        changedKeys: ['library.remote', 'library.branch', 'library.transport'],
+      });
+      const listing = await service.list();
+      expect(listing.configured).toMatchObject({
+        'library.remote': undefined,
+        'library.branch': undefined,
+        'library.transport': undefined,
+        'defaults.gitignore': 'manage',
+      });
+      expect(JSON.parse(await readFile(service.path(), 'utf8'))).toEqual({
+        defaults: { gitignore: 'manage' },
+        schemaVersion: 1,
+      });
+    }));
+
+  it('makes an already-unset key a truthful no-op without creating a config file', async () =>
+    withTempDirectory('skill-sync-config-service-noop-unset-', async (root) => {
+      const env = { SKILL_SYNC_CONFIG_HOME: root };
+      const service = new ConfigService(env, resolveApplicationPaths({ cwd: root, env }));
+
+      await expect(service.unset('defaults.gitignore')).resolves.toEqual({
+        changed: false,
+        changedKeys: [],
+      });
+      await expect(readFile(service.path(), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    }));
+
+  it('reports the remote URL normalization coupled to resetting SSH transport', async () =>
+    withTempDirectory('skill-sync-config-service-transport-unset-', async (root) => {
+      const env = { SKILL_SYNC_CONFIG_HOME: root };
+      const service = new ConfigService(env, resolveApplicationPaths({ cwd: root, env }));
+      await service.set('library.remote', 'https://github.com/example/skills.git');
+      await service.set('library.transport', 'ssh');
+
+      await expect(service.unset('library.transport')).resolves.toEqual({
+        changed: true,
+        changedKeys: ['library.remote', 'library.transport'],
+      });
+      expect(await service.get('library.remote')).toBe('https://github.com/example/skills.git');
+      expect(await service.get('library.transport')).toBe('https');
     }));
 });

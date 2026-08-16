@@ -6,6 +6,15 @@
   "schemaVersion": 1,
   "skills": [
     {
+      "id": "openspec/openspec-apply-change",
+      "projections": [
+        {
+          "destination": ".claude/skills/openspec-apply-change",
+          "target": "claude"
+        }
+      ]
+    },
+    {
       "id": "tools/skill-sync",
       "projections": [
         {

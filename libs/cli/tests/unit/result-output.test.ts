@@ -44,6 +44,17 @@ describe('command result and output contracts', () => {
     expect(state.exitCode).toBe(0);
   });
 
+  it('never exposes an unformatted structured result as human JSON', () => {
+    const { io, state } = memoryIo();
+    renderResult('validate', success({ valid: true }), { json: false, color: false }, io);
+
+    expect(state.stdout).toBe('');
+    expect(state.stderr).toContain('HUMAN_RENDERER_MISSING');
+    expect(state.stderr).toContain('Re-run with --json');
+    expect(state.stderr).not.toContain('"valid"');
+    expect(state.exitCode).toBe(EXIT_CODES.internal);
+  });
+
   it('redacts credentials from JSON errors', () => {
     const { io, state } = memoryIo();
     renderResult(

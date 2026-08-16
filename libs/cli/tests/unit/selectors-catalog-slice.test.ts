@@ -36,6 +36,35 @@ describe('skill selector resolution', () => {
     });
   });
 
+  it('returns bounded deterministic typo candidates without resolving them', () => {
+    expect(resolveSkillSelector(catalog, 'testing/run-tsets')).toEqual({
+      success: false,
+      error: {
+        code: 'unknown-selector',
+        selector: 'testing/run-tsets',
+        message:
+          'No catalog skill matches selector "testing/run-tsets". Closest exact ID: testing/run-tests.',
+        candidates: ['testing/run-tests'],
+      },
+    });
+
+    const tied = Array.from({ length: 5 }, (_value, index) => ({
+      id: `group-${String(index)}/review-ui`,
+      name: 'review-ui',
+    }));
+    expect(resolveSkillSelector(tied, 'revie-ui')).toMatchObject({
+      success: false,
+      error: {
+        code: 'unknown-selector',
+        candidates: ['group-0/review-ui', 'group-1/review-ui', 'group-2/review-ui'],
+      },
+    });
+    expect(resolveSkillSelector(catalog, 'unrelated-name')).toMatchObject({
+      success: false,
+      error: { code: 'unknown-selector', candidates: [] },
+    });
+  });
+
   it('validates the whole explicit set before exposing values', () => {
     const result = resolveSkillSelectors(catalog, [
       'testing/run-tests',
@@ -46,6 +75,19 @@ describe('skill selector resolution', () => {
       success: false,
       values: [],
       errors: [expect.objectContaining({ code: 'unknown-selector', selector: 'missing-skill' })],
+    });
+
+    const typo = resolveSkillSelectors(catalog, ['frontend/review-ui', 'run-tsets']);
+    expect(typo).toMatchObject({
+      success: false,
+      values: [],
+      errors: [
+        expect.objectContaining({
+          code: 'unknown-selector',
+          selector: 'run-tsets',
+          candidates: ['testing/run-tests'],
+        }),
+      ],
     });
   });
 

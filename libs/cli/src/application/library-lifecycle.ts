@@ -1,4 +1,3 @@
-import { execFile } from 'node:child_process';
 import {
   chmod,
   copyFile,
@@ -10,7 +9,19 @@ import {
   rm,
   unlink,
 } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
+
+import {
+  initConfigurationFingerprint,
+  initPlanFingerprint,
+  type LibraryInitPlanAction,
+  type LibraryInitPlanEffects,
+} from './init-plan.js';
+import {
+  InitializationRecoverySession,
+  type InitializationRecoveryRuntime,
+} from './init-recovery.js';
 
 import {
   canonicalSkillPath,
@@ -30,6 +41,7 @@ import {
   type GroupPath,
   type QualifiedSkillId,
 } from '../domain/identifiers.js';
+import { RecoveryIntegrityError } from '../domain/recovery-integrity.js';
 import type { ProjectLock, ProjectManifest } from '../domain/project-state.js';
 import {
   readUserConfig,
@@ -40,6 +52,7 @@ import {
   type UserConfig,
 } from '../infrastructure/config.js';
 import {
+  gitFailureDiagnostic,
   GitClient,
   GitExecutionError,
   normalizeGitRemote,
@@ -49,8 +62,10 @@ import {
   type NormalizedGitRemote,
 } from '../infrastructure/git.js';
 import {
+  LibraryCacheExpectedRevisionError,
   type LibraryCacheRefreshRequest,
   type LibraryCacheInspectRequest,
+  type LibraryCachePromotionRequest,
   type LibraryCacheRevision,
   type LibraryCacheLock,
   withInProcessLibraryCacheLock,
@@ -61,10 +76,16 @@ import {
   readProjectManifest,
   writeProjectLock,
 } from '../infrastructure/project-state.js';
+import {
+  nonInteractiveProcessEnvironment,
+  ProcessRunError,
+  runProcess,
+} from '../infrastructure/process-runner.js';
 import { writeJsonAtomic } from '../infrastructure/stable-json.js';
 
 export type LibraryLifecycleErrorCode =
   | 'REMOTE_EMPTY_CONFIRMATION_REQUIRED'
+  | 'INIT_PLAN_CHANGED'
   | 'REMOTE_NOT_EMPTY'
   | 'INCOMPATIBLE_LIBRARY'
   | 'LIBRARY_VALIDATION_FAILED'
@@ -110,6 +131,7 @@ export interface LibraryGitPort {
 export interface LibraryCachePort {
   refresh(request: LibraryCacheRefreshRequest): Promise<LibraryCacheRevision>;
   inspect?(request: LibraryCacheInspectRequest): Promise<LibraryCacheRevision>;
+  promoteExact(request: LibraryCachePromotionRequest): Promise<LibraryCacheRevision>;
 }
 
 export interface LibraryConfigStore {
@@ -128,6 +150,7 @@ export type GitHubVisibility = 'private' | 'public' | 'internal';
 
 export interface GitHubCreateRequest {
   readonly repository: string;
+  readonly signal?: AbortSignal;
   readonly visibility: GitHubVisibility;
   readonly transport: ConfigGitTransport;
 }
@@ -137,11 +160,14 @@ export interface GitHubCreateResult {
 }
 
 export interface GitHubRepositoryPort {
+  inspectRepository(request: GitHubCreateRequest): Promise<GitHubCreateResult>;
   createRepository(request: GitHubCreateRequest): Promise<GitHubCreateResult>;
 }
 
 export interface GitHubProcessOptions {
   readonly env: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
 }
 
 export type GitHubProcessRunner = (
@@ -150,24 +176,31 @@ export type GitHubProcessRunner = (
   options: GitHubProcessOptions,
 ) => Promise<GitProcessResult>;
 
+const GITHUB_PROCESS_TIMEOUT_MS = 120_000;
+const PROCESS_OUTPUT_LIMIT_BYTES = 4 * 1024 * 1024;
+
 const defaultGitHubProcessRunner: GitHubProcessRunner = async (executable, arguments_, options) =>
-  await new Promise<GitProcessResult>((resolvePromise, rejectPromise) => {
-    execFile(
-      executable,
-      [...arguments_],
-      { env: options.env, windowsHide: true },
-      (error, stdout, stderr) => {
-        if (error !== null) {
-          Object.assign(error, { stdout, stderr });
-          rejectPromise(error instanceof Error ? error : new Error('GitHub CLI failed.'));
-          return;
-        }
-        resolvePromise({ stdout, stderr });
-      },
-    );
+  await runProcess({
+    arguments: arguments_,
+    env: options.env,
+    executable,
+    maxOutputBytes: PROCESS_OUTPUT_LIMIT_BYTES,
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    timeoutMs: options.timeoutMs ?? GITHUB_PROCESS_TIMEOUT_MS,
   });
 
-function validGitHubRepositoryName(value: string): boolean {
+function githubProcessDiagnostic(error: unknown): string {
+  if (error instanceof ProcessRunError) {
+    return error.output.stderr.trim() || error.message;
+  }
+  if (typeof error === 'object' && error !== null) {
+    const stderr: unknown = Reflect.get(error, 'stderr');
+    if (typeof stderr === 'string' && stderr.trim().length > 0) return stderr.trim();
+  }
+  return error instanceof Error ? error.message : 'GitHub CLI failed.';
+}
+
+export function isValidGitHubRepositoryName(value: string): boolean {
   const segments = value.split('/');
   return (
     segments.length === 2 &&
@@ -175,25 +208,54 @@ function validGitHubRepositoryName(value: string): boolean {
   );
 }
 
+function githubCloneUrl(repository: string, transport: ConfigGitTransport): string {
+  return transport === 'ssh'
+    ? `git@github.com:${repository}.git`
+    : `https://github.com/${repository}.git`;
+}
+
+function githubRepositoryIsMissing(error: unknown): boolean {
+  const diagnostic = githubProcessDiagnostic(error);
+  return /(?:could not resolve to a repository|http\s+(?:status\s+)?404)/iu.test(diagnostic);
+}
+
 export class GhCliRepositoryClient implements GitHubRepositoryPort {
   private readonly executable: string;
   private readonly processRunner: GitHubProcessRunner;
   private readonly environment: NodeJS.ProcessEnv;
+  private readonly signal: AbortSignal | undefined;
+  private readonly timeoutMs: number | undefined;
 
   constructor(
     options: {
       readonly executable?: string;
       readonly processRunner?: GitHubProcessRunner;
       readonly environment?: NodeJS.ProcessEnv;
+      readonly signal?: AbortSignal;
+      readonly timeoutMs?: number;
     } = {},
   ) {
     this.executable = options.executable ?? 'gh';
     this.processRunner = options.processRunner ?? defaultGitHubProcessRunner;
-    this.environment = { ...process.env, ...options.environment };
+    this.environment = nonInteractiveProcessEnvironment({
+      ...process.env,
+      ...options.environment,
+    });
+    this.signal = options.signal;
+    this.timeoutMs = options.timeoutMs;
   }
 
-  async createRepository(request: GitHubCreateRequest): Promise<GitHubCreateResult> {
-    if (!validGitHubRepositoryName(request.repository)) {
+  private processOptions(signal?: AbortSignal): GitHubProcessOptions {
+    const selectedSignal = signal ?? this.signal;
+    return {
+      env: this.environment,
+      ...(selectedSignal === undefined ? {} : { signal: selectedSignal }),
+      ...(this.timeoutMs === undefined ? {} : { timeoutMs: this.timeoutMs }),
+    };
+  }
+
+  async inspectRepository(request: GitHubCreateRequest): Promise<GitHubCreateResult> {
+    if (!isValidGitHubRepositoryName(request.repository)) {
       throw new LibraryLifecycleError(
         'GITHUB_CREATE_FAILED',
         'GitHub repository names must use owner/repository syntax.',
@@ -201,12 +263,15 @@ export class GhCliRepositoryClient implements GitHubRepositoryPort {
     }
 
     try {
-      await this.processRunner(this.executable, ['auth', 'status'], { env: this.environment });
+      await this.processRunner(
+        this.executable,
+        ['auth', 'status'],
+        this.processOptions(request.signal),
+      );
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'GitHub CLI failed.';
       throw new LibraryLifecycleError(
         'GITHUB_CREATE_FAILED',
-        `GitHub authentication is unavailable: ${message}`,
+        `GitHub authentication is unavailable: ${githubProcessDiagnostic(error)} Next: run gh auth login, then retry the same skill-sync init --create preview with --dry-run.`,
       );
     }
 
@@ -214,37 +279,47 @@ export class GhCliRepositoryClient implements GitHubRepositoryPort {
       await this.processRunner(
         this.executable,
         ['repo', 'view', request.repository, '--json', 'nameWithOwner'],
-        { env: this.environment },
+        this.processOptions(request.signal),
       );
       throw new LibraryLifecycleError(
         'GITHUB_REPOSITORY_EXISTS',
-        'The requested GitHub repository already exists; connect it explicitly instead.',
+        `The requested GitHub repository already exists. Preview connecting it with skill-sync init ${githubCloneUrl(request.repository, request.transport)} --dry-run instead.`,
       );
     } catch (error) {
       if (error instanceof LibraryLifecycleError) throw error;
-      // A missing repository is the expected path. `repo create` remains the
-      // authoritative no-overwrite operation if the visibility check raced.
+      if (!githubRepositoryIsMissing(error)) {
+        throw new LibraryLifecycleError(
+          'GITHUB_CREATE_FAILED',
+          `GitHub repository availability could not be verified: ${githubProcessDiagnostic(error)} Check GitHub connectivity, then retry the same skill-sync init --create preview with --dry-run.`,
+        );
+      }
+    }
+
+    return { cloneUrl: githubCloneUrl(request.repository, request.transport) };
+  }
+
+  async createRepository(request: GitHubCreateRequest): Promise<GitHubCreateResult> {
+    if (!isValidGitHubRepositoryName(request.repository)) {
+      throw new LibraryLifecycleError(
+        'GITHUB_CREATE_FAILED',
+        'GitHub repository names must use owner/repository syntax.',
+      );
     }
 
     try {
       await this.processRunner(
         this.executable,
         ['repo', 'create', request.repository, `--${request.visibility}`],
-        { env: this.environment },
+        this.processOptions(request.signal),
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'GitHub CLI failed.';
       throw new LibraryLifecycleError(
         'GITHUB_CREATE_FAILED',
-        `GitHub repository creation failed: ${message}`,
+        `GitHub repository creation failed: ${githubProcessDiagnostic(error)} The repository may have been created; inspect GitHub before retrying or deleting it.`,
       );
     }
 
-    const cloneUrl =
-      request.transport === 'ssh'
-        ? `git@github.com:${request.repository}.git`
-        : `https://github.com/${request.repository}.git`;
-    return { cloneUrl };
+    return { cloneUrl: githubCloneUrl(request.repository, request.transport) };
   }
 }
 
@@ -682,6 +757,50 @@ export interface LibraryInitResult {
   readonly revision: string;
 }
 
+export type LibraryInitializationRequest =
+  | {
+      readonly kind: 'connect';
+      readonly url: string;
+      readonly branch?: string;
+    }
+  | {
+      readonly kind: 'create';
+      readonly repository: string;
+      readonly branch?: string;
+      readonly transport?: ConfigGitTransport;
+      readonly visibility?: GitHubVisibility;
+    };
+
+export interface LibraryInitializationExecutionOptions {
+  readonly recovery?: InitializationRecoveryRuntime;
+  readonly signal?: AbortSignal;
+}
+
+export interface LibraryInitPlan {
+  readonly action: LibraryInitPlanAction;
+  readonly applied: false;
+  readonly branch: string;
+  readonly configuration: {
+    readonly beforeFingerprint: string;
+    readonly changed: boolean;
+    readonly nextIdentity: string;
+    readonly previousIdentity: string | null;
+  };
+  readonly dryRun: true;
+  readonly effects: LibraryInitPlanEffects;
+  readonly fingerprint: string;
+  readonly operation: 'init';
+  readonly remote: NormalizedGitRemote;
+  readonly remoteState: 'available' | 'compatible' | 'empty';
+  readonly repository: string | null;
+  readonly revision: string | null;
+  readonly validation: {
+    readonly groups: number;
+    readonly skills: number;
+  } | null;
+  readonly visibility: GitHubVisibility | null;
+}
+
 export interface LibraryCreateRequest {
   readonly repository: string;
   readonly branch?: string;
@@ -789,6 +908,12 @@ interface ResolvedLibraryConnection {
   readonly branch?: string;
 }
 
+interface PreparedLibraryInitialization {
+  readonly plan: LibraryInitPlan;
+  /** Valid only inside the surrounding initialization-inspection callback. */
+  readonly sourceRepositoryDirectory?: string;
+}
+
 interface PublicationSource {
   readonly id: QualifiedSkillId;
   readonly skill: ValidatedSkill;
@@ -800,6 +925,8 @@ export interface LibraryLifecycleServiceOptions {
   readonly cache: LibraryCachePort;
   readonly config: LibraryConfigStore;
   readonly stagingRoot: string;
+  /** OS-temporary root used only for side-effect-free initialization inspection. */
+  readonly inspectionRoot?: string;
   readonly git?: LibraryGitPort;
   readonly github?: GitHubRepositoryPort;
   readonly projectState?: LibraryProjectStateStore;
@@ -826,6 +953,7 @@ export class LibraryLifecycleService {
   private readonly github: GitHubRepositoryPort;
   private readonly projectState: LibraryProjectStateStore;
   private readonly stagingRoot: string;
+  private readonly inspectionRoot: string;
   private readonly normalizeRemote: (value: string) => NormalizedGitRemote;
   private readonly withLock: LibraryCacheLock;
   private readonly coordinator: LibraryMutationCoordinator;
@@ -837,6 +965,7 @@ export class LibraryLifecycleService {
     this.github = options.github ?? new GhCliRepositoryClient();
     this.projectState = options.projectState ?? fileProjectStateStore;
     this.stagingRoot = options.stagingRoot;
+    this.inspectionRoot = options.inspectionRoot ?? tmpdir();
     this.normalizeRemote = options.normalizeRemote ?? normalizeGitRemote;
     this.withLock = options.withLock ?? withInProcessLibraryCacheLock;
     this.coordinator =
@@ -907,64 +1036,222 @@ export class LibraryLifecycleService {
     }
   }
 
-  async init(request: LibraryInitRequest): Promise<LibraryInitResult> {
-    const remote = this.normalizeRemote(request.url);
-    const advertised = await this.listRemote(remote);
-    if (advertised.trim().length === 0) {
-      if (request.initializeEmpty !== true) {
-        throw new LibraryLifecycleError(
-          'REMOTE_EMPTY_CONFIRMATION_REQUIRED',
-          'The remote is empty and requires explicit confirmation before initialization.',
-        );
-      }
-      const branch = request.branch ?? 'main';
-      const revision = await this.initializeEmptyRemote(remote, branch);
-      const changed = await this.persistLibraryConfig(remote, branch);
-      return { changed, initialized: true, remote, branch, revision };
-    }
+  async planInitialization(
+    request: LibraryInitializationRequest,
+    options: LibraryInitializationExecutionOptions = {},
+  ): Promise<LibraryInitPlan> {
+    return await this.withInitializationInspection(
+      async (git, inspection) =>
+        (await this.prepareInitialization(request, git, inspection, options.signal)).plan,
+      options.signal,
+    );
+  }
 
-    const cached = await this.cache.refresh({
-      remote,
+  async applyInitialization(
+    request: LibraryInitializationRequest,
+    expectedPlanFingerprint: string,
+    options: LibraryInitializationExecutionOptions = {},
+  ): Promise<LibraryInitResult> {
+    const coordinationIdentity =
+      request.kind === 'connect'
+        ? this.normalizeRemote(request.url).identity
+        : `github.com/${request.repository.toLocaleLowerCase('en-US')}`;
+    return await this.withLock(
+      `lifecycle:${coordinationIdentity}`,
+      async () =>
+        await this.withInitializationInspection(async (git, inspection) => {
+          const prepared = await this.prepareInitialization(
+            request,
+            git,
+            inspection,
+            options.signal,
+          );
+          const current = prepared.plan;
+          if (current.fingerprint !== expectedPlanFingerprint) {
+            throw new LibraryLifecycleError(
+              'INIT_PLAN_CHANGED',
+              'The initialization plan changed after review, so nothing was applied. Run the same init command with --dry-run, then apply its new --expect-plan fingerprint.',
+              { currentPlan: current, expectedPlanFingerprint },
+            );
+          }
+          await this.assertPlannedConfiguration(current);
+
+          if (current.action === 'connect') {
+            if (prepared.sourceRepositoryDirectory === undefined || current.revision === null) {
+              throw new LibraryLifecycleError(
+                'INIT_PLAN_CHANGED',
+                'The reviewed library snapshot is no longer available, so nothing was applied. Run the same init command with --dry-run and review the new plan.',
+              );
+            }
+            let cached: LibraryCacheRevision;
+            try {
+              cached = await this.cache.promoteExact({
+                remote: current.remote,
+                branch: current.branch,
+                revision: current.revision,
+                ...(options.signal === undefined ? {} : { signal: options.signal }),
+                sourceRepositoryDirectory: prepared.sourceRepositoryDirectory,
+              });
+            } catch (error) {
+              if (error instanceof LibraryCacheExpectedRevisionError) {
+                throw new LibraryLifecycleError(
+                  'INIT_PLAN_CHANGED',
+                  'The library remote changed after review, so the persistent cache and saved configuration were not changed.',
+                  {
+                    currentPlan: current,
+                    expectedRevision: error.expectedRevision,
+                    ...(error.actualRevision === undefined
+                      ? {}
+                      : { fetchedRevision: error.actualRevision }),
+                  },
+                );
+              }
+              throw error;
+            }
+            if (
+              cached.branch !== current.branch ||
+              cached.revision.toLowerCase() !== current.revision.toLowerCase()
+            ) {
+              throw new LibraryLifecycleError(
+                'INIT_PLAN_CHANGED',
+                'The prepared cache did not match the reviewed plan. The saved configuration was not changed; run the same init command with --dry-run before retrying.',
+                {
+                  expectedRevision: current.revision,
+                  fetchedRevision: cached.revision,
+                },
+              );
+            }
+            const library = await this.validateCachedRevision(current.remote, cached);
+            if (!library.valid) throw validationFailure(library);
+            const recovery =
+              options.recovery === undefined
+                ? undefined
+                : await InitializationRecoverySession.create(current, options.recovery);
+            const changed = await this.persistPlannedLibraryConfig(current, recovery);
+            await recovery?.complete();
+            return {
+              changed,
+              initialized: false,
+              remote: current.remote,
+              branch: current.branch,
+              revision: cached.revision,
+            };
+          }
+
+          if (current.action === 'create') {
+            const recovery =
+              options.recovery === undefined
+                ? undefined
+                : await InitializationRecoverySession.create(current, options.recovery);
+            try {
+              await recovery?.begin('provider');
+              const created = await this.github.createRepository({
+                repository: current.repository ?? '',
+                ...(options.signal === undefined ? {} : { signal: options.signal }),
+                transport: current.remote.transport,
+                visibility: current.visibility ?? 'private',
+              });
+              await recovery?.confirm('provider');
+              const createdRemote = this.normalizeRemote(created.cloneUrl);
+              if (createdRemote.identity !== current.remote.identity) {
+                throw new LibraryLifecycleError(
+                  'INIT_PLAN_CHANGED',
+                  'GitHub returned a different repository than the reviewed plan. The created repository may still exist; inspect it before retrying.',
+                );
+              }
+              const advertised = await this.listRemote(createdRemote, git);
+              if (advertised.trim().length > 0) {
+                throw new LibraryLifecycleError(
+                  'REMOTE_NOT_EMPTY',
+                  'The newly created repository was unexpectedly nonempty; refusing to initialize it.',
+                );
+              }
+              const revision = await this.initializeEmptyRemoteUnderLock(
+                createdRemote,
+                current.branch,
+                git,
+                options.signal,
+                recovery,
+              );
+              const changed = await this.persistPlannedLibraryConfig(current, recovery);
+              await recovery?.complete();
+              return {
+                changed,
+                initialized: true,
+                remote: createdRemote,
+                branch: current.branch,
+                revision,
+              };
+            } catch (error) {
+              if (error instanceof LibraryLifecycleError) {
+                const repositoryBoundary =
+                  error.code === 'REMOTE_ACCESS_FAILED'
+                    ? 'The GitHub repository was created before this access check failed and may still exist.'
+                    : 'The GitHub repository was created and may still exist.';
+                throw new LibraryLifecycleError(
+                  error.code,
+                  `${error.message} ${repositoryBoundary} Inspect it with your Git provider before retrying or deleting it.`,
+                  error.details,
+                );
+              }
+              throw new LibraryLifecycleError(
+                'GITHUB_CREATE_FAILED',
+                `GitHub repository initialization failed: ${gitFailureDiagnostic(error)} The GitHub repository was created and may still exist. Inspect it with your Git provider before retrying or deleting it.`,
+              );
+            }
+          }
+
+          const recovery =
+            options.recovery === undefined
+              ? undefined
+              : await InitializationRecoverySession.create(current, options.recovery);
+          const revision = await this.initializeEmptyRemoteUnderLock(
+            current.remote,
+            current.branch,
+            git,
+            options.signal,
+            recovery,
+          );
+          const changed = await this.persistPlannedLibraryConfig(current, recovery);
+          await recovery?.complete();
+          return {
+            changed,
+            initialized: true,
+            remote: current.remote,
+            branch: current.branch,
+            revision,
+          };
+        }, options.signal),
+    );
+  }
+
+  async init(request: LibraryInitRequest): Promise<LibraryInitResult> {
+    const initializationRequest: LibraryInitializationRequest = {
+      kind: 'connect',
+      url: request.url,
       ...(request.branch === undefined ? {} : { branch: request.branch }),
-      access: 'mutation',
-    });
-    const library = await this.validateCachedRevision(remote, cached);
-    if (!library.valid) {
+    };
+    const plan = await this.planInitialization(initializationRequest);
+    if (plan.action === 'initialize-empty' && request.initializeEmpty !== true) {
       throw new LibraryLifecycleError(
-        'INCOMPATIBLE_LIBRARY',
-        'The nonempty remote is not a compatible skill-sync library.',
-        { errors: library.errors },
+        'REMOTE_EMPTY_CONFIRMATION_REQUIRED',
+        'The remote is empty and requires explicit confirmation before initialization.',
+        { currentPlan: plan },
       );
     }
-    const changed = await this.persistLibraryConfig(remote, cached.branch);
-    return {
-      changed,
-      initialized: false,
-      remote,
-      branch: cached.branch,
-      revision: cached.revision,
-    };
+    return await this.applyInitialization(initializationRequest, plan.fingerprint);
   }
 
   async create(request: LibraryCreateRequest): Promise<LibraryInitResult> {
-    const transport = request.transport ?? 'https';
-    const created = await this.github.createRepository({
+    const initializationRequest: LibraryInitializationRequest = {
+      kind: 'create',
       repository: request.repository,
-      transport,
-      visibility: request.visibility ?? 'private',
-    });
-    const remote = this.normalizeRemote(created.cloneUrl);
-    const advertised = await this.listRemote(remote);
-    if (advertised.trim().length > 0) {
-      throw new LibraryLifecycleError(
-        'REMOTE_NOT_EMPTY',
-        'The newly created repository was unexpectedly nonempty; refusing to initialize it.',
-      );
-    }
-    const branch = request.branch ?? 'main';
-    const revision = await this.initializeEmptyRemote(remote, branch);
-    const changed = await this.persistLibraryConfig(remote, branch);
-    return { changed, initialized: true, remote, branch, revision };
+      ...(request.branch === undefined ? {} : { branch: request.branch }),
+      ...(request.transport === undefined ? {} : { transport: request.transport }),
+      ...(request.visibility === undefined ? {} : { visibility: request.visibility }),
+    };
+    const plan = await this.planInitialization(initializationRequest);
+    return await this.applyInitialization(initializationRequest, plan.fingerprint);
   }
 
   async add(request: LibraryAddRequest): Promise<LibraryAddResult> {
@@ -1409,79 +1696,419 @@ export class LibraryLifecycleService {
     return await this.cache.inspect(request);
   }
 
-  private async listRemote(remote: NormalizedGitRemote): Promise<string> {
+  private async listRemote(
+    remote: NormalizedGitRemote,
+    git: LibraryGitPort = this.git,
+  ): Promise<string> {
     try {
-      return (await this.git.run(['ls-remote', '--symref', remote.cloneUrl])).stdout;
+      return (await git.run(['ls-remote', '--symref', remote.cloneUrl])).stdout;
     } catch (error) {
+      const guidance =
+        remote.transport === 'ssh'
+          ? 'For SSH, check that the correct key is loaded and the host is configured in SSH.'
+          : 'For HTTPS, configure a Git credential helper or authenticate with your Git provider (for GitHub, run gh auth login).';
       throw new LibraryLifecycleError(
         'REMOTE_ACCESS_FAILED',
-        `The library remote could not be accessed: ${error instanceof Error ? error.message : String(error)}`,
+        `The library remote could not be accessed. Git reported: ${gitFailureDiagnostic(error)} Verify the repository exists and your account has access. ${guidance}`,
       );
     }
   }
 
-  private async initializeEmptyRemote(
+  private async withInitializationInspection<T>(
+    operation: (git: LibraryGitPort, inspection: string) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    await mkdir(this.inspectionRoot, { recursive: true, mode: 0o700 });
+    const inspection = await mkdtemp(join(this.inspectionRoot, 'skill-sync-init-plan-'));
+    const commandGit: LibraryGitPort =
+      signal === undefined
+        ? this.git
+        : this.git instanceof GitClient
+          ? this.git.withSignal(signal)
+          : {
+              run: async (arguments_, options) =>
+                await this.git.run(arguments_, {
+                  ...options,
+                  signal: options?.signal ?? signal,
+                }),
+            };
+    const git =
+      commandGit instanceof GitClient
+        ? commandGit.withSafetyDirectory(join(inspection, 'git-safety'))
+        : commandGit;
+    try {
+      return await operation(git, inspection);
+    } finally {
+      await rm(inspection, { recursive: true, force: true });
+    }
+  }
+
+  private async prepareInitialization(
+    request: LibraryInitializationRequest,
+    git: LibraryGitPort,
+    inspection: string,
+    signal?: AbortSignal,
+  ): Promise<PreparedLibraryInitialization> {
+    if (request.kind === 'create') {
+      const branch = request.branch ?? 'main';
+      await this.assertInitializationBranch(branch, git);
+      const transport = request.transport ?? 'https';
+      const visibility = request.visibility ?? 'private';
+      const inspected = await this.github.inspectRepository({
+        repository: request.repository,
+        ...(signal === undefined ? {} : { signal }),
+        transport,
+        visibility,
+      });
+      const remote = this.normalizeRemote(inspected.cloneUrl);
+      return {
+        plan: await this.buildInitializationPlan({
+          action: 'create',
+          branch,
+          remote,
+          remoteState: 'available',
+          repository: request.repository,
+          revision: null,
+          validation: null,
+          visibility,
+        }),
+      };
+    }
+
+    if (request.branch !== undefined) {
+      await this.assertInitializationBranch(request.branch, git);
+    }
+    const remote = this.normalizeRemote(request.url);
+    const advertised = await this.listRemote(remote, git);
+    if (advertised.trim().length === 0) {
+      const branch = request.branch ?? 'main';
+      await this.assertInitializationBranch(branch, git);
+      return {
+        plan: await this.buildInitializationPlan({
+          action: 'initialize-empty',
+          branch,
+          remote,
+          remoteState: 'empty',
+          repository: null,
+          revision: null,
+          validation: null,
+          visibility: null,
+        }),
+      };
+    }
+
+    const inspected = await this.inspectRemoteLibrary(
+      remote,
+      advertised,
+      request.branch,
+      git,
+      inspection,
+    );
+    return {
+      plan: await this.buildInitializationPlan({
+        action: 'connect',
+        branch: inspected.branch,
+        remote,
+        remoteState: 'compatible',
+        repository: null,
+        revision: inspected.revision,
+        validation: {
+          groups: inspected.library.groups.length,
+          skills: inspected.library.skills.length,
+        },
+        visibility: null,
+      }),
+      sourceRepositoryDirectory: inspected.repositoryDirectory,
+    };
+  }
+
+  private async buildInitializationPlan(options: {
+    readonly action: LibraryInitPlanAction;
+    readonly branch: string;
+    readonly remote: NormalizedGitRemote;
+    readonly remoteState: LibraryInitPlan['remoteState'];
+    readonly repository: string | null;
+    readonly revision: string | null;
+    readonly validation: LibraryInitPlan['validation'];
+    readonly visibility: GitHubVisibility | null;
+  }): Promise<LibraryInitPlan> {
+    const configuration = await this.plannedLibraryConfiguration(options.remote, options.branch);
+    const effects: LibraryInitPlanEffects = {
+      cache: 'refresh',
+      configuration: configuration.changed ? 'write' : 'none',
+      githubRepository: options.action === 'create' ? 'create' : 'none',
+      remoteLibrary: options.action === 'connect' ? 'none' : 'initialize',
+    };
+    const fingerprint = initPlanFingerprint({
+      action: options.action,
+      branch: options.branch,
+      configuration: { after: configuration.next, before: configuration.previous ?? null },
+      effects,
+      remote: {
+        cloneUrl: options.remote.cloneUrl,
+        identity: options.remote.identity,
+        transport: options.remote.transport,
+      },
+      repository: options.repository,
+      revision: options.revision,
+      validation: options.validation,
+      visibility: options.visibility,
+    });
+    return {
+      action: options.action,
+      applied: false,
+      branch: options.branch,
+      configuration: {
+        beforeFingerprint: initConfigurationFingerprint(configuration.previous),
+        changed: configuration.changed,
+        nextIdentity: options.remote.identity,
+        previousIdentity: configuration.previous?.library?.identity ?? null,
+      },
+      dryRun: true,
+      effects,
+      fingerprint,
+      operation: 'init',
+      remote: options.remote,
+      remoteState: options.remoteState,
+      repository: options.repository,
+      revision: options.revision,
+      validation: options.validation,
+      visibility: options.visibility,
+    };
+  }
+
+  private async plannedLibraryConfiguration(
     remote: NormalizedGitRemote,
     branch: string,
-  ): Promise<string> {
-    return await this.withLock(`lifecycle:${remote.identity}`, async () => {
-      await this.git.run(['check-ref-format', '--branch', branch], { profile: 'content' });
-      const advertised = await this.listRemote(remote);
-      if (advertised.trim().length > 0) {
-        throw new LibraryLifecycleError(
-          'REMOTE_NOT_EMPTY',
-          'The remote advanced before initialization; refusing to overwrite it.',
-        );
-      }
-      await mkdir(this.stagingRoot, { recursive: true, mode: 0o700 });
-      const checkout = await mkdtemp(join(this.stagingRoot, 'initialize-'));
+  ): Promise<{
+    readonly changed: boolean;
+    readonly next: UserConfig;
+    readonly previous?: UserConfig;
+  }> {
+    const previous = await this.config.read();
+    const next: UserConfig = {
+      ...(previous?.defaults === undefined ? {} : { defaults: previous.defaults }),
+      library: {
+        branch,
+        identity: remote.identity,
+        remote: remote.cloneUrl,
+        transport: remote.transport,
+      },
+      schemaVersion: USER_CONFIG_SCHEMA_VERSION,
+    };
+    return {
+      changed: initConfigurationFingerprint(previous) !== initConfigurationFingerprint(next),
+      next,
+      ...(previous === undefined ? {} : { previous }),
+    };
+  }
+
+  private async assertPlannedConfiguration(plan: LibraryInitPlan): Promise<void> {
+    const current = await this.config.read();
+    if (initConfigurationFingerprint(current) !== plan.configuration.beforeFingerprint) {
+      throw new LibraryLifecycleError(
+        'INIT_PLAN_CHANGED',
+        'The saved configuration changed after review. Review the current plan before applying it.',
+      );
+    }
+  }
+
+  private async persistPlannedLibraryConfig(
+    plan: LibraryInitPlan,
+    recovery?: InitializationRecoverySession,
+  ): Promise<boolean> {
+    await this.assertPlannedConfiguration(plan);
+    const configuration = await this.plannedLibraryConfiguration(plan.remote, plan.branch);
+    if (!configuration.changed) return false;
+    try {
+      await recovery?.begin('configuration');
+      await this.config.replace(configuration.next);
+      await recovery?.confirm('configuration');
+    } catch (error) {
       try {
-        await this.git.run(['init', '--quiet', `--initial-branch=${branch}`, checkout], {
-          profile: 'content',
-        });
-        await mkdir(join(checkout, '.skill-sync'), { recursive: true, mode: 0o700 });
-        await writeJsonAtomic(
-          join(checkout, LIBRARY_MANIFEST_PATH),
-          { schemaVersion: LIBRARY_SCHEMA_VERSION },
-          { mode: 0o644 },
+        await this.config.replace(configuration.previous);
+        await recovery?.markRolledBack('configuration');
+      } catch (rollbackError) {
+        recovery?.markRecoveryRequired();
+        throw new RecoveryIntegrityError(
+          'failed-rollback',
+          `The library configuration write failed and the previous configuration could not be restored: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+          { cause: error },
         );
-        const validation = await validateLibrary(checkout);
-        if (!validation.valid) throw validationFailure(validation);
-        await configureCommitIdentity(this.git, checkout);
-        await this.git.run(['add', '--all', '--', '.'], { cwd: checkout, profile: 'content' });
-        await this.git.run(
-          [
-            'commit',
-            '--quiet',
-            '--no-gpg-sign',
-            '--no-verify',
-            '-m',
-            'skill-sync: initialize library',
-          ],
-          { cwd: checkout, profile: 'content' },
-        );
-        const revision = await exactHead(this.git, checkout);
-        await this.git.run(['remote', 'add', 'origin', remote.cloneUrl], {
-          cwd: checkout,
-          profile: 'network',
-        });
-        await this.git.run(
-          ['push', '--porcelain', '--no-verify', 'origin', `HEAD:refs/heads/${branch}`],
-          { cwd: checkout, profile: 'network' },
-        );
-        const cached = await this.cache.refresh({ remote, branch, access: 'mutation' });
-        if (cached.revision !== revision) {
-          throw new LibraryLifecycleError(
-            'LIBRARY_DIVERGED',
-            'The remote advanced immediately after initialization.',
-            { initializedRevision: revision, fetchedRevision: cached.revision },
-          );
-        }
-        return revision;
-      } finally {
-        await rm(checkout, { recursive: true, force: true });
       }
-    });
+      throw new LibraryLifecycleError(
+        'CONFIG_PERSIST_FAILED',
+        `The library was prepared but configuration persistence failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return true;
+  }
+
+  private async assertInitializationBranch(
+    branch: string,
+    git: LibraryGitPort = this.git,
+  ): Promise<void> {
+    try {
+      await git.run(['check-ref-format', '--branch', branch], { profile: 'content' });
+    } catch (error) {
+      throw new LibraryLifecycleError(
+        'LIBRARY_VALIDATION_FAILED',
+        `The initialization branch is invalid: ${gitFailureDiagnostic(error)}`,
+      );
+    }
+  }
+
+  private defaultBranchFromAdvertisement(advertised: string): string {
+    for (const line of advertised.split(/\r?\n/u)) {
+      const match = /^ref:\s+refs\/heads\/(.+)\tHEAD$/u.exec(line);
+      if (match?.[1] !== undefined) return match[1];
+    }
+    throw new LibraryLifecycleError(
+      'REMOTE_ACCESS_FAILED',
+      'The remote did not advertise a default branch. Specify one explicitly with --branch <name>.',
+    );
+  }
+
+  private async inspectRemoteLibrary(
+    remote: NormalizedGitRemote,
+    advertised: string,
+    requestedBranch: string | undefined,
+    git: LibraryGitPort,
+    inspection: string,
+  ): Promise<{
+    readonly branch: string;
+    readonly revision: string;
+    readonly library: LibraryValidationResult;
+    readonly repositoryDirectory: string;
+  }> {
+    const branch = requestedBranch ?? this.defaultBranchFromAdvertisement(advertised);
+    await this.assertInitializationBranch(branch, git);
+    try {
+      const repository = join(inspection, 'repository.git');
+      await git.run(['init', '--quiet', '--bare', repository], { profile: 'content' });
+      await git.run(['remote', 'add', 'origin', remote.cloneUrl], {
+        cwd: repository,
+        profile: 'network',
+      });
+      const remoteReference = `refs/remotes/origin/${branch}`;
+      await git.run(
+        [
+          'fetch',
+          '--force',
+          '--prune',
+          '--no-tags',
+          '--no-recurse-submodules',
+          'origin',
+          `+refs/heads/${branch}:${remoteReference}`,
+        ],
+        { cwd: repository, profile: 'network' },
+      );
+      const resolved = await git.run(
+        ['rev-parse', '--verify', '--end-of-options', `${remoteReference}^{commit}`],
+        { cwd: repository, profile: 'content' },
+      );
+      const revision = resolved.stdout.trim();
+      if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(revision)) {
+        throw new LibraryLifecycleError(
+          'REMOTE_ACCESS_FAILED',
+          'Git did not resolve an exact commit for the initialization plan.',
+        );
+      }
+      const checkout = await createCheckout({
+        git,
+        stagingRoot: inspection,
+        cacheRepository: repository,
+        revision,
+        remote,
+      });
+      const library = await validateLibrary(checkout);
+      if (!library.valid) {
+        throw new LibraryLifecycleError(
+          'INCOMPATIBLE_LIBRARY',
+          'The nonempty remote is not a compatible skill-sync library. Its contents and your saved library configuration were left unchanged. Next: preview a compatible or empty repository with skill-sync init <repository-url> --dry-run, or preview a new one with skill-sync init --create <owner/name> --dry-run.',
+          { errors: library.errors },
+        );
+      }
+      return { branch, revision, library, repositoryDirectory: repository };
+    } catch (error) {
+      if (error instanceof LibraryLifecycleError) throw error;
+      throw new LibraryLifecycleError(
+        'REMOTE_ACCESS_FAILED',
+        `The selected library branch could not be inspected: ${gitFailureDiagnostic(error)}`,
+      );
+    }
+  }
+
+  private async initializeEmptyRemoteUnderLock(
+    remote: NormalizedGitRemote,
+    branch: string,
+    git: LibraryGitPort = this.git,
+    signal?: AbortSignal,
+    recovery?: InitializationRecoverySession,
+  ): Promise<string> {
+    await this.assertInitializationBranch(branch, git);
+    const advertised = await this.listRemote(remote, git);
+    if (advertised.trim().length > 0) {
+      throw new LibraryLifecycleError(
+        'REMOTE_NOT_EMPTY',
+        'The remote advanced before initialization; refusing to overwrite it.',
+      );
+    }
+    await mkdir(this.stagingRoot, { recursive: true, mode: 0o700 });
+    const checkout = await mkdtemp(join(this.stagingRoot, 'initialize-'));
+    try {
+      await git.run(['init', '--quiet', `--initial-branch=${branch}`, checkout], {
+        profile: 'content',
+      });
+      await mkdir(join(checkout, '.skill-sync'), { recursive: true, mode: 0o700 });
+      await writeJsonAtomic(
+        join(checkout, LIBRARY_MANIFEST_PATH),
+        { schemaVersion: LIBRARY_SCHEMA_VERSION },
+        { mode: 0o644 },
+      );
+      const validation = await validateLibrary(checkout);
+      if (!validation.valid) throw validationFailure(validation);
+      await configureCommitIdentity(git, checkout);
+      await git.run(['add', '--all', '--', '.'], { cwd: checkout, profile: 'content' });
+      await git.run(
+        [
+          'commit',
+          '--quiet',
+          '--no-gpg-sign',
+          '--no-verify',
+          '-m',
+          'skill-sync: initialize library',
+        ],
+        { cwd: checkout, profile: 'content' },
+      );
+      const revision = await exactHead(git, checkout);
+      await git.run(['remote', 'add', 'origin', remote.cloneUrl], {
+        cwd: checkout,
+        profile: 'network',
+      });
+      await recovery?.begin('push');
+      await git.run(['push', '--porcelain', '--no-verify', 'origin', `HEAD:refs/heads/${branch}`], {
+        cwd: checkout,
+        profile: 'network',
+      });
+      await recovery?.confirm('push', { expectedRevision: revision });
+      const cached = await this.cache.refresh({
+        remote,
+        branch,
+        access: 'mutation',
+        ...(signal === undefined ? {} : { signal }),
+      });
+      if (cached.revision !== revision) {
+        throw new LibraryLifecycleError(
+          'LIBRARY_DIVERGED',
+          'The remote advanced immediately after initialization.',
+          { initializedRevision: revision, fetchedRevision: cached.revision },
+        );
+      }
+      return revision;
+    } finally {
+      await rm(checkout, { recursive: true, force: true });
+    }
   }
 
   private async validateCachedRevision(
@@ -1505,34 +2132,6 @@ export class LibraryLifecycleService {
     }
   }
 
-  private async persistLibraryConfig(
-    remote: NormalizedGitRemote,
-    branch: string,
-  ): Promise<boolean> {
-    const previous = await this.config.read();
-    const next: UserConfig = {
-      ...(previous?.defaults === undefined ? {} : { defaults: previous.defaults }),
-      library: {
-        branch,
-        identity: remote.identity,
-        remote: remote.cloneUrl,
-        transport: remote.transport,
-      },
-      schemaVersion: USER_CONFIG_SCHEMA_VERSION,
-    };
-    if (JSON.stringify(previous) === JSON.stringify(next)) return false;
-    try {
-      await this.config.replace(next);
-    } catch (error) {
-      await this.config.replace(previous).catch(() => undefined);
-      throw new LibraryLifecycleError(
-        'CONFIG_PERSIST_FAILED',
-        `The library was prepared but configuration persistence failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    return true;
-  }
-
   private async resolveConnection(
     explicitUrl: string | undefined,
     explicitBranch: string | undefined,
@@ -1547,7 +2146,7 @@ export class LibraryLifecycleService {
     if (config?.library === undefined) {
       throw new LibraryLifecycleError(
         'REMOTE_ACCESS_FAILED',
-        'No default skill library is configured. Run init first.',
+        'No default skill library is configured. Preview setup with skill-sync init <repository-url> --dry-run or skill-sync init --create <owner/name> --dry-run, then run the exact --expect-plan command printed by the preview.',
       );
     }
     const branch = explicitBranch ?? config.library.branch;

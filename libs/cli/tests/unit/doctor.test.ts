@@ -5,14 +5,15 @@ import { join, relative } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import {
-  formatDoctorReport,
-  runDoctor,
-  type DoctorCommandRunner,
-  type DoctorReport,
-} from '../../src/application/doctor.js';
+import { runDoctor, type DoctorCommandRunner } from '../../src/application/doctor.js';
 import { EXIT_CODES } from '../../src/domain/result.js';
 import type { ApplicationPaths } from '../../src/infrastructure/config.js';
+import { ProcessRunError } from '../../src/infrastructure/process-runner.js';
+import {
+  acquireAdvisoryLock,
+  createOperationJournal,
+  createRecoverableBackup,
+} from '../../src/infrastructure/transactions.js';
 
 const REMOTE = 'https://github.com/example/skills.git';
 const IDENTITY = 'github.com/example/skills';
@@ -148,8 +149,88 @@ describe('doctor diagnostics', () => {
       expect.objectContaining({ id: 'github-auth', status: 'skipped' }),
       expect.objectContaining({ id: 'library-access', status: 'skipped' }),
     ]);
+    expect(report.checks.find((check) => check.id === 'recovery-state')).toMatchObject({
+      status: 'pass',
+    });
     expect(calls.some((call) => call.includes('ls-remote'))).toBe(false);
     expect(calls.some((call) => call.includes('auth status'))).toBe(false);
+    expect(await snapshot(root)).toEqual(before);
+  });
+
+  it('reports all valid recovery evidence without changing it', async () => {
+    const root = await makeTemporaryDirectory('skill-sync-doctor-recovery-');
+    const project = join(root, 'project');
+    const paths = applicationPaths(root);
+    await mkdir(project);
+    await writeConfiguration(paths);
+    await writeValidCache(paths);
+    const lock = await acquireAdvisoryLock(join(paths.locksDirectory, 'project.lock'), {
+      operationId: 'active-project-operation',
+      scope: { id: 'project-example', kind: 'project' },
+    });
+    await createOperationJournal(join(paths.journalsDirectory, 'project-example'), {
+      kind: 'install',
+      operationId: 'interrupted-install',
+    });
+    const source = join(project, 'source.txt');
+    await writeFile(source, 'recoverable content\n');
+    await createRecoverableBackup({
+      backupRoot: join(paths.backupsDirectory, 'project-example'),
+      entries: [{ path: source, relativePath: 'source.txt' }],
+      operationId: 'install-backup',
+      projectRoot: project,
+    });
+    const before = await snapshot(root);
+
+    const report = await runDoctor({
+      env: {},
+      nodeVersion: '24.4.0',
+      offline: true,
+      paths,
+      project,
+      runCommand: successfulRunner([]),
+    });
+
+    expect(report.checks.find((check) => check.id === 'recovery-state')).toMatchObject({
+      message:
+        'Application recovery evidence needs review: 1 lock(s), 1 incomplete journal(s), 1 backup(s), and 0 validation problem(s).',
+      remediation:
+        'Run skill-sync recovery list to get a stable record ID, then skill-sync recovery inspect <id>.',
+      scope: 'local',
+      status: 'warning',
+    });
+    expect(report.exitCode).toBe(EXIT_CODES.success);
+    expect(await snapshot(root)).toEqual(before);
+    await lock.release();
+  });
+
+  it('fails locally on malformed recovery evidence and preserves its exact bytes', async () => {
+    const root = await makeTemporaryDirectory('skill-sync-doctor-invalid-recovery-');
+    const project = join(root, 'project');
+    const paths = applicationPaths(root);
+    await mkdir(project);
+    await mkdir(paths.locksDirectory, { recursive: true });
+    const malformed = join(paths.locksDirectory, 'malformed.lock');
+    await writeFile(malformed, '{"broken":true}\n');
+    const before = await snapshot(root);
+
+    const report = await runDoctor({
+      env: {},
+      nodeVersion: '24.4.0',
+      offline: true,
+      paths,
+      project,
+      runCommand: successfulRunner([]),
+    });
+
+    expect(report.checks.find((check) => check.id === 'recovery-state')).toMatchObject({
+      remediation:
+        'Run skill-sync recovery list to get a stable record ID, then skill-sync recovery inspect <id>.',
+      scope: 'local',
+      status: 'fail',
+    });
+    expect(report.exitCode).toBe(EXIT_CODES.validation);
+    expect(await readFile(malformed, 'utf8')).toBe('{"broken":true}\n');
     expect(await snapshot(root)).toEqual(before);
   });
 
@@ -184,7 +265,6 @@ describe('doctor diagnostics', () => {
       ]),
     );
     expect(report.exitCode).toBe(EXIT_CODES.validation);
-    expect(formatDoctorReport(report)).toContain('Next actions');
   });
 
   it('uses repository status when the only failing check is remote access', async () => {
@@ -217,70 +297,63 @@ describe('doctor diagnostics', () => {
     });
   });
 
-  it('formats a scannable healthy report without ANSI styling by default', () => {
-    const report: DoctorReport = {
-      checks: [
-        { id: 'node', status: 'pass', scope: 'local', message: 'Node.js is ready.' },
-        { id: 'library-access', status: 'pass', scope: 'remote', message: 'Library is reachable.' },
-      ],
-      exitCode: EXIT_CODES.success,
-      offline: false,
-      projectRoot: '/project',
-      scope: 'project' as const,
-    };
+  it('maps shared-runner failures and propagates noninteractive cancellation policy', async () => {
+    const root = await makeTemporaryDirectory('skill-sync-doctor-process-policy-');
+    const project = join(root, 'project');
+    const paths = applicationPaths(root);
+    await mkdir(project);
+    const controller = new AbortController();
+    const optionsSeen: Parameters<DoctorCommandRunner>[2][] = [];
 
-    const formatted = formatDoctorReport(report);
+    const report = await runDoctor({
+      commandTimeoutMs: 41,
+      env: { GIT_DIR: '/hostile' },
+      nodeVersion: '24.4.0',
+      paths,
+      project,
+      runCommand: (executable, _arguments, options) => {
+        optionsSeen.push(options);
+        if (executable === 'git') {
+          throw new ProcessRunError(
+            'spawn-failed',
+            'Could not start git.',
+            { exitCode: null, stderr: '', stdout: '' },
+            { cause: Object.assign(new Error('missing'), { code: 'ENOENT' }) },
+          );
+        }
+        throw new ProcessRunError('timeout', 'Child process gh stopped: timeout.', {
+          exitCode: null,
+          stderr: 'token=top-secret timed out',
+          stdout: '',
+        });
+      },
+      signal: controller.signal,
+    });
 
-    expect(formatted).toContain('skill-sync doctor · Your skill-sync setup looks healthy');
-    expect(formatted).toContain('Scope: project (/project)');
-    expect(formatted).toContain('Remote checks: included');
-    expect(formatted).toContain('\nPASS (2)');
-    expect(formatted).not.toContain('PASS PASS');
-    expect(formatted).toContain('Node.js');
-    expect(formatted).toContain('Library access · remote');
-    expect(formatted).not.toContain('Next actions');
-    expect(formatted).not.toContain('\u001B[');
-  });
-
-  it('formats blocked offline reports with colour and numbered remedies when requested', () => {
-    const report: DoctorReport = {
-      checks: [
-        {
-          id: 'project-state',
-          status: 'fail',
-          scope: 'local',
-          message: 'State is invalid.',
-          remediation: 'Restore the manifest and lock pair.',
-        },
-        {
-          id: 'github-cli',
-          status: 'warning',
-          scope: 'local',
-          message: 'GitHub CLI is unavailable.',
-          remediation: 'Install gh before using init --create.',
-        },
-        {
-          id: 'library-access',
-          status: 'skipped',
-          scope: 'remote',
-          message: 'Skipped while offline.',
-          remediation: 'Run without --offline to check access.',
-        },
-      ],
-      exitCode: EXIT_CODES.validation,
-      offline: true,
-      scope: 'global' as const,
-      globalStateDirectory: '/state/global',
-    };
-
-    const formatted = formatDoctorReport(report, { color: true });
-
-    expect(formatted).toContain('Doctor found blocking issues');
-    expect(formatted).toContain('Scope: global (/state/global)');
-    expect(formatted).toContain('Remote checks: skipped (--offline)');
-    expect(formatted).toContain('Next actions');
-    expect(formatted).toContain('1. Project managed state — Restore the manifest and lock pair.');
-    expect(formatted).toContain('2. GitHub CLI — Install gh before using init --create.');
-    expect(formatted).toContain('\u001B[');
+    expect(report.checks.find((check) => check.id === 'git')).toMatchObject({
+      message: 'Git is not installed or not on PATH.',
+      status: 'fail',
+    });
+    expect(report.checks.find((check) => check.id === 'github-cli')).toMatchObject({
+      message: 'GitHub CLI could not be executed: token=[REDACTED] timed out',
+      status: 'warning',
+    });
+    expect(optionsSeen).toHaveLength(2);
+    expect(optionsSeen).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          signal: controller.signal,
+          timeoutMs: 41,
+        }),
+      ]),
+    );
+    for (const options of optionsSeen) {
+      expect(options?.env).toMatchObject({
+        GCM_INTERACTIVE: 'never',
+        GH_PROMPT_DISABLED: '1',
+        GIT_TERMINAL_PROMPT: '0',
+      });
+      expect(options?.env?.GIT_DIR).toBeUndefined();
+    }
   });
 });

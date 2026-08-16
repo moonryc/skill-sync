@@ -3,6 +3,7 @@ import { join, relative, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import type { CatalogSkillRecord } from './catalog.js';
+import { installPlanFingerprint, type ReviewedInstallOriginal } from './install-plan.js';
 import { preflightTargets, type ProjectionPlan } from './target-preflight.js';
 import { inspectRegularFileTree, sha256TreeDigest } from '../domain/digest.js';
 import { validateSkillDirectory } from '../domain/library.js';
@@ -24,11 +25,11 @@ import {
 import { EXIT_CODES, SkillSyncError } from '../domain/result.js';
 import { updateManagedGitignore, type GitignoreUpdate } from '../infrastructure/gitignore.js';
 import {
-  assertProjectStatePair,
   readProjectLock,
   readProjectManifest,
   resolveContainedProjectPath,
 } from '../infrastructure/project-state.js';
+import { loadManagedStatePair } from '../infrastructure/managed-state.js';
 import { stableJsonStringify } from '../infrastructure/stable-json.js';
 import {
   acquireAdvisoryLock,
@@ -36,8 +37,10 @@ import {
   createStagingDirectory,
   replacePathsAtomically,
   stageRegularPath,
+  transactionContentDigest,
   type AtomicReplacement,
 } from '../infrastructure/transactions.js';
+import type { OperationGuard } from '../runtime/operation-guard.js';
 import { TargetRegistry, type TargetName } from '../targets/index.js';
 
 export interface ProjectMutationStorage {
@@ -78,6 +81,7 @@ export interface ProjectStatePlan {
 export interface InstallPlan {
   readonly applied: boolean;
   readonly dryRun: boolean;
+  readonly fingerprint: string;
   readonly gitignore: GitignoreUpdate;
   readonly libraryRevision: string;
   readonly operation: 'install';
@@ -108,10 +112,12 @@ export interface UninstallPlan {
 
 export interface InstallProjectSkillsOptions {
   readonly dryRun?: boolean;
+  readonly expectedPlanFingerprint?: string;
   readonly gitignore?: ProjectManifest['gitignore'];
   readonly libraryIdentity: string;
   readonly libraryRevision: string;
   readonly operationId?: string;
+  readonly operationGuard?: OperationGuard;
   readonly projectRoot: string;
   readonly registry?: TargetRegistry;
   readonly skills: readonly ResolvedInstallSkill[];
@@ -124,6 +130,7 @@ export interface UninstallProjectSkillsOptions {
   readonly discardLocal?: boolean;
   readonly dryRun?: boolean;
   readonly operationId?: string;
+  readonly operationGuard?: OperationGuard;
   readonly projectRoot: string;
   readonly skillIds: readonly string[];
   readonly storage?: ProjectMutationStorage;
@@ -139,6 +146,7 @@ export interface AdoptProjectSkillOptions {
   readonly libraryIdentity: string;
   readonly libraryRevision: string;
   readonly operationId?: string;
+  readonly operationGuard?: OperationGuard;
   readonly projectRoot: string;
   readonly registry?: TargetRegistry;
   readonly skill: ResolvedAdoptSkill;
@@ -179,6 +187,7 @@ interface InstallBuild {
   readonly mutations: readonly InstallMutation[];
   readonly nextLock: ProjectLock;
   readonly nextManifest: ProjectManifest;
+  readonly originalDigests: ReadonlyMap<string, string | null>;
   readonly plan: InstallPlan;
 }
 
@@ -243,33 +252,14 @@ function assertUniqueSelection(selection: readonly { readonly id: string }[]): v
 }
 
 async function readState(projectRoot: string): Promise<ProjectStateSnapshot> {
-  const [manifest, lock] = await Promise.all([
-    readProjectManifest(projectRoot),
-    readProjectLock(projectRoot),
-  ]);
-  if ((manifest === undefined) !== (lock === undefined)) {
-    throw projectError(
-      'INCOMPLETE_PROJECT_STATE',
-      `Both ${PROJECT_MANIFEST_FILENAME} and ${PROJECT_LOCK_FILENAME} must be present together.`,
-      EXIT_CODES.validation,
-    );
-  }
-  if (manifest !== undefined && lock !== undefined) {
-    assertProjectStatePair(manifest, lock);
-    const lockedIds = new Set(lock.skills.map((skill) => skill.id));
-    const missingLockEntries = manifest.skills
-      .map((skill) => skill.id)
-      .filter((id) => !lockedIds.has(id));
-    if (missingLockEntries.length > 0 || manifest.skills.length !== lock.skills.length) {
-      throw projectError(
-        'INCOMPLETE_PROJECT_STATE',
-        'Every desired skill must have exactly one resolved lock entry.',
-        EXIT_CODES.validation,
-        { missingLockEntries },
-      );
-    }
-  }
-  return { lock, manifest };
+  const snapshot = await loadManagedStatePair({
+    readLock: async () => await readProjectLock(projectRoot),
+    readManifest: async () => await readProjectManifest(projectRoot),
+    resolveDestination: async (projection) =>
+      await resolveContainedProjectPath(projectRoot, projection.destination),
+    scope: 'project',
+  });
+  return { lock: snapshot.lock, manifest: snapshot.manifest };
 }
 
 function assertLibraryIdentity(snapshot: ProjectStateSnapshot, identity: string): void {
@@ -427,6 +417,39 @@ function managedDestinations(manifest: ProjectManifest): readonly string[] {
         ),
       )
     : [];
+}
+
+interface ProjectInstallOriginal extends ReviewedInstallOriginal {
+  readonly path: string;
+}
+
+async function originalDigest(path: string): Promise<string | null> {
+  try {
+    return await transactionContentDigest(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function inspectInstallOriginals(
+  entries: readonly { readonly destination: string; readonly path: string }[],
+): Promise<readonly ProjectInstallOriginal[]> {
+  return await Promise.all(
+    [...entries]
+      .sort((left, right) => left.destination.localeCompare(right.destination))
+      .map(async (entry) => ({
+        ...entry,
+        digest: await originalDigest(entry.path),
+      })),
+  );
+}
+
+function requiredOriginalDigest(build: InstallBuild, path: string): string | null {
+  if (!build.originalDigests.has(path)) {
+    throw new Error(`Install build is missing an original digest for ${path}.`);
+  }
+  return build.originalDigests.get(path) ?? null;
 }
 
 async function buildInstall(options: InstallProjectSkillsOptions): Promise<InstallBuild> {
@@ -619,15 +642,57 @@ async function buildInstall(options: InstallProjectSkillsOptions): Promise<Insta
     ...(lockChanged ? [PROJECT_LOCK_FILENAME] : []),
     ...(gitignore.changed ? ['.gitignore'] : []),
   ]);
+  const originals = await inspectInstallOriginals([
+    ...mutations.map((mutation) => ({
+      destination: mutation.destinationRelative,
+      path: mutation.destination,
+    })),
+    ...(manifestChanged
+      ? [
+          {
+            destination: PROJECT_MANIFEST_FILENAME,
+            path: join(projectRoot, PROJECT_MANIFEST_FILENAME),
+          },
+        ]
+      : []),
+    ...(lockChanged
+      ? [
+          {
+            destination: PROJECT_LOCK_FILENAME,
+            path: join(projectRoot, PROJECT_LOCK_FILENAME),
+          },
+        ]
+      : []),
+    ...(gitignore.changed ? [{ destination: '.gitignore', path: gitignore.path }] : []),
+  ]);
+  const fingerprint = installPlanFingerprint({
+    gitignore: { after: gitignore.after, before: gitignore.before },
+    libraryIdentity: options.libraryIdentity,
+    libraryRevision: options.libraryRevision,
+    location: projectRoot,
+    originals: originals.map(({ destination, digest }) => ({ destination, digest })),
+    scope: 'project',
+    skills: skillPlans,
+    state: {
+      after: { lock: nextLock, manifest: nextManifest },
+      before: {
+        lock: snapshot.lock ?? null,
+        manifest: snapshot.manifest ?? null,
+      },
+    },
+    writes,
+  });
 
   return {
     gitignore,
     mutations,
     nextLock,
     nextManifest,
+    originalDigests: new Map(originals.map((original) => [original.path, original.digest])),
     plan: {
       applied: false,
       dryRun: options.dryRun === true,
+      fingerprint,
       gitignore,
       libraryRevision: options.libraryRevision,
       operation: 'install',
@@ -657,8 +722,11 @@ function requireStorage(storage: ProjectMutationStorage | undefined): ProjectMut
 export async function installProjectSkills(
   options: InstallProjectSkillsOptions,
 ): Promise<InstallPlan> {
-  const initial = await buildInstall(options);
-  if (options.dryRun === true || initial.plan.writes.length === 0) return initial.plan;
+  if (options.dryRun === true) return (await buildInstall(options)).plan;
+  if (options.expectedPlanFingerprint === undefined) {
+    const initial = await buildInstall(options);
+    if (initial.plan.writes.length === 0) return initial.plan;
+  }
 
   const storage = requireStorage(options.storage);
   const operationId = options.operationId ?? `install-${randomUUID()}`;
@@ -666,6 +734,22 @@ export async function installProjectSkills(
   let stagingDirectory: string | undefined;
   try {
     const build = await buildInstall(options);
+    if (
+      options.expectedPlanFingerprint !== undefined &&
+      build.plan.fingerprint !== options.expectedPlanFingerprint
+    ) {
+      throw projectError(
+        'INSTALL_PLAN_CHANGED',
+        'The project install plan changed after review; review the new plan before applying it.',
+        EXIT_CODES.conflict,
+        {
+          actualFingerprint: build.plan.fingerprint,
+          expectedFingerprint: options.expectedPlanFingerprint,
+          location: build.plan.projectRoot,
+          scope: 'project',
+        },
+      );
+    }
     if (build.plan.writes.length === 0) return build.plan;
     stagingDirectory = await createStagingDirectory(storage.stagingRoot, operationId);
     const stagedBySkill = new Map<string, string>();
@@ -692,6 +776,7 @@ export async function installProjectSkills(
       replacements.push({
         action: 'replace',
         destinationPath: mutation.destination,
+        expectedOriginalDigest: requiredOriginalDigest(build, mutation.destination),
         stagedPath: staged,
       });
     }
@@ -702,6 +787,10 @@ export async function installProjectSkills(
       replacements.push({
         action: 'replace',
         destinationPath: join(build.plan.projectRoot, PROJECT_MANIFEST_FILENAME),
+        expectedOriginalDigest: requiredOriginalDigest(
+          build,
+          join(build.plan.projectRoot, PROJECT_MANIFEST_FILENAME),
+        ),
         stagedPath: path,
       });
     }
@@ -711,6 +800,10 @@ export async function installProjectSkills(
       replacements.push({
         action: 'replace',
         destinationPath: join(build.plan.projectRoot, PROJECT_LOCK_FILENAME),
+        expectedOriginalDigest: requiredOriginalDigest(
+          build,
+          join(build.plan.projectRoot, PROJECT_LOCK_FILENAME),
+        ),
         stagedPath: path,
       });
     }
@@ -720,6 +813,7 @@ export async function installProjectSkills(
       replacements.push({
         action: 'replace',
         destinationPath: build.gitignore.path,
+        expectedOriginalDigest: requiredOriginalDigest(build, build.gitignore.path),
         stagedPath: path,
       });
     }
@@ -728,7 +822,9 @@ export async function installProjectSkills(
       journalDirectory: storage.journalDirectory,
       kind: 'install',
       operationId,
+      ...(options.operationGuard === undefined ? {} : { operationGuard: options.operationGuard }),
       replacements,
+      reviewedPlanFingerprint: build.plan.fingerprint,
       root: build.plan.projectRoot,
     });
     return { ...build.plan, applied: true };
@@ -954,6 +1050,7 @@ export async function adoptProjectSkill(
       journalDirectory: storage.journalDirectory,
       kind: 'adopt',
       operationId,
+      ...(options.operationGuard === undefined ? {} : { operationGuard: options.operationGuard }),
       replacements: [
         {
           action: 'replace',
@@ -1177,6 +1274,7 @@ export async function uninstallProjectSkills(
       journalDirectory: storage.journalDirectory,
       kind: 'uninstall',
       operationId,
+      ...(options.operationGuard === undefined ? {} : { operationGuard: options.operationGuard }),
       replacements,
       root: build.plan.projectRoot,
     });

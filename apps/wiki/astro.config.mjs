@@ -49,6 +49,7 @@ export default defineConfig({
             'reference/library-commands',
             'reference/project-commands',
             'reference/inspection',
+            'reference/recovery-commands',
             'reference/configuration',
           ],
         },

@@ -3,8 +3,10 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
+  gitFailureDiagnostic,
   GitClient,
   GitExecutionError,
+  GIT_FAILURE_DIAGNOSTIC_MAX_LENGTH,
   GitRemoteUrlError,
   normalizeGitRemote,
   redactGitCredentials,
@@ -70,6 +72,25 @@ describe('Git remote normalization', () => {
     expect(redacted).toContain('[REDACTED]');
     expect(redacted).toContain('github.com/example/skills.git');
   });
+
+  it('extracts a bounded terminal-safe Git failure reason without credentials', () => {
+    const secret = 'top-secret-value';
+    const error = new GitExecutionError({
+      code: 'GIT_EXECUTION_FAILED',
+      command: ['git', 'ls-remote'],
+      message: 'Child process git exited with code 128.',
+      stderr: `fatal: repository not found\n\u001b[31mauthorization=${secret}\u001b[0m ${'x'.repeat(800)}`,
+    });
+
+    const diagnostic = gitFailureDiagnostic(error);
+
+    expect(diagnostic).toContain('fatal: repository not found');
+    expect(diagnostic).toContain('authorization=[REDACTED]');
+    expect(diagnostic).not.toContain(secret);
+    expect(diagnostic).not.toContain('\u001b');
+    expect(diagnostic).not.toContain('\n');
+    expect(diagnostic.length).toBeLessThanOrEqual(GIT_FAILURE_DIAGNOSTIC_MAX_LENGTH);
+  });
 });
 
 describe('safe Git execution', () => {
@@ -118,8 +139,10 @@ describe('safe Git execution', () => {
   it('isolates system and global filters for content materialization', async () => {
     await withTempDirectory('skill-sync-git-content-', async (directory) => {
       let environment: NodeJS.ProcessEnv | undefined;
+      let environmentOverrides: NodeJS.ProcessEnv | undefined;
       const runner: GitProcessRunner = (_executable, _arguments, options) => {
         environment = options.env;
+        environmentOverrides = options.envOverrides;
         return Promise.resolve({ stdout: '', stderr: '' });
       };
       const client = new GitClient({
@@ -132,6 +155,31 @@ describe('safe Git execution', () => {
       expect(environment?.GIT_CONFIG_NOSYSTEM).toBe('1');
       expect(environment?.GIT_CONFIG_GLOBAL).toContain('global-empty.gitconfig');
       expect(environment?.GIT_LFS_SKIP_SMUDGE).toBe('1');
+      expect(environmentOverrides).toEqual({
+        GIT_CONFIG_GLOBAL: environment?.GIT_CONFIG_GLOBAL,
+        GIT_CONFIG_NOSYSTEM: '1',
+      });
+    });
+  });
+
+  it('keeps a command cancellation signal when initialization changes its safety directory', async () => {
+    await withTempDirectory('skill-sync-git-signal-', async (directory) => {
+      const controller = new AbortController();
+      let receivedSignal: AbortSignal | undefined;
+      const runner: GitProcessRunner = (_executable, _arguments, options) => {
+        receivedSignal = options.signal;
+        return Promise.resolve({ stdout: '', stderr: '' });
+      };
+      const client = new GitClient({
+        processRunner: runner,
+        safetyDirectory: join(directory, 'original-safety'),
+      })
+        .withSignal(controller.signal)
+        .withSafetyDirectory(join(directory, 'inspection-safety'));
+
+      await client.run(['status', '--porcelain'], { profile: 'content' });
+
+      expect(receivedSignal).toBe(controller.signal);
     });
   });
 

@@ -1,13 +1,22 @@
-import { execFile } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+import { redactSecrets } from '../domain/result.js';
+import { ProcessRunError, runProcess } from './process-runner.js';
 
 const REDACTION_MARKER = '[REDACTED]';
 const URL_WITH_AUTHORITY_PATTERN = /\b(?:https?|ssh):\/\/[^\s'"<>]+/giu;
 const SECRET_ASSIGNMENT_PATTERN =
   /\b(password|passwd|token|access_token|oauth_token|authorization)=([^\s&;]+)/giu;
 const SCP_PASSWORD_PATTERN = /\b[^\s:@/]+:[^\s@/]+@([^\s:/]+):([^\s]+)/gu;
+const ANSI_ESCAPE_SEQUENCE_PATTERN =
+  // eslint-disable-next-line no-control-regex -- Git diagnostics must be inert before display.
+  /\u001b(?:\[[0-?]*[ -/]*[@-~]|\][^\u0007\u001b]*(?:\u0007|\u001b\\))/gu;
+// eslint-disable-next-line no-control-regex -- Remaining terminal controls must be removed.
+const TERMINAL_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f]/gu;
+
+export const GIT_FAILURE_DIAGNOSTIC_MAX_LENGTH = 480;
 
 const FORBIDDEN_GIT_ENVIRONMENT_KEYS = [
   'GIT_ALTERNATE_OBJECT_DIRECTORIES',
@@ -249,6 +258,10 @@ export interface GitProcessResult {
 export interface GitProcessOptions {
   readonly cwd?: string;
   readonly env: NodeJS.ProcessEnv;
+  /** Safety values selected by the Git adapter, not inherited from the parent process. */
+  readonly envOverrides?: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
 }
 
 export type GitProcessRunner = (
@@ -257,28 +270,35 @@ export type GitProcessRunner = (
   options: GitProcessOptions,
 ) => Promise<GitProcessResult>;
 
-const defaultProcessRunner: GitProcessRunner = async (executable, arguments_, options) =>
-  await new Promise<GitProcessResult>((resolve, reject) => {
-    const childOptions = {
-      env: options.env,
-      windowsHide: true,
+const defaultProcessRunner: GitProcessRunner = async (executable, arguments_, options) => {
+  try {
+    return await runProcess({
+      arguments: arguments_,
       ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-    };
-    execFile(executable, [...arguments_], childOptions, (error, stdout, stderr) => {
-      if (error !== null) {
-        Object.assign(error, { stdout, stderr });
-        reject(error instanceof Error ? error : new Error('Git exited unsuccessfully.'));
-        return;
-      }
-      resolve({ stdout, stderr });
+      env: options.env,
+      ...(options.envOverrides === undefined ? {} : { envOverrides: options.envOverrides }),
+      executable,
+      ...(options.signal === undefined ? {} : { signal: options.signal }),
+      ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     });
-  });
+  } catch (error) {
+    if (error instanceof ProcessRunError) {
+      Object.assign(error, {
+        code: error.output.exitCode ?? error.reason,
+        stderr: error.output.stderr,
+        stdout: error.output.stdout,
+      });
+    }
+    throw error;
+  }
+};
 
 export interface GitClientOptions {
   readonly executable?: string;
   readonly processRunner?: GitProcessRunner;
   readonly safetyDirectory?: string;
   readonly environment?: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
 }
 
 export interface GitRunOptions {
@@ -289,6 +309,8 @@ export interface GitRunOptions {
    */
   readonly profile?: 'network' | 'content';
   readonly environment?: NodeJS.ProcessEnv;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs?: number;
 }
 
 export type GitExecutionErrorCode = 'GIT_ARGUMENT_REJECTED' | 'GIT_EXECUTION_FAILED';
@@ -343,6 +365,26 @@ export class GitExecutionError extends Error {
       stdout: this.stdout,
     };
   }
+}
+
+/** Extract a short, credential-free, terminal-inert reason from a failed Git process. */
+export function gitFailureDiagnostic(error: unknown): string {
+  const stderr = error instanceof GitExecutionError ? error.stderr : stringField(error, 'stderr');
+  const raw = stderr.trim() || (error instanceof Error ? error.message : String(error));
+  const safe = redactSecrets(
+    redactGitCredentials(
+      raw
+        .replace(ANSI_ESCAPE_SEQUENCE_PATTERN, '')
+        .replace(/[\r\n\t]+/gu, ' ')
+        .replace(TERMINAL_CONTROL_PATTERN, ''),
+    ),
+  )
+    .replace(/\s+/gu, ' ')
+    .trim();
+  const reason = safe || 'Git exited unsuccessfully.';
+  return reason.length <= GIT_FAILURE_DIAGNOSTIC_MAX_LENGTH
+    ? reason
+    : `${reason.slice(0, GIT_FAILURE_DIAGNOSTIC_MAX_LENGTH - 1).trimEnd()}…`;
 }
 
 function validateGitArguments(arguments_: readonly string[], profile: 'network' | 'content'): void {
@@ -424,12 +466,36 @@ export class GitClient {
   private readonly processRunner: GitProcessRunner;
   private readonly safetyDirectory: string;
   private readonly baseEnvironment: NodeJS.ProcessEnv;
+  private readonly signal: AbortSignal | undefined;
 
   constructor(options: GitClientOptions = {}) {
     this.executable = options.executable ?? 'git';
     this.processRunner = options.processRunner ?? defaultProcessRunner;
     this.safetyDirectory = options.safetyDirectory ?? join(tmpdir(), 'skill-sync-git-safety');
     this.baseEnvironment = { ...process.env, ...options.environment };
+    this.signal = options.signal;
+  }
+
+  /** Preserve the configured runner/environment while isolating generated Git safety files. */
+  withSafetyDirectory(safetyDirectory: string): GitClient {
+    return new GitClient({
+      environment: this.baseEnvironment,
+      executable: this.executable,
+      processRunner: this.processRunner,
+      safetyDirectory,
+      ...(this.signal === undefined ? {} : { signal: this.signal }),
+    });
+  }
+
+  /** Preserve the configured runner/environment while binding one command cancellation signal. */
+  withSignal(signal: AbortSignal): GitClient {
+    return new GitClient({
+      environment: this.baseEnvironment,
+      executable: this.executable,
+      processRunner: this.processRunner,
+      safetyDirectory: this.safetyDirectory,
+      signal,
+    });
   }
 
   async run(arguments_: readonly string[], options: GitRunOptions = {}): Promise<GitProcessResult> {
@@ -477,11 +543,22 @@ export class GitClient {
       environment.GIT_CONFIG_NOSYSTEM = '1';
       environment.GIT_CONFIG_GLOBAL = join(this.safetyDirectory, 'global-empty.gitconfig');
     }
+    const envOverrides =
+      profile === 'content'
+        ? {
+            GIT_CONFIG_GLOBAL: environment.GIT_CONFIG_GLOBAL,
+            GIT_CONFIG_NOSYSTEM: environment.GIT_CONFIG_NOSYSTEM,
+          }
+        : undefined;
+    const signal = options.signal ?? this.signal;
 
     try {
       return await this.processRunner(this.executable, safeArguments, {
         env: environment,
+        ...(envOverrides === undefined ? {} : { envOverrides }),
         ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+        ...(signal === undefined ? {} : { signal }),
+        ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
       });
     } catch (error) {
       const rawExitCode = errorField(error, 'code');

@@ -10,6 +10,7 @@ import {
   SkillSyncError,
   type StructuredError,
 } from '../domain/result.js';
+import { OperationGuard } from './operation-guard.js';
 
 type FailedCommandResult = Extract<CommandResult<unknown>, { readonly ok: false }>;
 
@@ -33,7 +34,11 @@ export const nodeRuntimeSignalSource: RuntimeSignalSource = {
 export interface RuntimeBoundaryDiagnostic {
   readonly level: 'warning' | 'error';
   readonly code:
-    'CANCELLED' | 'INTERNAL_ERROR' | 'RECOVERY_JOURNAL_FAILED' | 'RECOVERY_ROLLBACK_FAILED';
+    | 'CANCELLED'
+    | 'INTERNAL_ERROR'
+    | 'POST_COMMIT_INTERRUPTION'
+    | 'RECOVERY_JOURNAL_FAILED'
+    | 'RECOVERY_ROLLBACK_FAILED';
   readonly message: string;
 }
 
@@ -61,6 +66,7 @@ export interface RuntimeRecoveryRegistration {
 }
 
 export interface RuntimeBoundaryContext {
+  readonly operationGuard: OperationGuard;
   readonly signal: AbortSignal;
   readonly registerRecovery: (
     participant: RuntimeRecoveryParticipant,
@@ -147,6 +153,34 @@ function cancellationResult(signal: RuntimeSignal | null): FailedCommandResult {
   };
 }
 
+function recoveryRequiredResult(): FailedCommandResult {
+  return sanitizeFailure({
+    errors: [
+      {
+        code: 'RECOVERY_REQUIRED',
+        message:
+          'The operation ended at an ambiguous commit boundary. Run skill-sync recovery list, then inspect the reported record before retrying.',
+      },
+    ],
+    exitCode: EXIT_CODES.conflict,
+    ok: false,
+  });
+}
+
+function postCommitInterruptionResult(): FailedCommandResult {
+  return sanitizeFailure({
+    errors: [
+      {
+        code: 'POST_COMMIT_INTERRUPTION',
+        message:
+          'The operation committed before completion was interrupted. Verify current state before retrying; if recovery evidence is reported, run skill-sync recovery list.',
+      },
+    ],
+    exitCode: EXIT_CODES.internal,
+    ok: false,
+  });
+}
+
 function failedResultFromUnknown(error: unknown): FailedCommandResult {
   const result = resultFromUnknown(error);
   if (!result.ok) return result;
@@ -175,6 +209,7 @@ export async function runWithRuntimeBoundary<T>(
   const signalSource = options.signalSource ?? nodeRuntimeSignalSource;
   const configuredSignals = [...new Set<RuntimeSignal>(options.signals ?? ['SIGINT', 'SIGTERM'])];
   const abortController = new AbortController();
+  const operationGuard = new OperationGuard(abortController.signal);
   const participants = new Map<symbol, RuntimeRecoveryParticipant>();
   const runtimeState: { receivedSignal: RuntimeSignal | null } = { receivedSignal: null };
 
@@ -195,6 +230,7 @@ export async function runWithRuntimeBoundary<T>(
   }
 
   const context: RuntimeBoundaryContext = {
+    operationGuard,
     signal: abortController.signal,
     registerRecovery: (participant) => {
       if (participant.journal === undefined && participant.rollback === undefined) {
@@ -211,11 +247,7 @@ export async function runWithRuntimeBoundary<T>(
         },
       };
     },
-    throwIfCancelled: () => {
-      if (abortController.signal.aborted) {
-        throw new RuntimeCancellationError(runtimeState.receivedSignal);
-      }
-    },
+    throwIfCancelled: () => operationGuard.throwIfCancelled(),
   };
 
   let recoveryPromise: Promise<void> | undefined;
@@ -264,9 +296,32 @@ export async function runWithRuntimeBoundary<T>(
     return recoveryPromise;
   };
 
+  const reportPostCommitInterruption = (): void => {
+    safeDiagnostic(options.diagnostics, {
+      level: 'warning',
+      code: 'POST_COMMIT_INTERRUPTION',
+      message: 'The operation committed before cancellation could be observed.',
+    });
+  };
+
   try {
     context.throwIfCancelled();
     const rawResult = await operation(context);
+    const operationOutcome = operationGuard.outcome();
+    if (operationOutcome.kind === 'committed') {
+      const returnedCancellation = !rawResult.ok && rawResult.exitCode === EXIT_CODES.cancelled;
+      if (operationOutcome.interrupted || returnedCancellation) reportPostCommitInterruption();
+      const result = returnedCancellation
+        ? postCommitInterruptionResult()
+        : sanitizeResult(rawResult);
+      if (!result.ok) await recover(result);
+      return result;
+    }
+    if (operationOutcome.kind === 'recovery-required') {
+      const recoveryRequired = recoveryRequiredResult();
+      await recover(recoveryRequired);
+      return recoveryRequired;
+    }
     if (runtimeState.receivedSignal !== null || abortController.signal.aborted) {
       const cancelled = sanitizeFailure(cancellationResult(runtimeState.receivedSignal));
       await recover(cancelled);
@@ -277,17 +332,31 @@ export async function runWithRuntimeBoundary<T>(
     if (!result.ok) await recover(result);
     return result;
   } catch (error) {
+    if (operationGuard.outcome().kind === 'recovery-required') {
+      const recoveryRequired = recoveryRequiredResult();
+      await recover(recoveryRequired);
+      return recoveryRequired;
+    }
+    const operationOutcome = operationGuard.outcome();
+    const committed = operationOutcome.kind === 'committed';
+    const interruptionError = errorIsCancellation(error);
+    if (committed && (operationOutcome.interrupted || interruptionError)) {
+      reportPostCommitInterruption();
+    }
     const cancelled =
-      runtimeState.receivedSignal !== null ||
-      abortController.signal.aborted ||
-      errorIsCancellation(error);
+      !committed &&
+      (runtimeState.receivedSignal !== null || abortController.signal.aborted || interruptionError);
     const expected = error instanceof SkillSyncError;
     const result = sanitizeFailure(
-      cancelled ? cancellationResult(runtimeState.receivedSignal) : failedResultFromUnknown(error),
+      committed && interruptionError
+        ? postCommitInterruptionResult()
+        : cancelled
+          ? cancellationResult(runtimeState.receivedSignal)
+          : failedResultFromUnknown(error),
     );
     await recover(result);
 
-    if (!cancelled && !expected) {
+    if (!cancelled && !expected && !(committed && interruptionError)) {
       const diagnostic = firstError(result);
       safeDiagnostic(options.diagnostics, {
         level: 'error',

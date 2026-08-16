@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CachedLibraryRevisionProvider,
   formatProjectDiffHuman,
+  formatProjectReconciliationHuman,
   formatProjectStatusHuman,
   inspectProjectDiff,
   inspectProjectStatus,
@@ -23,6 +24,7 @@ import {
 import { sha256TreeDigest } from '../../src/domain/digest.js';
 import { EXIT_CODES } from '../../src/domain/result.js';
 import { validateLibrary } from '../../src/domain/library.js';
+import { RecoveryIntegrityError } from '../../src/domain/recovery-integrity.js';
 import type { NormalizedGitRemote } from '../../src/infrastructure/git.js';
 import { readProjectLock } from '../../src/infrastructure/project-state.js';
 import { withTempDirectory } from '../helpers/temp.js';
@@ -217,6 +219,48 @@ describe('project reconciliation application service', () => {
     });
   });
 
+  it('explains how to populate a missing verified cache for offline status', async () => {
+    await withTempDirectory('skill-sync-offline-cache-miss-', async (root) => {
+      const remote: NormalizedGitRemote = {
+        cloneUrl: 'https://github.com/acme/skills.git',
+        host: 'github.com',
+        identity,
+        owner: 'acme',
+        repository: 'skills',
+        transport: 'https',
+        upgradedFromHttp: false,
+      };
+      let refreshes = 0;
+      const revisionProvider = new CachedLibraryRevisionProvider({
+        cache: {
+          inspect: () => Promise.reject(new Error('No verified cached library revision exists.')),
+          refresh: () => {
+            refreshes += 1;
+            return Promise.reject(new Error('refresh must not run'));
+          },
+        },
+        remote,
+        stagingRoot: join(root, 'must-not-be-created'),
+      });
+
+      let failure: unknown;
+      try {
+        await revisionProvider.resolve({ cacheOnly: true, purpose: 'inspection' });
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toMatchObject({ code: 'LIBRARY_REVISION_UNAVAILABLE' });
+      if (!(failure instanceof Error)) throw new Error('Expected revision resolution to fail.');
+      expect(failure.message).toContain(
+        'Re-run this status command without --offline when remote access is available to populate a verified cache.',
+      );
+      expect(refreshes).toBe(0);
+      await expect(stat(join(root, 'must-not-be-created'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    });
+  });
+
   it('reports stale three-way status and target-specific diff without writing project state', async () => {
     await withTempDirectory('skill-sync-status-', async (root) => {
       const library = await createLibrary(root, { 'frontend/review-ui': '# Version one\n' });
@@ -247,7 +291,15 @@ describe('project reconciliation application service', () => {
         state: 'conflicted',
       });
       expect(statusReport.skills[0]?.assessment.divergentTargets).toEqual(['claude', 'codex']);
-      expect(formatProjectStatusHuman(statusReport)).toContain('not current');
+      const statusHuman = formatProjectStatusHuman(statusReport);
+      expect(statusHuman).toContain('Scope: project');
+      expect(statusHuman).toContain('Managed skills: 1 (conflicted 1)');
+      expect(statusHuman).toContain('not current');
+      expect(statusHuman).toContain('Warning: Cached data is not current');
+      expect(statusHuman).toContain('Next: Re-run skill-sync status without --offline');
+      expect(formatProjectStatusHuman(statusReport, { explicitProject: true })).toContain(
+        'Next: Re-run skill-sync status --project <project-path> without --offline',
+      );
 
       const cacheOnlyStatus = await inspectProjectStatus({
         library: stale,
@@ -270,7 +322,75 @@ describe('project reconciliation application service', () => {
           ),
         ),
       ).toBe(true);
-      expect(formatProjectDiffHuman(diffReport)).toContain('different: SKILL.md');
+      const diffHuman = formatProjectDiffHuman(diffReport);
+      expect(diffHuman).toContain('Scope: project');
+      expect(diffHuman).toContain('Targets: 2; differences: 2');
+      expect(diffHuman).toContain('different: SKILL.md');
+      expect(diffHuman).toContain(
+        'Next: Re-run skill-sync diff frontend/review-ui when remote access is available',
+      );
+      expect(formatProjectDiffHuman(diffReport, { explicitProject: true })).toContain(
+        'Next: Re-run skill-sync diff frontend/review-ui --project <project-path> when remote access is available',
+      );
+
+      const firstStatus = statusReport.skills[0];
+      if (firstStatus === undefined) throw new Error('Expected a status entry.');
+      const orphanedStatus = formatProjectStatusHuman({
+        ...statusReport,
+        authoritative: true,
+        freshness: 'fetched',
+        stale: false,
+        skills: [{ ...firstStatus, state: 'orphaned' }],
+      });
+      expect(orphanedStatus).toContain(
+        'Preview removal with skill-sync uninstall frontend/review-ui --dry-run',
+      );
+      expect(orphanedStatus).not.toContain('before deciding whether to sync');
+
+      const orphanedDiff = formatProjectDiffHuman({
+        ...diffReport,
+        authoritative: true,
+        freshness: 'fetched',
+        stale: false,
+        state: 'orphaned',
+      });
+      expect(orphanedDiff).toContain(
+        'Preview removal with skill-sync uninstall frontend/review-ui --dry-run',
+      );
+      expect(orphanedDiff).not.toContain('Run skill-sync sync to reconcile');
+
+      const boundedStatus = formatProjectStatusHuman({
+        ...statusReport,
+        authoritative: true,
+        freshness: 'fetched',
+        stale: false,
+        skills: Array.from({ length: 24 }, (_, index) => ({
+          ...firstStatus,
+          id: `frontend/review-${String(index).padStart(2, '0')}`,
+        })),
+      });
+      expect(boundedStatus).toContain('… 4 more managed skills omitted');
+      expect(boundedStatus).not.toContain('frontend/review-23:');
+
+      const firstTarget = diffReport.targets[0];
+      if (firstTarget === undefined) throw new Error('Expected a diff target.');
+      const boundedDiff = formatProjectDiffHuman({
+        ...diffReport,
+        authoritative: true,
+        freshness: 'fetched',
+        stale: false,
+        targets: [
+          {
+            ...firstTarget,
+            differences: Array.from({ length: 30 }, (_, index) => ({
+              kind: 'different' as const,
+              path: `assets/file-${String(index).padStart(2, '0')}.txt`,
+            })),
+          },
+        ],
+      });
+      expect(boundedDiff).toContain('… 5 more differences omitted');
+      expect(boundedDiff).not.toContain('file-29.txt');
       expect(stale.requests).toEqual([
         { allowStale: true, purpose: 'inspection' },
         { cacheOnly: true, purpose: 'inspection' },
@@ -308,6 +428,55 @@ describe('project reconciliation application service', () => {
         ['group/alpha', 'updated'],
         ['group/beta', 'skipped'],
       ]);
+      const human = formatProjectReconciliationHuman(result);
+      expect(human).toContain(`Sync apply: project ${result.projectRoot}`);
+      expect(human).toContain('Result: partial; selected 2');
+      expect(human).toContain('Outcomes: updated 1; skipped 1');
+      expect(human).toContain('Paths: 2 writes; 0 backups');
+      expect(human).toContain('group/alpha: outdated → updated (update; 2 writes)');
+      expect(human).toContain('Next: Review group/beta with skill-sync diff group/beta');
+      expect(human).toContain('then retry skill-sync sync.');
+      const explicitProjectHuman = formatProjectReconciliationHuman(result, {
+        explicitProject: true,
+      });
+      expect(explicitProjectHuman).toContain(
+        'Next: Review group/beta with skill-sync diff group/beta --project <project-path>',
+      );
+      expect(explicitProjectHuman).toContain(
+        'then retry skill-sync sync --project <project-path>.',
+      );
+
+      const skippedSkill = result.skills.find((skill) => skill.outcome === 'skipped');
+      if (skippedSkill === undefined) throw new Error('Expected a skipped reconciliation result.');
+      const orphaned = formatProjectReconciliationHuman({
+        ...result,
+        applied: false,
+        selectedIds: [skippedSkill.id],
+        skills: [
+          {
+            ...skippedSkill,
+            action: 'skip-orphaned',
+            outcome: 'skipped',
+            state: 'orphaned',
+          },
+        ],
+      });
+      expect(orphaned).toContain('Preview removal with skill-sync uninstall group/beta --dry-run');
+      expect(orphaned).not.toContain('then retry skill-sync sync');
+
+      const boundedSkills = Array.from({ length: 25 }, (_, index) => {
+        const source = result.skills[index % result.skills.length];
+        if (source === undefined) throw new Error('Expected reconciliation result skills.');
+        return { ...source, id: `group/skill-${String(index).padStart(2, '0')}` };
+      });
+      const bounded = formatProjectReconciliationHuman({
+        ...result,
+        selectedIds: boundedSkills.map((skill) => skill.id),
+        skills: boundedSkills,
+      });
+      expect(bounded).toContain('Skills (showing 20 of 25):');
+      expect(bounded).toContain('… 5 more skills omitted');
+      expect(bounded).not.toContain('group/skill-24:');
       expect(await sha256TreeDigest(join(project, '.codex', 'skills', 'alpha'))).toBe(alphaDigest);
       expect(await readFile(betaInstalled, 'utf8')).toBe('precious beta work\n');
       const lock = await readProjectLock(project);
@@ -421,6 +590,14 @@ describe('project reconciliation application service', () => {
         'skill-sync.json',
         'skill-sync.lock.json',
       ]);
+      const previewHuman = formatProjectReconciliationHuman(preview);
+      expect(previewHuman).toContain('Update dry-run: project');
+      expect(previewHuman).toContain('Result: changes planned; selected 1');
+      expect(previewHuman).toContain('Outcomes: planned 1');
+      expect(previewHuman).toContain('Paths: 3 writes; 4 backups');
+      expect(previewHuman).toContain(
+        'Next: Apply with skill-sync update group/alpha --discard-local, then verify with skill-sync status.',
+      );
       expect(await readFile(codexFile, 'utf8')).toBe('codex precious work\n');
       expect(await readBytes(project, 'skill-sync.lock.json')).toEqual(lockBefore);
       expect(await readdir(runtime.backupRoot).catch(() => [])).toEqual(backupsBefore);
@@ -508,6 +685,14 @@ describe('project reconciliation application service', () => {
         ['group/alpha', 'updated'],
         ['group/beta', 'failed'],
       ]);
+      const human = formatProjectReconciliationHuman(result);
+      expect(human).toContain('Result: partial; selected 2');
+      expect(human).toContain('Outcomes: updated 1; failed 1');
+      expect(human).toContain('Error SKILL_RECONCILIATION_FAILED:');
+      expect(human).toContain('simulated second-target failure');
+      expect(human).toContain(
+        'Next: Fix the failure for group/beta, then retry skill-sync sync; run skill-sync doctor',
+      );
       for (const [index, target] of ['.codex', '.claude'].entries()) {
         expect(await readFile(join(project, target, 'skills', 'beta', 'SKILL.md'))).toEqual(
           betaBefore[index],
@@ -521,6 +706,54 @@ describe('project reconciliation application service', () => {
       expect(lock?.skills.find((skill) => skill.id === 'group/alpha')?.baseDigest).toBe(
         alphaDigest,
       );
+    });
+  });
+
+  it('stops a batch immediately after a recovery-integrity failure', async () => {
+    await withTempDirectory('skill-sync-reconcile-fatal-', async (root) => {
+      const library = await createLibrary(root, {
+        'group/alpha': '# Alpha one\n',
+        'group/beta': '# Beta one\n',
+      });
+      const project = join(root, 'project');
+      await mkdir(project);
+      await install(root, project, library);
+      await replaceSkillBody(library, 'group/alpha', '# Alpha two\n');
+      await replaceSkillBody(library, 'group/beta', '# Beta two\n');
+      const before = await Promise.all(
+        ['alpha', 'beta'].map(
+          async (skill) =>
+            await readFile(join(project, '.codex', 'skills', skill, 'SKILL.md'), 'utf8'),
+        ),
+      );
+
+      await expect(
+        syncProjectSkills({
+          hooks: {
+            beforeCommit: ({ skillId }) => {
+              if (skillId === 'group/alpha') {
+                throw new RecoveryIntegrityError('ambiguous-commit', 'simulated ambiguous commit');
+              }
+            },
+          },
+          library: provider(library),
+          operationId: 'fatal-batch',
+          projectRoot: project,
+          storage: storage(root),
+        }),
+      ).rejects.toMatchObject({
+        code: 'RECOVERY_REQUIRED',
+        kind: 'ambiguous-commit',
+      });
+
+      expect(
+        await Promise.all(
+          ['alpha', 'beta'].map(
+            async (skill) =>
+              await readFile(join(project, '.codex', 'skills', skill, 'SKILL.md'), 'utf8'),
+          ),
+        ),
+      ).toEqual(before);
     });
   });
 

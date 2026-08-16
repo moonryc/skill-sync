@@ -55,9 +55,79 @@ Project writes are staged and journaled, and active operations hold locks. If a 
 
 ```sh
 skill-sync doctor
+skill-sync recovery list
+skill-sync recovery inspect <id>
 ```
 
-Verify that no `skill-sync` process is active before following any abandoned-lock remediation. Keep backups until the project metadata and target copies have been checked.
+The record ID comes from `recovery list`. After inspection, choose the direction that matches the
+kind of evidence it reports. For an ordinary record labeled `recoverable`, preview the direction
+you want before confirming:
+
+Run list and inspect without `--project` or `--global`; they search the recovery store directly.
+Use `recovery list --scope <scope>` to narrow the records. If inspection reports a record owned by
+another project, it prints the affected destinations and an action with
+`skill-sync --project /path/to/affected-project` before `recovery resume`, `restore`, or `prune`.
+
+```sh
+# Finish the originally intended write.
+skill-sync recovery resume <id> --dry-run
+skill-sync recovery resume <id>
+
+# Or return to the recorded pre-operation state.
+skill-sync recovery restore <id> --dry-run
+skill-sync recovery restore <id>
+```
+
+Both operations revalidate every recorded path and digest. They refuse changed, incomplete,
+legacy inspect-only, or otherwise ambiguous evidence instead of guessing.
+
+An advisory lock uses a separate singular recovery path. Only follow it when inspection offers
+unlock for that stable lock ID:
+
+```sh
+skill-sync recovery unlock <id> --dry-run
+skill-sync recovery unlock <id>
+# Use --yes only for an explicitly reviewed noninteractive apply.
+```
+
+Owned advisory locks refresh their persisted lock-file mtime heartbeat every 15 seconds. The
+preview proves that the recorded owner is on this host, its PID is no longer active, and 60 seconds
+have elapsed from the later of metadata creation and that last persisted heartbeat, then shows the
+exact lock path, owner, scope, and plan fingerprint. Application requires interactive confirmation
+or explicit `--yes`. It serializes per stable record with a crash-visible recovery action lock and,
+while holding it, revalidates the exact path, owner metadata, grace, and fingerprint immediately
+before removing only that lock. Active, foreign-host, too-young, malformed, changed, or otherwise
+unverifiable evidence is refused and preserved.
+
+Skill-sync syncs the selected lock's parent directory before reporting the removal as complete. If
+that durability step is ambiguous, it preserves the recovery action lock for `recovery list` and
+inspection instead of claiming success. JSON inspection and preview show safe owner facts but never
+the internal `ownerToken`.
+
+`recovery unlock` searches by one stable ID. Run it without `--project`, `--global`, or `--scope`;
+the scope shown in the lock metadata is evidence, not a command selector. Never substitute manual
+lock deletion when unlock refuses to prove abandonment.
+
+An initialization record is different. It records provider repository creation, initial push, and
+saved-configuration phases as inspect-only evidence. `recovery resume`, `recovery restore`, and
+`recovery prune` cannot act on it, and skill-sync never automatically replays or deletes external
+repository changes. Inspect the repository and branch with the provider, then run the exact fresh
+`skill-sync init ... --dry-run` command printed by `recovery inspect`. If that current plan is
+correct, run the exact `--expect-plan` command printed by the preview. A successful setup for the
+same remote clears the older matching initialization evidence.
+
+After the project or global state is verified, terminal records and verified backups can be
+reviewed and pruned explicitly:
+
+```sh
+skill-sync recovery list --include-terminal
+skill-sync recovery prune <id> --dry-run
+skill-sync recovery prune <id>
+```
+
+Prune never accepts unresolved records or advisory locks. Do not manually delete journals, locks,
+staging paths, or backups, and keep backups until the associated metadata and target copies have
+been checked. See the complete [recovery command reference](/reference/recovery-commands/).
 
 ## Partial batches
 

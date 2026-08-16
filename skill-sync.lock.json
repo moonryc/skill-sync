@@ -1,10 +1,22 @@
 {
   "library": {
     "identity": "github.com/moonryc/dev-skills-sync",
-    "revision": "87a9b29ce35d8a89ad82e5242522fe55eb9833bb"
+    "revision": "e23311516563b168607b07533f856e1e9ff42d38"
   },
   "schemaVersion": 1,
   "skills": [
+    {
+      "baseDigest": "be1557a660fd147bc5e1e5d5e752aebcb27165b78c52ab582576d206fc97e799",
+      "canonicalDigest": "be1557a660fd147bc5e1e5d5e752aebcb27165b78c52ab582576d206fc97e799",
+      "id": "openspec/openspec-apply-change",
+      "projections": [
+        {
+          "destination": ".claude/skills/openspec-apply-change",
+          "digest": "be1557a660fd147bc5e1e5d5e752aebcb27165b78c52ab582576d206fc97e799",
+          "target": "claude"
+        }
+      ]
+    },
     {
       "baseDigest": "304528562ab60e38a9ca453437fab6ee75aafc990cfcf8446f887409749b314c",
       "canonicalDigest": "304528562ab60e38a9ca453437fab6ee75aafc990cfcf8446f887409749b314c",

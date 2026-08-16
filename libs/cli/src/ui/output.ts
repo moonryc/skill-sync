@@ -1,5 +1,5 @@
 import { SCHEMA_VERSION } from '../domain/index.js';
-import { sanitizeError, type CommandResult } from '../domain/result.js';
+import { EXIT_CODES, sanitizeError, type CommandResult } from '../domain/result.js';
 import type { RuntimeIo } from '../ports/index.js';
 
 export interface OutputOptions {
@@ -7,13 +7,13 @@ export interface OutputOptions {
   readonly color: boolean;
 }
 
-function humanValue(value: unknown): string {
+function humanValue(value: unknown): string | undefined {
   if (typeof value === 'string') return value;
   if (value === undefined || value === null) return '';
   if (Array.isArray(value) && value.every((entry) => typeof entry === 'string')) {
     return value.join('\n');
   }
-  return JSON.stringify(value, null, 2);
+  return undefined;
 }
 
 export function renderResult(
@@ -38,6 +38,13 @@ export function renderResult(
 
   if (result.ok) {
     const rendered = humanValue(result.data);
+    if (rendered === undefined) {
+      io.writeStderr(
+        `HUMAN_RENDERER_MISSING: ${command} returned structured data without a human formatter. Re-run with --json and report this bug.\n`,
+      );
+      io.setExitCode(EXIT_CODES.internal);
+      return;
+    }
     if (rendered.length > 0) io.writeStdout(`${rendered}\n`);
   } else {
     for (const error of result.errors) {

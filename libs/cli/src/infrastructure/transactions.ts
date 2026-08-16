@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   constants,
   copyFile,
@@ -12,6 +12,7 @@ import {
   rename,
   rm,
   unlink,
+  utimes,
   chmod,
 } from 'node:fs/promises';
 import { hostname } from 'node:os';
@@ -19,17 +20,32 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 
 import { z } from 'zod';
 
+import { sha256TreeDigest } from '../domain/digest.js';
 import { portableRelativePathSchema } from '../domain/project-state.js';
+import {
+  JournalTransitionError,
+  RecoveryIntegrityError,
+  TransactionRolledBackError,
+} from '../domain/recovery-integrity.js';
+import { EXIT_CODES, SkillSyncError } from '../domain/result.js';
+import type { OperationGuard } from '../runtime/operation-guard.js';
 import { redactCredentials } from './config.js';
 import { isPathContained, resolveContainedProjectPath } from './project-state.js';
 import { stableJsonStringify, writeJsonAtomic } from './stable-json.js';
 
 const TRANSACTION_SCHEMA_VERSION = 1 as const;
+const DEFAULT_LOCK_HEARTBEAT_INTERVAL_MS = 15_000;
+export const OPERATION_JOURNAL_SCHEMA_VERSION = 2 as const;
 const operationIdSchema = z
   .string()
   .min(1)
   .max(128)
   .regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/u, 'Invalid operation ID.');
+
+const lockScopeSchema = z.strictObject({
+  id: z.string().min(1).max(512),
+  kind: z.enum(['custom', 'global', 'library', 'project', 'recovery']),
+});
 
 const lockMetadataSchema = z.strictObject({
   createdAt: z.iso.datetime(),
@@ -38,6 +54,7 @@ const lockMetadataSchema = z.strictObject({
   ownerToken: z.uuid(),
   pid: z.number().int().positive(),
   schemaVersion: z.literal(TRANSACTION_SCHEMA_VERSION),
+  scope: lockScopeSchema.default({ id: 'legacy-unscoped', kind: 'custom' }),
 });
 
 export type AdvisoryLockMetadata = z.infer<typeof lockMetadataSchema>;
@@ -45,22 +62,29 @@ export type AdvisoryLockMetadata = z.infer<typeof lockMetadataSchema>;
 export class AdvisoryLockUnavailableError extends Error {
   public readonly lockPath: string;
   public readonly owner: AdvisoryLockMetadata | undefined;
+  public readonly stale: boolean;
 
-  public constructor(lockPath: string, owner?: AdvisoryLockMetadata) {
+  public constructor(
+    lockPath: string,
+    owner?: AdvisoryLockMetadata,
+    options?: { readonly stale: boolean },
+  ) {
+    const stale = options?.stale ?? false;
     super(
       owner === undefined
         ? `Another operation holds advisory lock ${lockPath}.`
-        : `Operation ${owner.operationId} (PID ${String(owner.pid)} on ${owner.hostname}) holds advisory lock ${lockPath}.`,
+        : `${stale ? 'A stale lock from' : 'Operation'} ${owner.operationId} (PID ${String(owner.pid)} on ${owner.hostname}, scope ${owner.scope.kind}:${owner.scope.id}) holds advisory lock ${lockPath}.`,
     );
     this.name = 'AdvisoryLockUnavailableError';
     this.lockPath = lockPath;
     this.owner = owner;
+    this.stale = stale;
   }
 }
 
-export class AdvisoryLockOwnershipError extends Error {
+export class AdvisoryLockOwnershipError extends RecoveryIntegrityError {
   public constructor(lockPath: string) {
-    super(`Advisory lock ownership changed before release: ${lockPath}.`);
+    super('lock-ownership', `Advisory lock ownership changed before release: ${lockPath}.`);
     this.name = 'AdvisoryLockOwnershipError';
   }
 }
@@ -90,15 +114,27 @@ export async function acquireAdvisoryLock(
     readonly operationId: string;
     readonly pid?: number;
     readonly hostname?: string;
+    readonly heartbeatIntervalMs?: number;
+    readonly scope?: z.input<typeof lockScopeSchema>;
+    readonly staleAfterMs?: number;
   },
 ): Promise<AdvisoryLock> {
+  const now = options.now ?? new Date();
+  const heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_LOCK_HEARTBEAT_INTERVAL_MS;
+  if (!Number.isFinite(heartbeatIntervalMs) || heartbeatIntervalMs < 0) {
+    throw new Error('Advisory lock heartbeat interval must be a non-negative finite number.');
+  }
+  const defaultScopeId = createHash('sha256')
+    .update(`skill-sync-lock-scope-v1\0${resolve(path)}`)
+    .digest('hex');
   const metadata = lockMetadataSchema.parse({
-    createdAt: (options.now ?? new Date()).toISOString(),
+    createdAt: now.toISOString(),
     hostname: options.hostname ?? hostname(),
     operationId: options.operationId,
     ownerToken: randomUUID(),
     pid: options.pid ?? process.pid,
     schemaVersion: TRANSACTION_SCHEMA_VERSION,
+    scope: options.scope ?? { id: defaultScopeId, kind: 'custom' },
   });
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
 
@@ -113,18 +149,61 @@ export async function acquireAdvisoryLock(
     await handle?.close().catch(() => undefined);
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
       const owner = await readAdvisoryLock(path).catch(() => undefined);
-      throw new AdvisoryLockUnavailableError(path, owner);
+      const modifiedAt = await lstat(path)
+        .then((information) => information.mtimeMs)
+        .catch(() => Number.NaN);
+      const lastHeartbeat =
+        owner === undefined
+          ? Number.NaN
+          : Math.max(new Date(owner.createdAt).getTime(), modifiedAt);
+      const stale =
+        owner !== undefined &&
+        Number.isFinite(lastHeartbeat) &&
+        now.getTime() - lastHeartbeat > (options.staleAfterMs ?? 24 * 60 * 60 * 1_000);
+      throw new AdvisoryLockUnavailableError(path, owner, { stale });
     }
     await unlink(path).catch(() => undefined);
     throw error;
   }
 
   let released = false;
+  let heartbeatTimer: NodeJS.Timeout | undefined;
+  let heartbeatInFlight = Promise.resolve();
+  const stopHeartbeat = async (): Promise<void> => {
+    if (heartbeatTimer !== undefined) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = undefined;
+    }
+    await heartbeatInFlight;
+  };
+  if (heartbeatIntervalMs > 0) {
+    heartbeatTimer = setInterval(() => {
+      heartbeatInFlight = heartbeatInFlight.then(async () => {
+        try {
+          const current = await readAdvisoryLock(path);
+          if (current?.ownerToken !== metadata.ownerToken) {
+            if (heartbeatTimer !== undefined) {
+              clearInterval(heartbeatTimer);
+              heartbeatTimer = undefined;
+            }
+            return;
+          }
+          const heartbeatAt = new Date();
+          await utimes(path, heartbeatAt, heartbeatAt);
+        } catch {
+          // Liveness checks still refuse an active PID; recovery requires a full grace after
+          // the last heartbeat that the filesystem could persist.
+        }
+      });
+    }, heartbeatIntervalMs);
+    heartbeatTimer.unref();
+  }
   return {
     metadata,
     path,
     release: async () => {
       if (released) return;
+      await stopHeartbeat();
       const current = await readAdvisoryLock(path);
       if (current?.ownerToken !== metadata.ownerToken) {
         throw new AdvisoryLockOwnershipError(path);
@@ -166,9 +245,194 @@ export type OperationJournal = z.infer<typeof operationJournalSchema>;
 export type OperationJournalEntry = z.infer<typeof operationJournalEntrySchema>;
 export type OperationJournalStatus = z.infer<typeof operationJournalStatusSchema>;
 
+const contentDigestSchema = z
+  .string()
+  .regex(/^[a-f0-9]{64}$/u, 'Expected a lowercase SHA-256 digest.');
+const operationScopeSchema = z.strictObject({
+  id: z
+    .string()
+    .min(1)
+    .max(256)
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/u, 'Invalid operation scope ID.'),
+  kind: z.enum(['project', 'global', 'library', 'cache', 'config', 'recovery']),
+});
+const operationJournalTerminalSchema = z.strictObject({
+  completedAt: z.iso.datetime(),
+  outcome: z.enum(['committed', 'rolled-back']),
+});
+
+export interface DeterministicOperationPaths {
+  readonly candidate: string;
+  readonly rollback: string;
+}
+
+function portableDirectory(path: string): string {
+  const separator = path.lastIndexOf('/');
+  return separator < 0 ? '' : path.slice(0, separator);
+}
+
+/** Derive same-directory hidden paths without random or process-local input. */
+export function deterministicOperationPaths(
+  destination: string,
+  operationId: string,
+  entryIndex: number,
+): DeterministicOperationPaths {
+  const portableDestination = portableRelativePathSchema.parse(destination);
+  const safeOperationId = operationIdSchema.parse(operationId);
+  if (!Number.isSafeInteger(entryIndex) || entryIndex < 0) {
+    throw new Error('Operation journal entry index must be a non-negative safe integer.');
+  }
+  const directory = portableDirectory(portableDestination);
+  const prefix = `.skill-sync-${safeOperationId}-${String(entryIndex)}`;
+  const relativeToDirectory = (name: string): string =>
+    portableRelativePathSchema.parse(directory === '' ? name : `${directory}/${name}`);
+  return {
+    candidate: relativeToDirectory(`${prefix}-candidate`),
+    rollback: relativeToDirectory(`${prefix}-rollback`),
+  };
+}
+
+/** Hash the normalized root without persisting the machine-specific absolute path. */
+export function transactionRootFingerprint(root: string): string {
+  return createHash('sha256')
+    .update('skill-sync-transaction-root-v1\0')
+    .update(resolve(root))
+    .digest('hex');
+}
+
+export const operationJournalV2EntrySchema = z
+  .strictObject({
+    action: z.enum(['replace', 'remove']),
+    candidate: portableRelativePathSchema.optional(),
+    destination: portableRelativePathSchema,
+    finalDigest: contentDigestSchema.nullable(),
+    originalDigest: contentDigestSchema.nullable(),
+    rollback: portableRelativePathSchema,
+    sourceDigest: contentDigestSchema.nullable(),
+    state: z.enum(['pending', 'prepared', 'original-moved', 'committed', 'restored']),
+  })
+  .superRefine((entry, context) => {
+    if (entry.action === 'replace') {
+      if (entry.candidate === undefined) {
+        context.addIssue({
+          code: 'custom',
+          message: 'A replacement journal entry requires a candidate path.',
+          path: ['candidate'],
+        });
+      }
+      if (entry.sourceDigest === null || entry.finalDigest === null) {
+        context.addIssue({
+          code: 'custom',
+          message: 'A replacement journal entry requires source and final digests.',
+          path: ['sourceDigest'],
+        });
+      } else if (entry.sourceDigest !== entry.finalDigest) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Replacement source and final digests must match.',
+          path: ['finalDigest'],
+        });
+      }
+    } else {
+      if (entry.candidate !== undefined) {
+        context.addIssue({
+          code: 'custom',
+          message: 'A removal journal entry must not include a candidate path.',
+          path: ['candidate'],
+        });
+      }
+      if (entry.sourceDigest !== null || entry.finalDigest !== null) {
+        context.addIssue({
+          code: 'custom',
+          message: 'A removal journal entry must use null source and final digests.',
+          path: ['finalDigest'],
+        });
+      }
+    }
+    if (
+      entry.destination === entry.rollback ||
+      entry.destination === entry.candidate ||
+      entry.rollback === entry.candidate
+    ) {
+      context.addIssue({
+        code: 'custom',
+        message: 'Journal destination, candidate, and rollback paths must be distinct.',
+        path: ['rollback'],
+      });
+    }
+  });
+
+export const operationJournalV2Schema = z
+  .strictObject({
+    createdAt: z.iso.datetime(),
+    entries: z.array(operationJournalV2EntrySchema),
+    kind: z.string().min(1).max(128),
+    note: z.string().max(4_096).optional(),
+    operationId: operationIdSchema,
+    rootFingerprint: contentDigestSchema,
+    schemaVersion: z.literal(OPERATION_JOURNAL_SCHEMA_VERSION),
+    scope: operationScopeSchema,
+    status: operationJournalStatusSchema,
+    terminal: operationJournalTerminalSchema.optional(),
+    updatedAt: z.iso.datetime(),
+  })
+  .superRefine((journal, context) => {
+    const terminalStatus = journal.status === 'committed' || journal.status === 'rolled-back';
+    if (terminalStatus && journal.terminal?.outcome !== journal.status) {
+      context.addIssue({
+        code: 'custom',
+        message: 'A terminal journal requires matching terminal metadata.',
+        path: ['terminal'],
+      });
+    }
+    if (!terminalStatus && journal.terminal !== undefined) {
+      context.addIssue({
+        code: 'custom',
+        message: 'A nonterminal journal must not include terminal metadata.',
+        path: ['terminal'],
+      });
+    }
+
+    const destinations = new Set<string>();
+    for (const [index, entry] of journal.entries.entries()) {
+      if (destinations.has(entry.destination)) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Journal destinations must be unique.',
+          path: ['entries', index, 'destination'],
+        });
+      }
+      destinations.add(entry.destination);
+      const expected = deterministicOperationPaths(entry.destination, journal.operationId, index);
+      if (entry.rollback !== expected.rollback) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Journal rollback path is not deterministic for this entry.',
+          path: ['entries', index, 'rollback'],
+        });
+      }
+      if (entry.action === 'replace' && entry.candidate !== expected.candidate) {
+        context.addIssue({
+          code: 'custom',
+          message: 'Journal candidate path is not deterministic for this entry.',
+          path: ['entries', index, 'candidate'],
+        });
+      }
+    }
+  });
+
+export type OperationJournalV2 = z.infer<typeof operationJournalV2Schema>;
+export type OperationJournalV2Entry = z.infer<typeof operationJournalV2EntrySchema>;
+export type ReadableOperationJournal = OperationJournal | OperationJournalV2;
+
 export interface OperationJournalHandle {
   readonly path: string;
-  readonly value: OperationJournal;
+  readonly value: ReadableOperationJournal;
+}
+
+export interface OperationJournalV2Handle {
+  readonly path: string;
+  readonly value: OperationJournalV2;
 }
 
 export async function createOperationJournal(
@@ -196,21 +460,29 @@ export async function createOperationJournal(
   return { path, value: journal };
 }
 
-export async function readOperationJournal(path: string): Promise<OperationJournal> {
+export async function readOperationJournal(path: string): Promise<ReadableOperationJournal> {
   const contents = await readFile(path, 'utf8');
-  return operationJournalSchema.parse(JSON.parse(contents) as unknown);
+  const value = JSON.parse(contents) as unknown;
+  if (
+    typeof value === 'object' &&
+    value !== null &&
+    Reflect.get(value, 'schemaVersion') === OPERATION_JOURNAL_SCHEMA_VERSION
+  ) {
+    return operationJournalV2Schema.parse(value);
+  }
+  return operationJournalSchema.parse(value);
 }
 
 const validJournalTransitions: Readonly<
   Record<OperationJournalStatus, readonly OperationJournalStatus[]>
 > = {
-  committed: [],
-  committing: ['committed', 'rolling-back', 'failed'],
-  failed: [],
+  committed: ['rolling-back'],
+  committing: ['committing', 'committed', 'rolling-back', 'failed'],
+  failed: ['committing', 'rolling-back'],
   prepared: ['committing', 'rolling-back', 'failed'],
-  preparing: ['prepared', 'rolling-back', 'failed'],
+  preparing: ['prepared', 'committing', 'rolling-back', 'failed'],
   'rolled-back': [],
-  'rolling-back': ['rolled-back', 'failed'],
+  'rolling-back': ['rolling-back', 'rolled-back', 'failed'],
 };
 
 export async function updateOperationJournal(
@@ -223,6 +495,9 @@ export async function updateOperationJournal(
   },
 ): Promise<OperationJournal> {
   const current = await readOperationJournal(path);
+  if (current.schemaVersion !== TRANSACTION_SCHEMA_VERSION) {
+    throw new Error('Operation journal schema v2 requires the v2 transition writer.');
+  }
   if (!validJournalTransitions[current.status].includes(update.status)) {
     throw new Error(`Invalid journal transition from ${current.status} to ${update.status}.`);
   }
@@ -235,6 +510,79 @@ export async function updateOperationJournal(
   });
   await writeJsonAtomic(path, next, { mode: 0o600 });
   return next;
+}
+
+export async function createOperationJournalV2(
+  directory: string,
+  options: {
+    readonly entries: readonly OperationJournalV2Entry[];
+    readonly kind: string;
+    readonly note?: string;
+    readonly now?: Date;
+    readonly operationId: string;
+    readonly rootFingerprint: string;
+    readonly scope: OperationJournalV2['scope'];
+  },
+): Promise<OperationJournalV2Handle> {
+  const timestamp = (options.now ?? new Date()).toISOString();
+  const operationId = operationIdSchema.parse(options.operationId);
+  const journal = operationJournalV2Schema.parse({
+    createdAt: timestamp,
+    entries: options.entries,
+    kind: options.kind,
+    ...(options.note === undefined ? {} : { note: redactCredentials(options.note) }),
+    operationId,
+    rootFingerprint: options.rootFingerprint,
+    schemaVersion: OPERATION_JOURNAL_SCHEMA_VERSION,
+    scope: options.scope,
+    status: 'preparing',
+    updatedAt: timestamp,
+  });
+  const path = join(directory, `${operationId}.json`);
+  try {
+    await writeJsonAtomic(path, journal, { mode: 0o600 });
+  } catch (error) {
+    throw new JournalTransitionError(path, { cause: error });
+  }
+  return { path, value: journal };
+}
+
+export async function updateOperationJournalV2(
+  path: string,
+  update: {
+    readonly entries?: readonly OperationJournalV2Entry[];
+    readonly note?: string;
+    readonly now?: Date;
+    readonly status: OperationJournalStatus;
+  },
+): Promise<OperationJournalV2> {
+  try {
+    const current = await readOperationJournal(path);
+    if (current.schemaVersion !== OPERATION_JOURNAL_SCHEMA_VERSION) {
+      throw new Error('Legacy operation journals are inspect-only.');
+    }
+    if (!validJournalTransitions[current.status].includes(update.status)) {
+      throw new Error(`Invalid journal transition from ${current.status} to ${update.status}.`);
+    }
+    const timestamp = (update.now ?? new Date()).toISOString();
+    const terminal =
+      update.status === 'committed' || update.status === 'rolled-back'
+        ? { completedAt: timestamp, outcome: update.status }
+        : undefined;
+    const next = operationJournalV2Schema.parse({
+      ...current,
+      ...(update.entries === undefined ? {} : { entries: update.entries }),
+      ...(update.note === undefined ? {} : { note: redactCredentials(update.note) }),
+      ...(terminal === undefined ? {} : { terminal }),
+      status: update.status,
+      updatedAt: timestamp,
+    });
+    await writeJsonAtomic(path, next, { mode: 0o600 });
+    return next;
+  } catch (error) {
+    if (error instanceof JournalTransitionError) throw error;
+    throw new JournalTransitionError(path, { cause: error });
+  }
 }
 
 export async function listOperationJournals(directory: string): Promise<OperationJournalHandle[]> {
@@ -334,6 +682,11 @@ const backupManifestSchema = z.strictObject({
 
 export type BackupManifest = z.infer<typeof backupManifestSchema>;
 
+export async function readBackupManifest(path: string): Promise<BackupManifest> {
+  const contents = await readFile(path, 'utf8');
+  return backupManifestSchema.parse(JSON.parse(contents) as unknown);
+}
+
 export async function createRecoverableBackup(options: {
   readonly backupRoot: string;
   readonly entries: readonly { readonly path: string; readonly relativePath: string }[];
@@ -394,25 +747,98 @@ export async function createRecoverableBackup(options: {
 export interface AtomicReplacement {
   readonly action: 'replace' | 'remove';
   readonly destinationPath: string;
+  readonly expectedOriginalDigest?: string | null;
   readonly stagedPath?: string;
 }
 
 interface PreparedReplacement extends AtomicReplacement {
   readonly candidatePath?: string;
+  readonly candidateRelativePath?: string;
   readonly destinationRelativePath: string;
+  readonly finalDigest: string | null;
+  readonly originalDigest: string | null;
+  readonly rollbackRelativePath: string;
   readonly rollbackPath: string;
+  readonly sourceDigest: string | null;
   newCommitted: boolean;
   originalMoved: boolean;
 }
 
-export class TransactionRollbackError extends Error {
+export type TransactionDurableStep =
+  | 'journal-created'
+  | 'candidate-prepared'
+  | 'journal-prepared'
+  | 'journal-committing'
+  | 'original-moved'
+  | 'journal-original-moved'
+  | 'candidate-committed'
+  | 'journal-entry-committed'
+  | 'journal-committed'
+  | 'journal-rolling-back'
+  | 'committed-destination-removed'
+  | 'original-restored'
+  | 'candidate-removed'
+  | 'journal-rolled-back'
+  | 'journal-failed';
+
+export interface TransactionHooks {
+  readonly afterDurableStep?: (
+    step: TransactionDurableStep,
+    entryIndex?: number,
+  ) => Promise<void> | void;
+  readonly beforeCommit?: (index: number) => Promise<void> | void;
+}
+
+export class TransactionRollbackError extends RecoveryIntegrityError {
   public readonly failures: readonly unknown[];
 
   public constructor(failures: readonly unknown[], options: { readonly cause: unknown }) {
-    super('The operation failed and one or more paths could not be rolled back.', options);
+    super(
+      'failed-rollback',
+      'The operation failed and one or more paths could not be rolled back.',
+      options,
+    );
     this.name = 'TransactionRollbackError';
     this.failures = failures;
   }
+}
+
+export class MutationPlanChangedError extends SkillSyncError {
+  public constructor(
+    destination: string,
+    reason: 'candidate-digest' | 'destination-digest',
+    planFingerprint: string,
+  ) {
+    super(
+      'STALE_MUTATION_PLAN',
+      `Mutation input changed after planning for ${destination}; no commit was started.`,
+      EXIT_CODES.conflict,
+      { destination, planFingerprint, reason },
+    );
+    this.name = 'MutationPlanChangedError';
+  }
+}
+
+function preparedPlanFingerprint(
+  kind: string,
+  rootFingerprint: string,
+  replacements: readonly PreparedReplacement[],
+): string {
+  return createHash('sha256')
+    .update(
+      stableJsonStringify({
+        kind,
+        replacements: replacements.map((replacement) => ({
+          action: replacement.action,
+          destination: replacement.destinationRelativePath,
+          finalDigest: replacement.finalDigest,
+          originalDigest: replacement.originalDigest,
+          sourceDigest: replacement.sourceDigest,
+        })),
+        rootFingerprint,
+      }),
+    )
+    .digest('hex');
 }
 
 function portablePathFromRoot(root: string, path: string): string {
@@ -420,18 +846,89 @@ function portablePathFromRoot(root: string, path: string): string {
   return portableRelativePathSchema.parse(value);
 }
 
+async function syncDirectoryDurably(path: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(path, 'r');
+    await handle.sync();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'EINVAL' && code !== 'EISDIR' && code !== 'ENOTSUP' && code !== 'EPERM') {
+      throw error;
+    }
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function syncRegularPath(path: string): Promise<void> {
+  const information = await lstat(path);
+  if (information.isFile()) {
+    // Windows requires a writable handle for fsync even when only flushing copied data.
+    const handle = await open(path, process.platform === 'win32' ? 'r+' : 'r');
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    return;
+  }
+  if (!information.isDirectory() || information.isSymbolicLink()) {
+    throw new Error(`Refusing to sync non-regular transaction content: ${path}`);
+  }
+  const entries = await readdir(path, { withFileTypes: true });
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    await syncRegularPath(join(path, entry.name));
+  }
+  await syncDirectoryDurably(path);
+}
+
+async function renameDurably(source: string, destination: string): Promise<void> {
+  await rename(source, destination);
+  const sourceParent = dirname(source);
+  const destinationParent = dirname(destination);
+  await syncDirectoryDurably(sourceParent);
+  if (destinationParent !== sourceParent) {
+    await syncDirectoryDurably(destinationParent);
+  }
+}
+
+async function removeDurably(path: string): Promise<void> {
+  await rm(path, { force: true, recursive: true });
+  await syncDirectoryDurably(dirname(path));
+}
+
+export async function transactionContentDigest(path: string): Promise<string> {
+  const information = await lstat(path);
+  const hash = createHash('sha256');
+  if (information.isFile()) {
+    hash.update('skill-sync-transaction-file-v1\0');
+    hash.update(await readFile(path));
+    return hash.digest('hex');
+  }
+  if (information.isDirectory() && !information.isSymbolicLink()) {
+    hash.update('skill-sync-transaction-tree-v1\0');
+    hash.update(await sha256TreeDigest(path, { rejectNestedSkillRoots: false }));
+    return hash.digest('hex');
+  }
+  throw new Error(`Refusing to digest non-regular transaction content: ${path}`);
+}
+
 /**
  * Commit all replacements as one logical transaction. Each replacement uses same-filesystem
  * renames; any later failure restores every destination already changed by this call.
  */
 export async function replacePathsAtomically(options: {
-  readonly hooks?: { readonly beforeCommit?: (index: number) => Promise<void> | void };
+  readonly hooks?: TransactionHooks;
   readonly journalDirectory?: string;
   readonly kind: string;
   readonly now?: () => Date;
+  readonly operationGuard?: OperationGuard;
   readonly operationId: string;
   readonly replacements: readonly AtomicReplacement[];
+  readonly reviewedPlanFingerprint?: string;
   readonly root: string;
+  readonly scope?: OperationJournalV2['scope'];
 }): Promise<{ readonly journal?: OperationJournalHandle }> {
   const operationId = operationIdSchema.parse(options.operationId);
   const lexicalRoot = resolve(options.root);
@@ -467,139 +964,263 @@ export async function replacePathsAtomically(options: {
       throw new Error(`Removal must not include staged content: ${destinationRelativePath}`);
     }
 
-    const nonce = `${operationId}-${String(index)}-${randomUUID()}`;
+    const artifactPaths = deterministicOperationPaths(destinationRelativePath, operationId, index);
     const candidatePath =
       replacement.action === 'replace'
-        ? join(dirname(destination), `.skill-sync-${nonce}-stage`)
+        ? resolve(realRoot, ...artifactPaths.candidate.split('/'))
         : undefined;
-    const rollbackPath = join(dirname(destination), `.skill-sync-${nonce}-rollback`);
+    const rollbackPath = resolve(realRoot, ...artifactPaths.rollback.split('/'));
+    if (
+      (candidatePath !== undefined && (await pathExists(candidatePath))) ||
+      (await pathExists(rollbackPath))
+    ) {
+      throw new Error(
+        `Deterministic transaction artifacts already exist for ${destinationRelativePath}.`,
+      );
+    }
+    const sourceDigest =
+      replacement.stagedPath === undefined
+        ? null
+        : await transactionContentDigest(replacement.stagedPath);
+    const originalDigest = (await pathExists(destination))
+      ? await transactionContentDigest(destination)
+      : null;
     prepared.push({
       action: replacement.action,
-      ...(candidatePath === undefined ? {} : { candidatePath }),
+      ...(candidatePath === undefined
+        ? {}
+        : { candidatePath, candidateRelativePath: artifactPaths.candidate }),
       destinationPath: destination,
       destinationRelativePath,
+      ...(replacement.expectedOriginalDigest === undefined
+        ? {}
+        : { expectedOriginalDigest: replacement.expectedOriginalDigest }),
+      finalDigest: sourceDigest,
       newCommitted: false,
+      originalDigest,
       originalMoved: false,
+      rollbackRelativePath: artifactPaths.rollback,
       rollbackPath,
+      sourceDigest,
       ...(replacement.stagedPath === undefined ? {} : { stagedPath: replacement.stagedPath }),
     });
   }
 
-  let journal: OperationJournalHandle | undefined;
+  const journalEntries = (
+    stateForIndex: (index: number) => OperationJournalV2Entry['state'],
+  ): OperationJournalV2Entry[] =>
+    prepared.map((replacement, index) => ({
+      action: replacement.action,
+      ...(replacement.candidateRelativePath === undefined
+        ? {}
+        : { candidate: replacement.candidateRelativePath }),
+      destination: replacement.destinationRelativePath,
+      finalDigest: replacement.finalDigest,
+      originalDigest: replacement.originalDigest,
+      rollback: replacement.rollbackRelativePath,
+      sourceDigest: replacement.sourceDigest,
+      state: stateForIndex(index),
+    }));
+  const rootFingerprint = transactionRootFingerprint(realRoot);
+  const planFingerprint =
+    options.reviewedPlanFingerprint ??
+    preparedPlanFingerprint(options.kind, rootFingerprint, prepared);
+
+  for (const replacement of prepared) {
+    if (
+      replacement.expectedOriginalDigest !== undefined &&
+      replacement.expectedOriginalDigest !== replacement.originalDigest
+    ) {
+      throw new MutationPlanChangedError(
+        replacement.destinationRelativePath,
+        'destination-digest',
+        planFingerprint,
+      );
+    }
+  }
+
+  let journal: OperationJournalV2Handle | undefined;
   if (options.journalDirectory !== undefined) {
-    journal = await createOperationJournal(options.journalDirectory, {
-      entries: prepared.map((replacement) => ({
-        action: replacement.action,
-        destination: replacement.destinationRelativePath,
-        state: 'pending',
-      })),
+    journal = await createOperationJournalV2(options.journalDirectory, {
+      entries: journalEntries(() => 'pending'),
       kind: options.kind,
       now: now(),
       operationId,
+      rootFingerprint,
+      scope:
+        options.scope ??
+        ({
+          id: `root-${rootFingerprint}`,
+          kind: options.kind.startsWith('global-') ? 'global' : 'project',
+        } satisfies OperationJournalV2['scope']),
     });
+    await options.hooks?.afterDurableStep?.('journal-created');
   }
-
-  const journalEntries = (stateForIndex: (index: number) => OperationJournalEntry['state']) =>
-    prepared.map((replacement, index) => ({
-      action: replacement.action,
-      destination: replacement.destinationRelativePath,
-      state: stateForIndex(index),
-    }));
+  const entryStates: OperationJournalV2Entry['state'][] = prepared.map(() => 'pending');
 
   try {
-    for (const replacement of prepared) {
+    for (const [index, replacement] of prepared.entries()) {
       await mkdir(dirname(replacement.destinationPath), { recursive: true, mode: 0o700 });
       if (replacement.candidatePath !== undefined && replacement.stagedPath !== undefined) {
         await copyRegularPath(replacement.stagedPath, replacement.candidatePath);
+        await syncRegularPath(replacement.candidatePath);
+        await syncDirectoryDurably(dirname(replacement.candidatePath));
       }
+      entryStates[index] = 'prepared';
+      await options.hooks?.afterDurableStep?.('candidate-prepared', index);
     }
     if (journal !== undefined) {
       journal = {
         path: journal.path,
-        value: await updateOperationJournal(journal.path, {
-          entries: journalEntries(() => 'prepared'),
+        value: await updateOperationJournalV2(journal.path, {
+          entries: journalEntries((index) => entryStates[index] ?? 'pending'),
           now: now(),
           status: 'prepared',
         }),
       };
+      await options.hooks?.afterDurableStep?.('journal-prepared');
+    }
+    for (const replacement of prepared) {
+      const destinationDigest = (await pathExists(replacement.destinationPath))
+        ? await transactionContentDigest(replacement.destinationPath)
+        : null;
+      if (destinationDigest !== replacement.originalDigest) {
+        throw new MutationPlanChangedError(
+          replacement.destinationRelativePath,
+          'destination-digest',
+          planFingerprint,
+        );
+      }
+      if (replacement.candidatePath !== undefined) {
+        const candidateDigest = await transactionContentDigest(replacement.candidatePath);
+        if (candidateDigest !== replacement.finalDigest) {
+          throw new MutationPlanChangedError(
+            replacement.destinationRelativePath,
+            'candidate-digest',
+            planFingerprint,
+          );
+        }
+      }
+    }
+    if (journal !== undefined) {
+      options.operationGuard?.beginCommit();
       journal = {
         path: journal.path,
-        value: await updateOperationJournal(journal.path, {
+        value: await updateOperationJournalV2(journal.path, {
           entries: journal.value.entries,
           now: now(),
           status: 'committing',
         }),
       };
+      await options.hooks?.afterDurableStep?.('journal-committing');
+    } else {
+      options.operationGuard?.beginCommit();
     }
 
     for (const [index, replacement] of prepared.entries()) {
       await options.hooks?.beforeCommit?.(index);
       if (await pathExists(replacement.destinationPath)) {
-        await rename(replacement.destinationPath, replacement.rollbackPath);
+        await renameDurably(replacement.destinationPath, replacement.rollbackPath);
         replacement.originalMoved = true;
+        entryStates[index] = 'original-moved';
+        await options.hooks?.afterDurableStep?.('original-moved', index);
+        if (journal !== undefined) {
+          journal = {
+            path: journal.path,
+            value: await updateOperationJournalV2(journal.path, {
+              entries: journalEntries((entryIndex) => entryStates[entryIndex] ?? 'pending'),
+              now: now(),
+              status: 'committing',
+            }),
+          };
+          await options.hooks?.afterDurableStep?.('journal-original-moved', index);
+        }
       }
       if (replacement.action === 'replace') {
         if (replacement.candidatePath === undefined) {
           throw new Error('Prepared replacement is missing its candidate path.');
         }
-        await rename(replacement.candidatePath, replacement.destinationPath);
+        await renameDurably(replacement.candidatePath, replacement.destinationPath);
         replacement.newCommitted = true;
+        await options.hooks?.afterDurableStep?.('candidate-committed', index);
+      }
+      entryStates[index] = 'committed';
+      if (journal !== undefined) {
+        journal = {
+          path: journal.path,
+          value: await updateOperationJournalV2(journal.path, {
+            entries: journalEntries((entryIndex) => entryStates[entryIndex] ?? 'pending'),
+            now: now(),
+            status: 'committing',
+          }),
+        };
+        await options.hooks?.afterDurableStep?.('journal-entry-committed', index);
       }
     }
 
     if (journal !== undefined) {
       journal = {
         path: journal.path,
-        value: await updateOperationJournal(journal.path, {
-          entries: journalEntries(() => 'committed'),
+        value: await updateOperationJournalV2(journal.path, {
+          entries: journalEntries((index) => entryStates[index] ?? 'pending'),
           now: now(),
           status: 'committed',
         }),
       };
+      options.operationGuard?.markCommitted();
+      await options.hooks?.afterDurableStep?.('journal-committed');
+    } else {
+      options.operationGuard?.markCommitted();
     }
     // Cleanup happens only after the transaction is durably marked committed. A cleanup failure
     // leaves a recoverable hidden rollback copy and must never trigger removal of committed data.
     for (const replacement of prepared) {
       if (replacement.originalMoved) {
-        await rm(replacement.rollbackPath, { force: true, recursive: true }).catch(() => undefined);
+        await removeDurably(replacement.rollbackPath).catch(() => undefined);
       }
     }
     return { ...(journal === undefined ? {} : { journal }) };
   } catch (error) {
+    if (journal?.value.status === 'committed' || options.operationGuard?.state === 'committed') {
+      return { ...(journal === undefined ? {} : { journal }) };
+    }
     if (
       journal !== undefined &&
       ['preparing', 'prepared', 'committing'].includes(journal.value.status)
     ) {
       journal = {
         path: journal.path,
-        value: await updateOperationJournal(journal.path, {
-          entries: journalEntries((index) => {
-            const replacement = prepared[index];
-            if (replacement?.newCommitted === true) return 'committed';
-            if (replacement?.originalMoved === true) return 'original-moved';
-            return replacement?.candidatePath === undefined ? 'pending' : 'prepared';
-          }),
+        value: await updateOperationJournalV2(journal.path, {
+          entries: journalEntries((index) => entryStates[index] ?? 'pending'),
           now: now(),
           status: 'rolling-back',
         }),
       };
+      await options.hooks?.afterDurableStep?.('journal-rolling-back');
     }
 
     const rollbackFailures: unknown[] = [];
-    for (const replacement of [...prepared].reverse()) {
+    for (const [reverseIndex, replacement] of [...prepared].reverse().entries()) {
+      const index = prepared.length - reverseIndex - 1;
       try {
         if (replacement.newCommitted && (await pathExists(replacement.destinationPath))) {
-          await rm(replacement.destinationPath, { force: true, recursive: true });
+          await removeDurably(replacement.destinationPath);
+          replacement.newCommitted = false;
+          await options.hooks?.afterDurableStep?.('committed-destination-removed', index);
         }
         if (replacement.originalMoved && (await pathExists(replacement.rollbackPath))) {
-          await rename(replacement.rollbackPath, replacement.destinationPath);
+          await renameDurably(replacement.rollbackPath, replacement.destinationPath);
+          replacement.originalMoved = false;
+          await options.hooks?.afterDurableStep?.('original-restored', index);
         }
         if (
           replacement.candidatePath !== undefined &&
           (await pathExists(replacement.candidatePath))
         ) {
-          await rm(replacement.candidatePath, { force: true, recursive: true });
+          await removeDurably(replacement.candidatePath);
+          await options.hooks?.afterDurableStep?.('candidate-removed', index);
         }
+        entryStates[index] = 'restored';
       } catch (rollbackError) {
         rollbackFailures.push(rollbackError);
       }
@@ -607,17 +1228,489 @@ export async function replacePathsAtomically(options: {
 
     if (journal !== undefined) {
       const finalStatus = rollbackFailures.length === 0 ? 'rolled-back' : 'failed';
-      const journalBeforeFinalUpdate = journal;
-      await updateOperationJournal(journal.path, {
-        entries: journalEntries(() => (rollbackFailures.length === 0 ? 'restored' : 'committed')),
-        note: redactCredentials(error instanceof Error ? error.message : String(error)),
-        now: now(),
-        status: finalStatus,
-      }).catch(() => journalBeforeFinalUpdate.value);
+      try {
+        journal = {
+          path: journal.path,
+          value: await updateOperationJournalV2(journal.path, {
+            entries: journalEntries((index) => entryStates[index] ?? 'pending'),
+            note: redactCredentials(error instanceof Error ? error.message : String(error)),
+            now: now(),
+            status: finalStatus,
+          }),
+        };
+        await options.hooks?.afterDurableStep?.(
+          finalStatus === 'rolled-back' ? 'journal-rolled-back' : 'journal-failed',
+        );
+      } catch (journalError) {
+        rollbackFailures.push(journalError);
+      }
     }
     if (rollbackFailures.length > 0) {
+      if (
+        options.operationGuard !== undefined &&
+        options.operationGuard.state !== 'recovery-required'
+      ) {
+        options.operationGuard.markRecoveryRequired();
+      }
       throw new TransactionRollbackError(rollbackFailures, { cause: error });
     }
-    throw error;
+    if (options.operationGuard !== undefined && options.operationGuard.state !== 'rolled-back') {
+      options.operationGuard.markRolledBack();
+    }
+    if (error instanceof RecoveryIntegrityError || error instanceof SkillSyncError) throw error;
+    throw new TransactionRolledBackError({ cause: error });
   }
+}
+
+export type RecoveryResumeAction = 'commit-candidate' | 'mark-committed' | 'move-original';
+
+export interface RecoveryResumePlanEntry {
+  readonly action: OperationJournalV2Entry['action'];
+  readonly actions: readonly RecoveryResumeAction[];
+  readonly candidate?: string;
+  readonly destination: string;
+  readonly index: number;
+  readonly rollback: string;
+}
+
+export interface RecoveryResumePlan {
+  readonly entries: readonly RecoveryResumePlanEntry[];
+  readonly fingerprint: string;
+  readonly journalPath: string;
+  readonly operationId: string;
+  readonly root: string;
+  readonly rootFingerprint: string;
+  readonly status: OperationJournalStatus;
+}
+
+export class TransactionRecoveryValidationError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'TransactionRecoveryValidationError';
+  }
+}
+
+async function digestIfPresent(path: string): Promise<string | null> {
+  if (!(await pathExists(path))) return null;
+  return await transactionContentDigest(path);
+}
+
+function recoveryPlanFingerprint(plan: Omit<RecoveryResumePlan, 'fingerprint'>): string {
+  return createHash('sha256')
+    .update('skill-sync-recovery-resume-plan-v1\0')
+    .update(stableJsonStringify(plan))
+    .digest('hex');
+}
+
+export async function planOperationJournalResume(
+  journalPath: string,
+  root: string,
+): Promise<RecoveryResumePlan> {
+  const journal = await readOperationJournal(journalPath);
+  if (journal.schemaVersion !== OPERATION_JOURNAL_SCHEMA_VERSION) {
+    throw new TransactionRecoveryValidationError(
+      'Legacy operation journals are inspect-only and cannot be resumed.',
+    );
+  }
+  if (journal.status === 'rolled-back' || journal.status === 'rolling-back') {
+    throw new TransactionRecoveryValidationError(
+      `Operation ${journal.operationId} is ${journal.status} and cannot be resumed forward.`,
+    );
+  }
+  const realRoot = await realpath(root);
+  const rootFingerprint = transactionRootFingerprint(realRoot);
+  if (rootFingerprint !== journal.rootFingerprint) {
+    throw new TransactionRecoveryValidationError(
+      'The selected recovery root does not match the journal root fingerprint.',
+    );
+  }
+
+  const entries: RecoveryResumePlanEntry[] = [];
+  for (const [index, entry] of journal.entries.entries()) {
+    await resolveContainedProjectPath(realRoot, entry.destination);
+    await resolveContainedProjectPath(realRoot, entry.rollback);
+    if (entry.candidate !== undefined) {
+      await resolveContainedProjectPath(realRoot, entry.candidate);
+    }
+    const destination = resolve(realRoot, ...entry.destination.split('/'));
+    const rollback = resolve(realRoot, ...entry.rollback.split('/'));
+    const candidate =
+      entry.candidate === undefined ? undefined : resolve(realRoot, ...entry.candidate.split('/'));
+    const destinationDigest = await digestIfPresent(destination);
+    const rollbackDigest = await digestIfPresent(rollback);
+    const candidateDigest = candidate === undefined ? null : await digestIfPresent(candidate);
+
+    if (rollbackDigest !== null && rollbackDigest !== entry.originalDigest) {
+      throw new TransactionRecoveryValidationError(
+        `Rollback evidence conflicts with the journal for ${entry.destination}.`,
+      );
+    }
+    if (candidateDigest !== null && candidateDigest !== entry.sourceDigest) {
+      throw new TransactionRecoveryValidationError(
+        `Candidate evidence conflicts with the journal for ${entry.destination}.`,
+      );
+    }
+
+    const actions: RecoveryResumeAction[] = [];
+    if (entry.action === 'replace') {
+      if (destinationDigest === entry.finalDigest && candidateDigest === null) {
+        actions.push('mark-committed');
+      } else {
+        if (candidateDigest !== entry.sourceDigest || candidate === undefined) {
+          throw new TransactionRecoveryValidationError(
+            `The replacement candidate is unavailable for ${entry.destination}.`,
+          );
+        }
+        if (destinationDigest === entry.originalDigest && rollbackDigest === null) {
+          if (entry.originalDigest !== null) actions.push('move-original');
+        } else if (
+          destinationDigest !== null ||
+          (entry.originalDigest !== null && rollbackDigest !== entry.originalDigest)
+        ) {
+          throw new TransactionRecoveryValidationError(
+            `Destination evidence conflicts with the journal for ${entry.destination}.`,
+          );
+        }
+        actions.push('commit-candidate');
+      }
+    } else if (destinationDigest === null) {
+      if (
+        entry.originalDigest !== null &&
+        rollbackDigest !== null &&
+        rollbackDigest !== entry.originalDigest
+      ) {
+        throw new TransactionRecoveryValidationError(
+          `Removal rollback evidence conflicts with the journal for ${entry.destination}.`,
+        );
+      }
+      actions.push('mark-committed');
+    } else if (destinationDigest === entry.originalDigest && rollbackDigest === null) {
+      actions.push('move-original', 'mark-committed');
+    } else {
+      throw new TransactionRecoveryValidationError(
+        `Removal destination conflicts with the journal for ${entry.destination}.`,
+      );
+    }
+
+    entries.push({
+      action: entry.action,
+      actions,
+      ...(candidate === undefined ? {} : { candidate }),
+      destination,
+      index,
+      rollback,
+    });
+  }
+
+  const planWithoutFingerprint = {
+    entries,
+    journalPath,
+    operationId: journal.operationId,
+    root: realRoot,
+    rootFingerprint,
+    status: journal.status,
+  };
+  return {
+    ...planWithoutFingerprint,
+    fingerprint: recoveryPlanFingerprint(planWithoutFingerprint),
+  };
+}
+
+export async function resumeOperationJournal(options: {
+  readonly expectedFingerprint: string;
+  readonly hooks?: TransactionHooks;
+  readonly journalPath: string;
+  readonly now?: () => Date;
+  readonly operationGuard?: OperationGuard;
+  readonly root: string;
+}): Promise<OperationJournalV2Handle> {
+  const plan = await planOperationJournalResume(options.journalPath, options.root);
+  if (plan.fingerprint !== options.expectedFingerprint) {
+    throw new TransactionRecoveryValidationError(
+      'Recovery evidence changed after review; generate and confirm a fresh resume plan.',
+    );
+  }
+  const current = await readOperationJournal(options.journalPath);
+  if (current.schemaVersion !== OPERATION_JOURNAL_SCHEMA_VERSION) {
+    throw new TransactionRecoveryValidationError('Legacy operation journals are inspect-only.');
+  }
+  if (current.status === 'committed') {
+    return { path: options.journalPath, value: current };
+  }
+
+  const now = options.now ?? (() => new Date());
+  const entries = current.entries.map((entry) => ({ ...entry }));
+  const setEntryState = (index: number, state: OperationJournalV2Entry['state']): void => {
+    const entry = entries[index];
+    if (entry === undefined) {
+      throw new TransactionRecoveryValidationError(
+        `Resume plan references missing journal entry ${String(index)}.`,
+      );
+    }
+    entries[index] = { ...entry, state };
+  };
+  options.operationGuard?.beginCommit();
+  await updateOperationJournalV2(options.journalPath, {
+    entries,
+    now: now(),
+    status: 'committing',
+  });
+  await options.hooks?.afterDurableStep?.('journal-committing');
+
+  for (const planned of plan.entries) {
+    for (const action of planned.actions) {
+      if (action === 'move-original') {
+        await renameDurably(planned.destination, planned.rollback);
+        setEntryState(planned.index, 'original-moved');
+        await options.hooks?.afterDurableStep?.('original-moved', planned.index);
+        await updateOperationJournalV2(options.journalPath, {
+          entries,
+          now: now(),
+          status: 'committing',
+        });
+        await options.hooks?.afterDurableStep?.('journal-original-moved', planned.index);
+      } else if (action === 'commit-candidate') {
+        if (planned.candidate === undefined) {
+          throw new TransactionRecoveryValidationError(
+            `Resume plan is missing a candidate for ${planned.destination}.`,
+          );
+        }
+        await renameDurably(planned.candidate, planned.destination);
+        setEntryState(planned.index, 'committed');
+        await options.hooks?.afterDurableStep?.('candidate-committed', planned.index);
+        await updateOperationJournalV2(options.journalPath, {
+          entries,
+          now: now(),
+          status: 'committing',
+        });
+        await options.hooks?.afterDurableStep?.('journal-entry-committed', planned.index);
+      } else {
+        setEntryState(planned.index, 'committed');
+        await updateOperationJournalV2(options.journalPath, {
+          entries,
+          now: now(),
+          status: 'committing',
+        });
+        await options.hooks?.afterDurableStep?.('journal-entry-committed', planned.index);
+      }
+    }
+  }
+
+  const journal = await updateOperationJournalV2(options.journalPath, {
+    entries,
+    now: now(),
+    status: 'committed',
+  });
+  options.operationGuard?.markCommitted();
+  await options.hooks?.afterDurableStep?.('journal-committed');
+  for (const entry of plan.entries) {
+    if (await pathExists(entry.rollback)) {
+      await removeDurably(entry.rollback).catch(() => undefined);
+    }
+  }
+  return { path: options.journalPath, value: journal };
+}
+
+export type RecoveryRestoreAction =
+  'mark-restored' | 'remove-candidate' | 'remove-committed' | 'restore-original';
+
+export interface RecoveryRestorePlanEntry {
+  readonly actions: readonly RecoveryRestoreAction[];
+  readonly candidate?: string;
+  readonly destination: string;
+  readonly index: number;
+  readonly rollback: string;
+}
+
+export interface RecoveryRestorePlan {
+  readonly entries: readonly RecoveryRestorePlanEntry[];
+  readonly fingerprint: string;
+  readonly journalPath: string;
+  readonly operationId: string;
+  readonly root: string;
+  readonly rootFingerprint: string;
+  readonly status: OperationJournalStatus;
+}
+
+function recoveryRestorePlanFingerprint(plan: Omit<RecoveryRestorePlan, 'fingerprint'>): string {
+  return createHash('sha256')
+    .update('skill-sync-recovery-restore-plan-v1\0')
+    .update(stableJsonStringify(plan))
+    .digest('hex');
+}
+
+export async function planOperationJournalRestore(
+  journalPath: string,
+  root: string,
+): Promise<RecoveryRestorePlan> {
+  const journal = await readOperationJournal(journalPath);
+  if (journal.schemaVersion !== OPERATION_JOURNAL_SCHEMA_VERSION) {
+    throw new TransactionRecoveryValidationError(
+      'Legacy operation journals are inspect-only and cannot be restored.',
+    );
+  }
+  const realRoot = await realpath(root);
+  const rootFingerprint = transactionRootFingerprint(realRoot);
+  if (rootFingerprint !== journal.rootFingerprint) {
+    throw new TransactionRecoveryValidationError(
+      'The selected recovery root does not match the journal root fingerprint.',
+    );
+  }
+
+  const entries: RecoveryRestorePlanEntry[] = [];
+  for (const [index, entry] of journal.entries.entries()) {
+    await resolveContainedProjectPath(realRoot, entry.destination);
+    await resolveContainedProjectPath(realRoot, entry.rollback);
+    if (entry.candidate !== undefined) {
+      await resolveContainedProjectPath(realRoot, entry.candidate);
+    }
+    const destination = resolve(realRoot, ...entry.destination.split('/'));
+    const rollback = resolve(realRoot, ...entry.rollback.split('/'));
+    const candidate =
+      entry.candidate === undefined ? undefined : resolve(realRoot, ...entry.candidate.split('/'));
+    const destinationDigest = await digestIfPresent(destination);
+    const rollbackDigest = await digestIfPresent(rollback);
+    const candidateDigest = candidate === undefined ? null : await digestIfPresent(candidate);
+
+    if (rollbackDigest !== null && rollbackDigest !== entry.originalDigest) {
+      throw new TransactionRecoveryValidationError(
+        `Rollback evidence conflicts with the journal for ${entry.destination}.`,
+      );
+    }
+    if (candidateDigest !== null && candidateDigest !== entry.sourceDigest) {
+      throw new TransactionRecoveryValidationError(
+        `Candidate evidence conflicts with the journal for ${entry.destination}.`,
+      );
+    }
+
+    const actions: RecoveryRestoreAction[] = [];
+    if (entry.originalDigest === null) {
+      if (rollbackDigest !== null) {
+        throw new TransactionRecoveryValidationError(
+          `Unexpected rollback content exists for ${entry.destination}.`,
+        );
+      }
+      if (destinationDigest !== null) {
+        if (entry.action !== 'replace' || destinationDigest !== entry.finalDigest) {
+          throw new TransactionRecoveryValidationError(
+            `Destination evidence conflicts with the journal for ${entry.destination}.`,
+          );
+        }
+        actions.push('remove-committed');
+      }
+    } else if (destinationDigest === entry.originalDigest && rollbackDigest === null) {
+      // The original state is already present.
+    } else if (
+      (destinationDigest === null || destinationDigest === entry.finalDigest) &&
+      rollbackDigest === entry.originalDigest
+    ) {
+      if (destinationDigest !== null) actions.push('remove-committed');
+      actions.push('restore-original');
+    } else {
+      throw new TransactionRecoveryValidationError(
+        `Destination evidence conflicts with the journal for ${entry.destination}.`,
+      );
+    }
+    if (candidateDigest !== null) actions.push('remove-candidate');
+    actions.push('mark-restored');
+
+    entries.push({
+      actions,
+      ...(candidate === undefined ? {} : { candidate }),
+      destination,
+      index,
+      rollback,
+    });
+  }
+
+  const planWithoutFingerprint = {
+    entries,
+    journalPath,
+    operationId: journal.operationId,
+    root: realRoot,
+    rootFingerprint,
+    status: journal.status,
+  };
+  return {
+    ...planWithoutFingerprint,
+    fingerprint: recoveryRestorePlanFingerprint(planWithoutFingerprint),
+  };
+}
+
+export async function restoreOperationJournal(options: {
+  readonly expectedFingerprint: string;
+  readonly hooks?: TransactionHooks;
+  readonly journalPath: string;
+  readonly now?: () => Date;
+  readonly operationGuard?: OperationGuard;
+  readonly root: string;
+}): Promise<OperationJournalV2Handle> {
+  const plan = await planOperationJournalRestore(options.journalPath, options.root);
+  if (plan.fingerprint !== options.expectedFingerprint) {
+    throw new TransactionRecoveryValidationError(
+      'Recovery evidence changed after review; generate and confirm a fresh restore plan.',
+    );
+  }
+  const current = await readOperationJournal(options.journalPath);
+  if (current.schemaVersion !== OPERATION_JOURNAL_SCHEMA_VERSION) {
+    throw new TransactionRecoveryValidationError('Legacy operation journals are inspect-only.');
+  }
+  if (current.status === 'rolled-back') {
+    return { path: options.journalPath, value: current };
+  }
+
+  const now = options.now ?? (() => new Date());
+  const entries = current.entries.map((entry) => ({ ...entry }));
+  const setEntryState = (index: number, state: OperationJournalV2Entry['state']): void => {
+    const entry = entries[index];
+    if (entry === undefined) {
+      throw new TransactionRecoveryValidationError(
+        `Restore plan references missing journal entry ${String(index)}.`,
+      );
+    }
+    entries[index] = { ...entry, state };
+  };
+  options.operationGuard?.beginCommit();
+  await updateOperationJournalV2(options.journalPath, {
+    entries,
+    now: now(),
+    status: 'rolling-back',
+  });
+  await options.hooks?.afterDurableStep?.('journal-rolling-back');
+
+  for (const planned of [...plan.entries].reverse()) {
+    for (const action of planned.actions) {
+      if (action === 'remove-committed') {
+        await removeDurably(planned.destination);
+        const originalExists = await pathExists(planned.rollback);
+        setEntryState(planned.index, originalExists ? 'original-moved' : 'restored');
+        await options.hooks?.afterDurableStep?.('committed-destination-removed', planned.index);
+      } else if (action === 'restore-original') {
+        await renameDurably(planned.rollback, planned.destination);
+        setEntryState(planned.index, 'restored');
+        await options.hooks?.afterDurableStep?.('original-restored', planned.index);
+      } else if (action === 'remove-candidate') {
+        if (planned.candidate !== undefined) {
+          await removeDurably(planned.candidate);
+          await options.hooks?.afterDurableStep?.('candidate-removed', planned.index);
+        }
+      } else {
+        setEntryState(planned.index, 'restored');
+      }
+      await updateOperationJournalV2(options.journalPath, {
+        entries,
+        now: now(),
+        status: 'rolling-back',
+      });
+    }
+  }
+
+  const journal = await updateOperationJournalV2(options.journalPath, {
+    entries,
+    now: now(),
+    status: 'rolled-back',
+  });
+  options.operationGuard?.markCommitted();
+  await options.hooks?.afterDurableStep?.('journal-rolled-back');
+  return { path: options.journalPath, value: journal };
 }

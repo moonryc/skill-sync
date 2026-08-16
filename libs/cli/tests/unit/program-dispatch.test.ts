@@ -21,19 +21,11 @@ interface DispatchCase {
 }
 
 const dispatchCases: readonly DispatchCase[] = [
+  { argv: ['self-update'], command: 'self-update' },
   {
-    argv: [
-      '--json',
-      '--no-input',
-      '--yes',
-      '--project',
-      '/project',
-      'init',
-      '--create',
-      'acme/skills',
-    ],
+    argv: ['--json', '--no-input', '--yes', 'init', '--create', 'acme/skills'],
     command: 'init',
-    options: { json: true, noInput: true, project: '/project', yes: true },
+    options: { json: true, noInput: true, yes: true },
   },
   {
     argv: ['install', 'group/one', 'group/two', '--target', 'codex', '--no-gitignore', '--dry-run'],
@@ -73,6 +65,35 @@ const dispatchCases: readonly DispatchCase[] = [
   { argv: ['config', 'set', 'library.branch', 'main'], command: 'config:set' },
   { argv: ['config', 'unset', 'library.branch'], command: 'config:unset' },
   { argv: ['doctor', '--offline'], command: 'doctor', options: { offline: true } },
+  {
+    argv: ['recovery', 'list', '--scope', 'project', '--include-terminal'],
+    command: 'recovery:list',
+    options: { includeTerminal: true, scope: 'project' },
+  },
+  {
+    argv: ['recovery', 'inspect', 'journal-abc-operation'],
+    command: 'recovery:inspect',
+  },
+  {
+    argv: ['recovery', 'unlock', 'lock-abc-operation', '--dry-run'],
+    command: 'recovery:unlock',
+    options: { dryRun: true },
+  },
+  {
+    argv: ['recovery', 'resume', 'journal-abc-operation', '--dry-run'],
+    command: 'recovery:resume',
+    options: { dryRun: true },
+  },
+  {
+    argv: ['recovery', 'restore', 'journal-abc-operation', '--dry-run'],
+    command: 'recovery:restore',
+    options: { dryRun: true },
+  },
+  {
+    argv: ['recovery', 'prune', 'journal-abc-operation', 'backup-def-operation', '--dry-run'],
+    command: 'recovery:prune',
+    options: { dryRun: true },
+  },
   { argv: ['library', 'remove', 'group/one', '--dry-run'], command: 'library:remove' },
   { argv: ['group', 'list'], command: 'group:list' },
   { argv: ['group', 'create', 'engineering'], command: 'group:create' },
@@ -105,6 +126,52 @@ describe('program command dispatch', () => {
       dispatchCases.map((entry) => entry.command),
     );
     expect(new Set(seen.map((invocation) => invocation.command)).size).toBe(dispatchCases.length);
+  });
+
+  it('dispatches show through the read-only info command identity', async () => {
+    const seen: CommandInvocation[] = [];
+    const program = createProgram({
+      io: memoryIo(),
+      execute: (invocation) => {
+        seen.push(invocation);
+        return Promise.resolve(success({}));
+      },
+    });
+
+    await program.parseAsync(['node', 'skill-sync', '--global', 'show', 'group/one']);
+
+    expect(seen[0]).toMatchObject({
+      command: 'info',
+      options: { global: true },
+    });
+    expect(seen[0]?.arguments[0]).toBe('group/one');
+  });
+
+  it('dispatches an exact reviewed install fingerprint', async () => {
+    const seen: CommandInvocation[] = [];
+    const program = createProgram({
+      io: memoryIo(),
+      execute: (invocation) => {
+        seen.push(invocation);
+        return Promise.resolve(success({}));
+      },
+    });
+
+    await program.parseAsync([
+      'node',
+      'skill-sync',
+      'install',
+      'group/one',
+      '--target',
+      'codex',
+      '--expect-plan',
+      `install-v1-${'a'.repeat(64)}`,
+    ]);
+
+    expect(seen[0]).toMatchObject({
+      command: 'install',
+      options: { expectPlan: `install-v1-${'a'.repeat(64)}`, target: ['codex'] },
+    });
   });
 
   it('passes the explicit global scope selector to supported commands', async () => {

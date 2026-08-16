@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { RecoveryIntegrityError } from '../../src/domain/recovery-integrity.js';
 import { EXIT_CODES, failure, SkillSyncError, success } from '../../src/domain/result.js';
 import {
   runWithRuntimeBoundary,
@@ -164,6 +165,192 @@ describe('runtime command boundary', () => {
     ]);
     expect(contexts).toEqual([expect.stringContaining('"reason":"cancelled"')]);
     expect(signals.listenerCount()).toBe(0);
+  });
+
+  it('defers a commit-time signal and preserves committed success', async () => {
+    const signals = new FakeSignalSource();
+    const diagnostics: RuntimeBoundaryDiagnostic[] = [];
+    const result = await runWithRuntimeBoundary(
+      async (context) => {
+        context.operationGuard.beginCommit();
+        signals.emit('SIGTERM');
+        context.throwIfCancelled();
+        context.operationGuard.markCommitted();
+        return await Promise.resolve(success({ durable: true }));
+      },
+      {
+        diagnostics: (diagnostic) => diagnostics.push(diagnostic),
+        signalSource: signals,
+      },
+    );
+
+    expect(result).toEqual(success({ durable: true }));
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toEqual([
+      'CANCELLED',
+      'POST_COMMIT_INTERRUPTION',
+    ]);
+  });
+
+  it('reclassifies a returned cancellation after commit as a post-commit failure', async () => {
+    const diagnostics: RuntimeBoundaryDiagnostic[] = [];
+    const result = await runWithRuntimeBoundary(
+      (context) => {
+        context.operationGuard.beginCommit();
+        context.operationGuard.markCommitted();
+        return Promise.resolve(
+          failure({ code: 'CANCELLED', message: 'late cancellation' }, EXIT_CODES.cancelled),
+        );
+      },
+      {
+        diagnostics: (diagnostic) => diagnostics.push(diagnostic),
+        signalSource: new FakeSignalSource(),
+      },
+    );
+
+    expect(result).toMatchObject({
+      errors: [{ code: 'POST_COMMIT_INTERRUPTION' }],
+      exitCode: EXIT_CODES.internal,
+      ok: false,
+    });
+    expect(JSON.stringify(result)).not.toContain('"code":"CANCELLED"');
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toEqual(['POST_COMMIT_INTERRUPTION']);
+  });
+
+  it('preserves an exception after commit instead of replacing it with late cancellation', async () => {
+    const signals = new FakeSignalSource();
+    const diagnostics: RuntimeBoundaryDiagnostic[] = [];
+    const result = await runWithRuntimeBoundary(
+      (context) => {
+        context.operationGuard.beginCommit();
+        context.operationGuard.markCommitted();
+        signals.emit('SIGINT');
+        throw new Error('post-commit cleanup failed');
+      },
+      {
+        diagnostics: (diagnostic) => diagnostics.push(diagnostic),
+        signalSource: signals,
+      },
+    );
+
+    expect(result).toMatchObject({
+      errors: [{ code: 'INTERNAL_ERROR' }],
+      exitCode: EXIT_CODES.internal,
+      ok: false,
+    });
+    expect(JSON.stringify(result)).not.toContain('"code":"CANCELLED"');
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toEqual([
+      'CANCELLED',
+      'POST_COMMIT_INTERRUPTION',
+      'INTERNAL_ERROR',
+    ]);
+  });
+
+  it('reclassifies an abort thrown after commit as a post-commit failure', async () => {
+    const signals = new FakeSignalSource();
+    const diagnostics: RuntimeBoundaryDiagnostic[] = [];
+    const result = await runWithRuntimeBoundary(
+      (context) => {
+        context.operationGuard.beginCommit();
+        context.operationGuard.markCommitted();
+        signals.emit('SIGTERM');
+        const abort = new Error('aborted after commit');
+        abort.name = 'AbortError';
+        throw abort;
+      },
+      {
+        diagnostics: (diagnostic) => diagnostics.push(diagnostic),
+        signalSource: signals,
+      },
+    );
+
+    expect(result).toMatchObject({
+      errors: [{ code: 'POST_COMMIT_INTERRUPTION' }],
+      exitCode: EXIT_CODES.internal,
+      ok: false,
+    });
+    expect(JSON.stringify(result)).not.toContain('"code":"CANCELLED"');
+    expect(diagnostics.map((diagnostic) => diagnostic.code)).toEqual([
+      'CANCELLED',
+      'POST_COMMIT_INTERRUPTION',
+    ]);
+  });
+
+  it('returns recovery-required for an ambiguous commit and cancellation for proven rollback', async () => {
+    const ambiguousSignals = new FakeSignalSource();
+    const ambiguous = await runWithRuntimeBoundary(
+      (context) => {
+        context.operationGuard.beginCommit();
+        ambiguousSignals.emit('SIGINT');
+        return Promise.resolve(success({ durable: false }));
+      },
+      { signalSource: ambiguousSignals },
+    );
+    expect(ambiguous).toMatchObject({
+      errors: [{ code: 'RECOVERY_REQUIRED' }],
+      exitCode: EXIT_CODES.conflict,
+      ok: false,
+    });
+
+    const rolledBackSignals = new FakeSignalSource();
+    const rolledBack = await runWithRuntimeBoundary(
+      (context) => {
+        context.operationGuard.beginCommit();
+        rolledBackSignals.emit('SIGINT');
+        context.operationGuard.markRolledBack();
+        return Promise.resolve(success({ durable: false }));
+      },
+      { signalSource: rolledBackSignals },
+    );
+    expect(rolledBack).toMatchObject({
+      errors: [{ code: 'CANCELLED' }],
+      exitCode: EXIT_CODES.cancelled,
+      ok: false,
+    });
+  });
+
+  it('does not report cancellation when an interruption throws after commit begins', async () => {
+    const signals = new FakeSignalSource();
+    const result = await runWithRuntimeBoundary(
+      (context) => {
+        context.operationGuard.beginCommit();
+        signals.emit('SIGINT');
+        const interruption = new Error('interrupted during a durable recovery step');
+        interruption.name = 'AbortError';
+        throw interruption;
+      },
+      { signalSource: signals },
+    );
+
+    expect(result).toMatchObject({
+      errors: [{ code: 'RECOVERY_REQUIRED' }],
+      exitCode: EXIT_CODES.conflict,
+      ok: false,
+    });
+  });
+
+  it('preserves the recovery-required contract for fatal integrity errors', async () => {
+    const result = await runWithRuntimeBoundary(
+      () =>
+        Promise.reject(
+          new RecoveryIntegrityError(
+            'journal-transition',
+            'The journal transition could not be proven.',
+          ),
+        ),
+      { signalSource: new FakeSignalSource() },
+    );
+
+    expect(result).toEqual({
+      errors: [
+        {
+          code: 'RECOVERY_REQUIRED',
+          details: { recoveryKind: 'journal-transition' },
+          message: 'The journal transition could not be proven.',
+        },
+      ],
+      exitCode: EXIT_CODES.conflict,
+      ok: false,
+    });
   });
 
   it('cooperates with recovery for returned failures and skips completed participants', async () => {

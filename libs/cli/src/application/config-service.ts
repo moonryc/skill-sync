@@ -61,6 +61,11 @@ export interface ConfigurationListing {
   readonly effective: ReturnType<typeof resolveConfiguration>;
 }
 
+export interface ConfigUnsetResult {
+  readonly changed: boolean;
+  readonly changedKeys: readonly ConfigKey[];
+}
+
 export class ConfigService {
   readonly paths: ApplicationPaths;
 
@@ -119,7 +124,11 @@ export class ConfigService {
         break;
       }
       case 'library.branch': {
-        if (current.library === undefined) throw new Error('Configure library.remote first.');
+        if (current.library === undefined) {
+          throw new Error(
+            'Configure library.remote first with skill-sync config set library.remote <repository-url>.',
+          );
+        }
         const branch = rawValue.trim();
         if (branch.length === 0 || branch.length > 255 || /[\0\r\n]/u.test(branch)) {
           throw new Error('library.branch must be a nonempty portable Git branch name.');
@@ -128,7 +137,11 @@ export class ConfigService {
         break;
       }
       case 'library.transport': {
-        if (current.library === undefined) throw new Error('Configure library.remote first.');
+        if (current.library === undefined) {
+          throw new Error(
+            'Configure library.remote first with skill-sync config set library.remote <repository-url>.',
+          );
+        }
         if (rawValue !== 'https' && rawValue !== 'ssh') {
           throw new Error('library.transport must be https or ssh.');
         }
@@ -162,17 +175,24 @@ export class ConfigService {
     return await writeUserConfig(this.paths.configFile, next);
   }
 
-  async unset(keyValue: string): Promise<UserConfig> {
+  async unset(keyValue: string): Promise<ConfigUnsetResult> {
     const key = requireKey(keyValue);
     const current = await this.read();
     let next: UserConfig = current;
+    let changedKeys: readonly ConfigKey[] = [];
 
-    if (key === 'library.remote') {
+    if (key === 'library.remote' && current.library !== undefined) {
+      changedKeys = [
+        'library.remote',
+        ...(current.library.branch === undefined ? [] : (['library.branch'] as const)),
+        'library.transport',
+      ];
       next = {
         schemaVersion: current.schemaVersion,
         ...(current.defaults === undefined ? {} : { defaults: current.defaults }),
       };
-    } else if (key === 'library.branch' && current.library !== undefined) {
+    } else if (key === 'library.branch' && current.library?.branch !== undefined) {
+      changedKeys = ['library.branch'];
       next = {
         ...current,
         library: {
@@ -181,8 +201,13 @@ export class ConfigService {
           transport: current.library.transport,
         },
       };
-    } else if (key === 'library.transport' && current.library !== undefined) {
+    } else if (
+      key === 'library.transport' &&
+      current.library !== undefined &&
+      current.library.transport !== 'https'
+    ) {
       const remote = normalizeGitRemote(current.library.remote);
+      changedKeys = ['library.remote', 'library.transport'];
       next = {
         ...current,
         library: {
@@ -191,10 +216,21 @@ export class ConfigService {
           transport: 'https',
         },
       };
-    } else if (key.startsWith('defaults.') && current.defaults !== undefined) {
+    } else if (
+      key.startsWith('defaults.') &&
+      current.defaults !== undefined &&
+      ((key === 'defaults.targets' && current.defaults.targets !== undefined) ||
+        (key === 'defaults.gitignore' && current.defaults.gitignore !== undefined))
+    ) {
       const defaults = { ...current.defaults };
-      if (key === 'defaults.targets') delete defaults.targets;
-      if (key === 'defaults.gitignore') delete defaults.gitignore;
+      if (key === 'defaults.targets') {
+        delete defaults.targets;
+        changedKeys = ['defaults.targets'];
+      }
+      if (key === 'defaults.gitignore') {
+        delete defaults.gitignore;
+        changedKeys = ['defaults.gitignore'];
+      }
       next =
         Object.keys(defaults).length === 0
           ? {
@@ -204,6 +240,8 @@ export class ConfigService {
           : { ...current, defaults };
     }
 
-    return await writeUserConfig(this.paths.configFile, next);
+    if (changedKeys.length === 0) return { changed: false, changedKeys: [] };
+    await writeUserConfig(this.paths.configFile, next);
+    return { changed: true, changedKeys };
   }
 }
