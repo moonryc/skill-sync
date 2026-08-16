@@ -7,6 +7,7 @@ import type {
   TuiLibraryInitPlan,
   TuiLibraryRemovePreview,
   TuiTarget,
+  TuiSyncPreview,
 } from './types.js';
 
 export type TuiScreen =
@@ -16,11 +17,14 @@ export type TuiScreen =
   | 'adopt-candidate'
   | 'adopt-review'
   | 'catalog'
+  | 'diagnostics'
   | 'detail'
   | 'first-run'
   | 'install-review'
+  | 'group-filter'
   | 'library-remove-review'
   | 'managed'
+  | 'managed-detail'
   | 'overview'
   | 'setup-connect'
   | 'setup-connect-review'
@@ -219,7 +223,9 @@ export function moveTuiCursor(
 }
 
 export function overviewDestination(cursor: number): TuiScreen | 'quit' {
-  return (['catalog', 'managed', 'unmanaged', 'quit'] as const)[cursor] ?? 'overview';
+  return (
+    (['managed', 'catalog', 'unmanaged', 'diagnostics', 'quit'] as const)[cursor] ?? 'overview'
+  );
 }
 
 export function firstRunDestination(cursor: number): TuiScreen | 'quit' {
@@ -270,15 +276,39 @@ export function backFromTuiScreen(screen: TuiScreen): TuiScreen | 'quit' {
   ) {
     return 'first-run';
   }
-  if (screen === 'detail' || screen === 'install-review' || screen === 'library-remove-review') {
+  if (
+    screen === 'detail' ||
+    screen === 'install-review' ||
+    screen === 'library-remove-review' ||
+    screen === 'group-filter'
+  ) {
     return 'catalog';
   }
+  if (screen === 'managed-detail' || screen === 'sync-review') return 'managed';
+  if (screen === 'diagnostics') return 'overview';
   if (screen === 'add-location') return 'unmanaged';
   if (screen === 'add-folder-name' || screen === 'add-review') return 'add-location';
   if (screen === 'adopt-candidate') return 'unmanaged';
   if (screen === 'adopt-review') return 'adopt-candidate';
-  if (screen === 'sync-review') return 'managed';
   return 'overview';
+}
+
+export type TuiSyncConfirmationOutcome =
+  | { readonly kind: 'applied'; readonly result: CommandResult<unknown> }
+  | { readonly kind: 'changed'; readonly preview: TuiSyncPreview }
+  | { readonly kind: 'preview-failed'; readonly result: CommandResult<unknown> };
+
+export async function confirmTuiSyncReview(options: {
+  readonly apply: () => Promise<CommandResult<unknown>>;
+  readonly preview: () => Promise<CommandResult<TuiSyncPreview>>;
+  readonly reviewed: TuiSyncPreview;
+}): Promise<TuiSyncConfirmationOutcome> {
+  const refreshed = await options.preview();
+  if (!refreshed.ok) return { kind: 'preview-failed', result: refreshed };
+  if (refreshed.data.fingerprint !== options.reviewed.fingerprint) {
+    return { kind: 'changed', preview: refreshed.data };
+  }
+  return { kind: 'applied', result: await options.apply() };
 }
 
 /** Always return exact IDs; leaf names are deliberately not used to choose a canonical skill. */

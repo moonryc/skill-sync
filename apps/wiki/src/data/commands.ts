@@ -180,7 +180,7 @@ export const commands = [
   {
     name: 'tui',
     summary:
-      'Open the interactive command center for browsing, installs, adding or adopting local skills, and project state.',
+      'Open the health-first command center for explicit search and group filtering, reviewed installs and synchronization, diagnostics, and local-skill adoption.',
     category: 'Project',
     href: '/reference/project-commands/#tui',
     keywords: [

@@ -99,9 +99,15 @@ skill-sync
 skill-sync tui
 ```
 
-Use the terminal UI to connect or create a library, browse groups, search skills, choose Codex and
-Claude targets, review installations, inspect managed state, and add or adopt eligible on-disk
-skills. It stays read-only until you confirm a reviewed action.
+Use the terminal UI to connect or create a library, review managed-skill health, browse groups,
+search skills, choose Codex and Claude targets, review installations and synchronization, and add
+or adopt eligible on-disk skills. Press `/` for search mode, `f` for the group chooser, `c` to
+clear filters, and `?` for contextual help. Managed details explain each state and provide exact
+diff/update handoffs. Sync uses a dry-run review showing revision, freshness, actions, writes,
+backups, and blocked entries, then revalidates its review fingerprint before applying. Diagnostics
+remain available from the normal overview. The TUI stays read-only until you confirm a reviewed
+action. During work, Ctrl+C requests cooperative cancellation and waits for the command's safe
+commit boundary.
 
 ## User-level global skills
 

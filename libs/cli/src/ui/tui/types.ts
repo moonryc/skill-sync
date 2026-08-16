@@ -23,6 +23,27 @@ export interface TuiManagedSkill {
   readonly state: string;
 }
 
+export interface TuiReconciliationSkillPreview {
+  readonly action: string;
+  readonly backupPaths: readonly string[];
+  readonly id: string;
+  readonly outcome: string;
+  readonly state: string;
+  readonly writes: readonly string[];
+}
+
+export interface TuiSyncPreview {
+  readonly authoritative: boolean;
+  readonly fingerprint: string;
+  readonly freshness: string;
+  readonly libraryRevision: string;
+  readonly location: string;
+  readonly scope: 'global' | 'project';
+  readonly skills: readonly TuiReconciliationSkillPreview[];
+  readonly stale: boolean;
+  readonly wouldChange: boolean;
+}
+
 export interface TuiInventorySkill {
   readonly adoptable: boolean;
   readonly issues: readonly string[];
@@ -35,6 +56,7 @@ export interface TuiInventorySkill {
 export type TuiTarget = 'claude' | 'codex';
 
 export interface TuiDashboard {
+  readonly commandPrefix: string;
   readonly defaultTargets: readonly TuiTarget[];
   readonly errors: readonly string[];
   readonly firstRun: boolean;
@@ -166,6 +188,7 @@ export interface TuiActionPort {
     intent: TuiLibrarySetupIntent,
     expectedPlanFingerprint: string,
   ): Promise<CommandResult<unknown>>;
+  cancel(): boolean;
   checkForUpdate(): Promise<TuiReleaseUpdate | undefined>;
   diagnose(): Promise<CommandResult<TuiDoctorSummary>>;
   install(
@@ -184,5 +207,6 @@ export interface TuiActionPort {
     manageGitignore: boolean,
   ): Promise<CommandResult<TuiInstallPreview>>;
   removeLibrarySkill(id: string): Promise<CommandResult<unknown>>;
+  previewSync(discardLocal: boolean): Promise<CommandResult<TuiSyncPreview>>;
   sync(discardLocal: boolean): Promise<CommandResult<unknown>>;
 }

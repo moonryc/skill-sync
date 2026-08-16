@@ -178,6 +178,19 @@ center. Browse groups, search skills, select Codex and Claude targets, review
 an install, inspect managed-state badges, and see valid on-disk skills that are
 not tracked by the selected project or global state.
 
+The overview is health-first: managed skills that are outdated, missing,
+locally modified, or conflicted appear before catalog and inventory counts,
+and diagnostics remain available after setup. The header identifies the current
+scope and screen. Press `?` for contextual keyboard help. Catalog search is an
+explicit `/` mode, so shortcut letters are ordinary search text until Enter
+keeps the filter or Esc clears it. Press `f` for the group chooser and `c` to
+clear search and group filters.
+
+During an in-flight command, Ctrl+C requests cancellation through the same
+commit-aware runtime boundary used by argument-driven commands. The TUI waits
+for the current safe boundary, so it cannot report a committed operation as
+cancelled.
+
 Project and global dashboards initialize their install targets from the
 effective `defaults.targets` setting. A valid configured set is honored in
 either scope; the dashboard falls back to Codex only when no valid target
@@ -233,9 +246,20 @@ fingerprint-bound apply command. If that inline preview finds everything
 already installed, it returns status guidance immediately instead of asking the
 user to confirm an empty plan. Long catalog, managed, unmanaged, and adoption
 lists scroll with the active row and show the visible range, so keyboard actions
-never target an off-screen item.
+never target an off-screen item. Rows are bounded to terminal width, and wide
+catalogs show a compact selected-skill summary. Enter on Managed skills explains
+the highlighted state and prints exact `diff` and single-skill
+`update --dry-run` handoffs.
 
-Setup diagnostics are rendered from the same structured `doctor` report even
+Synchronization opens a real `sync --dry-run` review showing revision,
+freshness, per-skill actions, writes, backups, and blocked or skipped entries.
+Toggling discard-local regenerates the review with an explicit backup warning.
+Pressing `y` repeats the preview and compares its deterministic
+`sync-review-v1-...` fingerprint; a changed review is displayed and requires
+another confirmation before the normal reconciliation workflow runs.
+
+Diagnostics are available during first run and from the normal overview. They
+are rendered from the same structured `doctor` report even
 when a failed check gives `doctor` a nonzero exit status. The screen shows
 pass, warning, fail, and skipped counts; orders failures before warnings and
 skipped checks; keeps long issue lists within the terminal with an omitted-row

@@ -74,7 +74,7 @@
 - [x] 8.5 Add Bash, Zsh, Fish, and PowerShell completion generation from the static registry with snapshot and shell smoke tests.
 - [ ] 8.6 Add optional local-only dynamic completion for skill and profile identifiers with strict latency and result bounds and no network access.
 - [x] 8.7 Build a first-run interactive workflow for initialization and diagnostics that uses the same application plans, validation, confirmation, and commit path as noninteractive commands.
-- [ ] 8.8 Build the broader TUI workflow around typed plans and fingerprints, including cancellation, accessibility, keyboard-only operation, narrow-terminal behavior, and non-TTY fallback tests.
+- [x] 8.8 Build the broader TUI workflow around typed plans and fingerprints, including cancellation, accessibility, keyboard-only operation, narrow-terminal behavior, and non-TTY fallback tests.
 - [x] 8.9 Deliver and document the novice-readable presentation slice for TUI doctor findings, configuration values, catalog inspection, and project/global status and diff summaries, including actionable bounds and next steps.
 - [x] 8.10 Make empty global status succeed online and offline before library/cache resolution, with truthful structured state, exact setup/list guidance, no writes, and retained validation for existing state.
 - [x] 8.11 Make standalone human install previews print a complete exact apply handoff containing resolved IDs or `--all`, sorted repeated targets, resolved gitignore policy when applicable, project/global scope, a safe explicit-project placeholder, and the reviewed fingerprint.

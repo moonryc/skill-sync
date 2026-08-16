@@ -20,7 +20,7 @@
   <text x="600" y="90" fill="#94a3b8" font-family="SFMono-Regular,Consolas,Liberation Mono,monospace" font-size="18" text-anchor="middle">skill-sync tui</text>
   <g font-family="SFMono-Regular,Consolas,Liberation Mono,monospace" font-size="20">
     <rect x="104" y="140" width="992" height="52" rx="10" fill="#0f172a" stroke="#d946ef"/>
-    <text x="126" y="173" fill="#f0abfc" font-weight="700">✦ skill-sync command center · project scope</text>
+    <text x="126" y="173" fill="#f0abfc" font-weight="700">✦ skill-sync command center · project scope · Unmanaged inventory</text>
     <text x="104" y="238" fill="#f8fafc" font-weight="700">Unmanaged skill inventory</text>
     <text x="104" y="287" fill="#f0abfc">❯ codex · openspec-propose <tspan fill="#fbbf24">[unmanaged]</tspan> · [actionable]</text>
     <text x="132" y="318" fill="#94a3b8">/Users/you/project/.codex/skills/openspec-propose</text>
@@ -28,7 +28,7 @@
     <text x="132" y="398" fill="#94a3b8">/Users/you/project/.codex/skills/review-pr</text>
     <text x="104" y="447" fill="#cbd5e1">  claude · release-notes <tspan fill="#fbbf24">[unmanaged]</tspan> · [actionable]</text>
     <text x="132" y="478" fill="#94a3b8">/Users/you/project/.claude/skills/release-notes</text>
-    <text x="104" y="538" fill="#94a3b8">↑↓ move · Enter/a add to library · d adopt existing · r refresh · Esc back</text>
+    <text x="104" y="538" fill="#94a3b8">↑↓ move · Enter/a add · d adopt · r refresh · ? help · Esc back</text>
     <text x="104" y="583" fill="#64748b">Started from skill-sync tui</text>
   </g>
 </svg>

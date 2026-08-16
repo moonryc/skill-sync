@@ -8,6 +8,7 @@ import {
   parseTuiInstallPreviewResult,
   parseTuiLibraryInitPlanResult,
   parseTuiLibraryRemovePreviewResult,
+  parseTuiSyncPreviewResult,
 } from '../../src/ui/tui/runner.js';
 import type { RuntimeIo } from '../../src/ports/index.js';
 import type { CommandInvocation } from '../../src/commands/program.js';
@@ -145,6 +146,35 @@ function createInitPlan(): Readonly<Record<string, unknown>> {
   };
 }
 
+function syncReport(): Readonly<Record<string, unknown>> {
+  return {
+    applied: false,
+    authoritative: true,
+    branch: 'main',
+    check: false,
+    dryRun: true,
+    exitCode: EXIT_CODES.conflict,
+    freshness: 'fetched',
+    libraryIdentity: 'github.com/acme/skills',
+    libraryRevision: 'a'.repeat(40),
+    operation: 'sync',
+    projectRoot: '/workspace',
+    selectedIds: ['frontend/review-ui'],
+    skills: [
+      {
+        action: 'skip-conflict',
+        backupPaths: [],
+        id: 'frontend/review-ui',
+        outcome: 'skipped',
+        state: 'conflicted',
+        writes: [],
+      },
+    ],
+    stale: false,
+    wouldChange: false,
+  };
+}
+
 function nonInteractiveIo(): RuntimeIo {
   return {
     stdinIsTty: false,
@@ -156,6 +186,75 @@ function nonInteractiveIo(): RuntimeIo {
 }
 
 describe('TUI launcher', () => {
+  it('routes busy-screen cancellation through the runtime signal request', () => {
+    const requestCancellation = vi.fn(() => true);
+    const port = new DefaultTuiActionPort(
+      () => Promise.resolve(success({})),
+      {},
+      requestCancellation,
+    );
+
+    expect(port.cancel()).toBe(true);
+    expect(requestCancellation).toHaveBeenCalledOnce();
+  });
+
+  it('turns successful and conflict dry-runs into stable synchronization reviews', () => {
+    const successPreview = parseTuiSyncPreviewResult(success(syncReport()));
+    const conflictPreview = parseTuiSyncPreviewResult(
+      failure(
+        {
+          code: 'RECONCILIATION_CONFLICT',
+          details: { report: syncReport() },
+          message: 'sync did not complete cleanly.',
+        },
+        EXIT_CODES.conflict,
+      ),
+    );
+
+    expect(successPreview).toMatchObject({
+      data: {
+        skills: [{ action: 'skip-conflict', id: 'frontend/review-ui' }],
+      },
+      ok: true,
+    });
+    expect(successPreview.ok && successPreview.data.fingerprint).toMatch(
+      /^sync-review-v1-[a-f0-9]{64}$/u,
+    );
+    expect(conflictPreview).toEqual(successPreview);
+    expect(parseTuiSyncPreviewResult(success({ dryRun: true }))).toMatchObject({
+      errors: [{ code: 'INVALID_SYNC_PREVIEW' }],
+      ok: false,
+    });
+  });
+
+  it('requests synchronization reviews through a write-free command invocation', async () => {
+    const calls: CommandInvocation[] = [];
+    const port = new DefaultTuiActionPort(
+      (input) => {
+        calls.push(input);
+        return Promise.resolve(success(syncReport()));
+      },
+      { project: '/workspace' },
+    );
+
+    await expect(port.previewSync(true)).resolves.toMatchObject({ ok: true });
+    expect(calls).toEqual([
+      {
+        arguments: [],
+        command: 'sync',
+        options: {
+          color: true,
+          discardLocal: true,
+          dryRun: true,
+          json: true,
+          noInput: true,
+          project: '/workspace',
+          yes: true,
+        },
+      },
+    ]);
+  });
+
   it('validates canonical removal previews before exposing them to the TUI', () => {
     expect(
       parseTuiLibraryRemovePreviewResult(
@@ -295,6 +394,9 @@ describe('TUI launcher', () => {
           }, options);
 
           const dashboard = await port.load();
+          expect(dashboard.commandPrefix).toBe(
+            scope === 'global' ? 'skill-sync --global' : 'skill-sync --project <project-path>',
+          );
           expect(dashboard.defaultTargets).toEqual(['claude', 'codex']);
           expect(dashboard.groups).toEqual(['tools', 'workflows/openspec']);
           expect(dashboard.manageGitignore).toBe(scope === 'project');

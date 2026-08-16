@@ -6,6 +6,7 @@ import {
   confirmTuiInstallReview,
   confirmTuiLibraryRemoveReview,
   confirmTuiSetupReview,
+  confirmTuiSyncReview,
   describeTuiItemWindow,
   firstRunDestination,
   initialTuiNavigation,
@@ -28,6 +29,7 @@ import type {
   TuiInstallPreview,
   TuiLibraryInitPlan,
   TuiLibraryRemovePreview,
+  TuiSyncPreview,
 } from '../../src/ui/tui/types.js';
 
 function installPreview(overrides: Partial<TuiInstallPreview> = {}): TuiInstallPreview {
@@ -88,6 +90,21 @@ function libraryInitPlan(overrides: Partial<TuiLibraryInitPlan> = {}): TuiLibrar
   };
 }
 
+function syncPreview(overrides: Partial<TuiSyncPreview> = {}): TuiSyncPreview {
+  return {
+    authoritative: true,
+    fingerprint: `sync-review-v1-${'f'.repeat(64)}`,
+    freshness: 'fetched',
+    libraryRevision: 'a'.repeat(40),
+    location: '/workspace',
+    scope: 'project',
+    skills: [],
+    stale: false,
+    wouldChange: false,
+    ...overrides,
+  };
+}
+
 describe('TUI navigation controller', () => {
   it('keeps navigation within the visible screen bounds', () => {
     expect(moveTuiCursor(initialTuiNavigation(), -1, 3)).toEqual({ cursor: 0, screen: 'overview' });
@@ -134,9 +151,11 @@ describe('TUI navigation controller', () => {
   });
 
   it('maps overview actions and back behavior without renderer state', () => {
-    expect(overviewDestination(0)).toBe('catalog');
+    expect(overviewDestination(0)).toBe('managed');
+    expect(overviewDestination(1)).toBe('catalog');
     expect(overviewDestination(2)).toBe('unmanaged');
-    expect(overviewDestination(3)).toBe('quit');
+    expect(overviewDestination(3)).toBe('diagnostics');
+    expect(overviewDestination(4)).toBe('quit');
     expect(firstRunDestination(0)).toBe('setup-connect');
     expect(firstRunDestination(1)).toBe('setup-create');
     expect(firstRunDestination(2)).toBe('setup-diagnostics');
@@ -146,6 +165,9 @@ describe('TUI navigation controller', () => {
     expect(tuiSetupReviewScreen('create')).toBe('setup-create-review');
     expect(backFromTuiScreen('catalog')).toBe('overview');
     expect(backFromTuiScreen('detail')).toBe('catalog');
+    expect(backFromTuiScreen('group-filter')).toBe('catalog');
+    expect(backFromTuiScreen('managed-detail')).toBe('managed');
+    expect(backFromTuiScreen('diagnostics')).toBe('overview');
     expect(backFromTuiScreen('library-remove-review')).toBe('catalog');
     expect(backFromTuiScreen('add-location')).toBe('unmanaged');
     expect(backFromTuiScreen('add-folder-name')).toBe('add-location');
@@ -160,6 +182,36 @@ describe('TUI navigation controller', () => {
     expect(backFromTuiScreen('setup-guide')).toBe('first-run');
     expect(backFromTuiScreen('first-run')).toBe('quit');
     expect(backFromTuiScreen('overview')).toBe('quit');
+  });
+
+  it('revalidates synchronization reviews before applying', async () => {
+    const reviewed = syncPreview();
+    const changed = syncPreview({
+      fingerprint: `sync-review-v1-${'e'.repeat(64)}`,
+      libraryRevision: 'b'.repeat(40),
+      wouldChange: true,
+    });
+    const apply = vi.fn<() => Promise<CommandResult<unknown>>>(() =>
+      Promise.resolve(success({ applied: true })),
+    );
+
+    await expect(
+      confirmTuiSyncReview({
+        apply,
+        preview: () => Promise.resolve(success(changed)),
+        reviewed,
+      }),
+    ).resolves.toEqual({ kind: 'changed', preview: changed });
+    expect(apply).not.toHaveBeenCalled();
+
+    await expect(
+      confirmTuiSyncReview({
+        apply,
+        preview: () => Promise.resolve(success(reviewed)),
+        reviewed,
+      }),
+    ).resolves.toMatchObject({ kind: 'applied', result: { ok: true } });
+    expect(apply).toHaveBeenCalledTimes(1);
   });
 
   it('builds one-level folder choices for each add location', () => {
