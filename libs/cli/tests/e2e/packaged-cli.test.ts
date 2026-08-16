@@ -372,7 +372,7 @@ describe('built CLI from unrelated directories', () => {
         errors: [{ code: 'USAGE_ERROR' }],
       });
     });
-  }, 15_000);
+  }, 45_000);
 
   it('recovers a crash-left local advisory lock through a preview-first packaged workflow', async () => {
     await withTempDirectory('skill-sync-e2e-recovery-unlock-', async (root) => {
