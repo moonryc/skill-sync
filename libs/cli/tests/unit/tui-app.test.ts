@@ -14,6 +14,7 @@ import {
   TuiFirstRunMenu,
   TuiGitignorePolicy,
   TuiInstallPreviewReview,
+  TuiLibraryRemoveReview,
   TuiReleaseUpdateIndicator,
   TuiSetupDiagnostics,
   TuiSetupForm,
@@ -158,6 +159,17 @@ describe('TUI renderer and action port', () => {
               }),
             ),
           previewInstall: () => Promise.resolve(success(installPreview())),
+          previewLibraryRemove: () =>
+            Promise.resolve(
+              success({
+                changed: true as const,
+                dryRun: true as const,
+                id: 'frontend/review-ui',
+                revision: 'a'.repeat(40),
+                warning: 'Installed copies remain orphaned.',
+              }),
+            ),
+          removeLibrarySkill: () => Promise.resolve(success({})),
           sync: () => Promise.resolve(success({})),
         },
         color: false,
@@ -425,6 +437,28 @@ describe('TUI renderer and action port', () => {
     expect(output).toContain('skill-sync.lock.json');
   });
 
+  it('renders canonical removal as a revision-bound destructive review', () => {
+    const output = renderToString(
+      createElement(TuiLibraryRemoveReview, {
+        color: false,
+        preview: {
+          changed: true,
+          dryRun: true,
+          id: 'frontend/review-ui',
+          revision: 'a'.repeat(40),
+          warning: 'Project copies remain installed as orphaned skills.',
+        },
+      }),
+    );
+
+    expect(output).toContain('Review canonical skill removal');
+    expect(output).toContain('Skill: frontend/review-ui');
+    expect(output).toContain(`Reviewed library revision: ${'a'.repeat(40)}`);
+    expect(output).toContain('Project copies remain installed as orphaned skills.');
+    expect(output).toContain('commit and push deletion');
+    expect(output).toContain('y revalidate and remove');
+  });
+
   it('bounds long install reviews with explicit omitted counts', () => {
     const output = renderToString(
       createElement(TuiInstallPreviewReview, {
@@ -548,7 +582,15 @@ describe('TUI renderer and action port', () => {
                       id: 'workflows/openspec/openspec-propose',
                       revision: 'a'.repeat(40),
                     })
-                  : success({}),
+                  : input.command === 'library:remove' && input.options.dryRun === true
+                    ? success({
+                        changed: true,
+                        dryRun: true,
+                        id: 'frontend/review-ui',
+                        revision: 'a'.repeat(40),
+                        warning: 'Installed copies remain orphaned.',
+                      })
+                    : success({}),
         );
       },
       { project: '/workspace' },
@@ -587,8 +629,10 @@ describe('TUI renderer and action port', () => {
       data: { id: 'workflows/openspec/openspec-propose' },
     });
     await port.add('/workspace/.codex/skills/openspec-propose', 'workflows/openspec');
+    await port.previewLibraryRemove('frontend/review-ui');
+    await port.removeLibrarySkill('frontend/review-ui');
 
-    expect(calls).toHaveLength(11);
+    expect(calls).toHaveLength(13);
     expect(calls[0]?.command).toBe('adopt');
     expect(calls[0]?.arguments).toEqual(['frontend/review-ui']);
     expect(calls[0]?.options).toMatchObject({
@@ -685,6 +729,16 @@ describe('TUI renderer and action port', () => {
         noInput: true,
         yes: false,
       },
+    });
+    expect(calls[11]).toEqual({
+      command: 'library:remove',
+      arguments: ['frontend/review-ui'],
+      options: { color: true, dryRun: true, json: true, noInput: true, yes: false },
+    });
+    expect(calls[12]).toEqual({
+      command: 'library:remove',
+      arguments: ['frontend/review-ui'],
+      options: { color: true, json: true, noInput: true, yes: true },
     });
   });
 

@@ -7,6 +7,7 @@ import {
   parseTuiDoctorSummaryResult,
   parseTuiInstallPreviewResult,
   parseTuiLibraryInitPlanResult,
+  parseTuiLibraryRemovePreviewResult,
 } from '../../src/ui/tui/runner.js';
 import type { RuntimeIo } from '../../src/ports/index.js';
 import type { CommandInvocation } from '../../src/commands/program.js';
@@ -155,6 +156,24 @@ function nonInteractiveIo(): RuntimeIo {
 }
 
 describe('TUI launcher', () => {
+  it('validates canonical removal previews before exposing them to the TUI', () => {
+    expect(
+      parseTuiLibraryRemovePreviewResult(
+        success({
+          changed: true,
+          dryRun: true,
+          id: 'frontend/review-ui',
+          revision: 'a'.repeat(40),
+          warning: 'Installed copies remain orphaned.',
+        }),
+      ),
+    ).toMatchObject({ ok: true, data: { id: 'frontend/review-ui' } });
+    expect(parseTuiLibraryRemovePreviewResult(success({ changed: true }))).toMatchObject({
+      errors: [{ code: 'INVALID_LIBRARY_REMOVE_PREVIEW' }],
+      ok: false,
+    });
+  });
+
   it('refuses JSON, no-input, and non-terminal invocations before rendering', async () => {
     const launcher = createTuiLauncher({
       execute: () => Promise.reject(new Error('executor must not run')),

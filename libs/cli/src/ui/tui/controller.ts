@@ -2,7 +2,12 @@ import { isValidGitHubRepositoryName } from '../../application/library-lifecycle
 import type { CommandResult } from '../../domain/result.js';
 import { validatePortableSlug } from '../../domain/identifiers.js';
 import { GitRemoteUrlError, normalizeGitRemote } from '../../infrastructure/git.js';
-import type { TuiInstallPreview, TuiLibraryInitPlan, TuiTarget } from './types.js';
+import type {
+  TuiInstallPreview,
+  TuiLibraryInitPlan,
+  TuiLibraryRemovePreview,
+  TuiTarget,
+} from './types.js';
 
 export type TuiScreen =
   | 'add-folder-name'
@@ -14,6 +19,7 @@ export type TuiScreen =
   | 'detail'
   | 'first-run'
   | 'install-review'
+  | 'library-remove-review'
   | 'managed'
   | 'overview'
   | 'setup-connect'
@@ -264,7 +270,9 @@ export function backFromTuiScreen(screen: TuiScreen): TuiScreen | 'quit' {
   ) {
     return 'first-run';
   }
-  if (screen === 'detail' || screen === 'install-review') return 'catalog';
+  if (screen === 'detail' || screen === 'install-review' || screen === 'library-remove-review') {
+    return 'catalog';
+  }
   if (screen === 'add-location') return 'unmanaged';
   if (screen === 'add-folder-name' || screen === 'add-review') return 'add-location';
   if (screen === 'adopt-candidate') return 'unmanaged';
@@ -336,4 +344,27 @@ export async function confirmTuiSetupReview(options: {
       : { kind: 'preview-failed', result: refreshed };
   }
   return { kind: 'applied', result };
+}
+
+export type TuiLibraryRemoveReviewOutcome =
+  | { readonly kind: 'changed'; readonly preview: TuiLibraryRemovePreview }
+  | { readonly kind: 'preview-failed'; readonly result: TuiCommandFailure }
+  | { readonly kind: 'removed'; readonly result: CommandResult<unknown> };
+
+/** Re-check the canonical revision immediately before deleting the reviewed skill. */
+export async function confirmTuiLibraryRemoveReview(options: {
+  readonly apply: () => Promise<CommandResult<unknown>>;
+  readonly preview: () => Promise<CommandResult<TuiLibraryRemovePreview>>;
+  readonly reviewed: TuiLibraryRemovePreview;
+}): Promise<TuiLibraryRemoveReviewOutcome> {
+  const current = await options.preview();
+  if (!current.ok) return { kind: 'preview-failed', result: current };
+  if (
+    current.data.id !== options.reviewed.id ||
+    current.data.revision !== options.reviewed.revision ||
+    current.data.warning !== options.reviewed.warning
+  ) {
+    return { kind: 'changed', preview: current.data };
+  }
+  return { kind: 'removed', result: await options.apply() };
 }

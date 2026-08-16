@@ -98,7 +98,7 @@ export const commands = [
     summary: 'Delete one canonical skill while leaving project copies in place.',
     category: 'Library',
     href: '/reference/library-commands/#library-remove',
-    keywords: ['delete', 'orphan', 'confirmation', 'dry-run', 'noninteractive yes'],
+    keywords: ['delete', 'orphan', 'confirmation', 'dry-run', 'noninteractive yes', 'tui'],
   },
   {
     name: 'group list',

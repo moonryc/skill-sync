@@ -114,7 +114,8 @@ skill-sync tui
 ```
 
 The TUI lets users browse groups, search, select skills/targets, inspect managed
-state, and view valid untracked skills in supported Codex/Claude target roots.
+state, remove a selected canonical skill, and view valid untracked skills in
+supported Codex/Claude target roots.
 For project and global dashboards, initialize selected targets from the effective
 `defaults.targets` value. Honor a valid configured set in either scope and use Codex
 as the fallback only when no valid target set is available.
@@ -138,6 +139,11 @@ on-disk skills, while retaining the write-free arbitrary-path handoff
 `skill-sync add <path> --dry-run`. In the catalog, distinguish a truly empty library from a
 search or group filter with no matches: only the truly empty state gives the add preview, while the
 filtered state says that no skills match the current search and group filter.
+Press `x` on a catalog skill to preview canonical removal. The review shows the
+exact qualified ID, library revision, orphan warning, and remote commit/push effect.
+On `y`, repeat `library remove --dry-run`; if the revision changed, show the new
+review and require another `y`. Only an unchanged review may invoke confirmed
+`library remove`. Installed project and global copies remain in place as orphans.
 An eligible unmanaged entry supports two deliberate actions. `Enter` or `a`
 opens an arrow-key group browser. Each location lists `Save in …`, immediate
 child groups, and `Add folder`. Folder entry accepts one portable segment and

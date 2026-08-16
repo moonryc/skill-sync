@@ -4,6 +4,7 @@ import {
   backFromTuiScreen,
   compatibleAdoptionSkillIds,
   confirmTuiInstallReview,
+  confirmTuiLibraryRemoveReview,
   confirmTuiSetupReview,
   describeTuiItemWindow,
   firstRunDestination,
@@ -23,7 +24,11 @@ import {
   windowTuiItems,
 } from '../../src/ui/tui/controller.js';
 import { EXIT_CODES, failure, success, type CommandResult } from '../../src/domain/result.js';
-import type { TuiInstallPreview, TuiLibraryInitPlan } from '../../src/ui/tui/types.js';
+import type {
+  TuiInstallPreview,
+  TuiLibraryInitPlan,
+  TuiLibraryRemovePreview,
+} from '../../src/ui/tui/types.js';
 
 function installPreview(overrides: Partial<TuiInstallPreview> = {}): TuiInstallPreview {
   return {
@@ -141,6 +146,7 @@ describe('TUI navigation controller', () => {
     expect(tuiSetupReviewScreen('create')).toBe('setup-create-review');
     expect(backFromTuiScreen('catalog')).toBe('overview');
     expect(backFromTuiScreen('detail')).toBe('catalog');
+    expect(backFromTuiScreen('library-remove-review')).toBe('catalog');
     expect(backFromTuiScreen('add-location')).toBe('unmanaged');
     expect(backFromTuiScreen('add-folder-name')).toBe('add-location');
     expect(backFromTuiScreen('add-review')).toBe('add-location');
@@ -380,5 +386,37 @@ describe('TUI navigation controller', () => {
     });
     expect(staleApply).toHaveBeenCalledWith(reviewed.fingerprint);
     expect(preview).toHaveBeenCalledTimes(2);
+  });
+
+  it('requires a second removal confirmation when the canonical revision changed', async () => {
+    const reviewed: TuiLibraryRemovePreview = {
+      changed: true,
+      dryRun: true,
+      id: 'frontend/review-ui',
+      revision: 'a'.repeat(40),
+      warning: 'Installed copies remain orphaned.',
+    };
+    const changed = { ...reviewed, revision: 'b'.repeat(40) };
+    const apply = vi.fn<() => Promise<CommandResult<unknown>>>(() =>
+      Promise.resolve(success({ changed: true })),
+    );
+
+    await expect(
+      confirmTuiLibraryRemoveReview({
+        apply,
+        preview: () => Promise.resolve(success(changed)),
+        reviewed,
+      }),
+    ).resolves.toEqual({ kind: 'changed', preview: changed });
+    expect(apply).not.toHaveBeenCalled();
+
+    await expect(
+      confirmTuiLibraryRemoveReview({
+        apply,
+        preview: () => Promise.resolve(success(reviewed)),
+        reviewed,
+      }),
+    ).resolves.toMatchObject({ kind: 'removed', result: { ok: true } });
+    expect(apply).toHaveBeenCalledOnce();
   });
 });

@@ -125,6 +125,14 @@ export interface TuiLibraryAddPreview {
   readonly revision: string;
 }
 
+export interface TuiLibraryRemovePreview {
+  readonly changed: true;
+  readonly dryRun: true;
+  readonly id: string;
+  readonly revision: string;
+  readonly warning: string;
+}
+
 export interface TuiLibraryInitPlan {
   readonly action: 'connect' | 'create' | 'initialize-empty';
   readonly branch: string;
@@ -167,12 +175,14 @@ export interface TuiActionPort {
     expectedPlanFingerprint: string,
   ): Promise<CommandResult<unknown>>;
   load(): Promise<TuiDashboard>;
+  previewAdd(path: string, group: string): Promise<CommandResult<TuiLibraryAddPreview>>;
   previewLibrarySetup(intent: TuiLibrarySetupIntent): Promise<CommandResult<TuiLibraryInitPlan>>;
+  previewLibraryRemove(id: string): Promise<CommandResult<TuiLibraryRemovePreview>>;
   previewInstall(
     ids: readonly string[],
     targets: readonly string[],
     manageGitignore: boolean,
   ): Promise<CommandResult<TuiInstallPreview>>;
-  previewAdd(path: string, group: string): Promise<CommandResult<TuiLibraryAddPreview>>;
+  removeLibrarySkill(id: string): Promise<CommandResult<unknown>>;
   sync(discardLocal: boolean): Promise<CommandResult<unknown>>;
 }

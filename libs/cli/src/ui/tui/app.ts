@@ -6,6 +6,7 @@ import {
   backFromTuiScreen,
   compatibleAdoptionSkillIds,
   confirmTuiInstallReview,
+  confirmTuiLibraryRemoveReview,
   confirmTuiSetupReview,
   describeTuiItemWindow,
   firstRunDestination,
@@ -38,6 +39,7 @@ import type {
   TuiInventorySkill,
   TuiLibraryAddPreview,
   TuiLibraryInitPlan,
+  TuiLibraryRemovePreview,
   TuiLibrarySetupIntent,
   TuiReleaseUpdate,
   TuiSkill,
@@ -644,6 +646,31 @@ export function TuiInstallPreviewReview(props: {
   );
 }
 
+export function TuiLibraryRemoveReview(props: {
+  readonly color: boolean;
+  readonly preview: TuiLibraryRemovePreview;
+}): ReactElement {
+  const muted = props.color ? palette.muted : undefined;
+  return createElement(
+    Box,
+    { flexDirection: 'column', gap: 1 },
+    createElement(Text, { bold: props.color }, 'Review canonical skill removal'),
+    createElement(Text, null, `Skill: ${terminalSafe(props.preview.id)}`),
+    createElement(Text, null, `Reviewed library revision: ${terminalSafe(props.preview.revision)}`),
+    createElement(
+      Text,
+      withColor(props.color ? palette.warning : undefined),
+      terminalSafe(props.preview.warning),
+    ),
+    createElement(
+      Text,
+      null,
+      'This will commit and push deletion of the canonical skill. Installed copies are not removed.',
+    ),
+    createElement(Text, withColor(muted), 'y revalidate and remove · Esc cancel'),
+  );
+}
+
 export function TuiApp(props: {
   readonly actions: TuiActionPort;
   readonly color: boolean;
@@ -677,12 +704,16 @@ export function TuiApp(props: {
   const [setupPlan, setSetupPlan] = useState<TuiLibraryInitPlan | undefined>();
   const [releaseUpdate, setReleaseUpdate] = useState<TuiReleaseUpdate | undefined>();
   const [installPreview, setInstallPreview] = useState<TuiInstallPreview | undefined>();
+  const [libraryRemovePreview, setLibraryRemovePreview] = useState<
+    TuiLibraryRemovePreview | undefined
+  >();
   const [diagnostics, setDiagnostics] = useState<TuiDoctorSummary | undefined>();
   const [diagnosticsError, setDiagnosticsError] = useState<string | undefined>();
   const [busy, setBusy] = useState(false);
   const targetsRef = useRef(targets);
   const manageGitignoreRef = useRef(manageGitignore);
   const installPreviewRef = useRef<TuiInstallPreview | undefined>(undefined);
+  const libraryRemovePreviewRef = useRef<TuiLibraryRemovePreview | undefined>(undefined);
   const setupPlanRef = useRef<TuiLibraryInitPlan | undefined>(undefined);
   const setupIntentRef = useRef<TuiLibrarySetupIntent | undefined>(undefined);
   const previewSequence = useRef(0);
@@ -892,6 +923,84 @@ export function TuiApp(props: {
     } catch (error) {
       setNotice(
         terminalSafe(error instanceof Error ? error.message : 'Unable to install selected skills.'),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openLibraryRemoveReview = async (): Promise<void> => {
+    if (selectedSkill === undefined) {
+      setNotice('Choose a canonical skill before reviewing removal.');
+      return;
+    }
+    const id = selectedSkill.id;
+    setLibraryRemovePreview(undefined);
+    libraryRemovePreviewRef.current = undefined;
+    setNotice(undefined);
+    setScreen('library-remove-review');
+    setBusy(true);
+    try {
+      const result = await props.actions.previewLibraryRemove(id);
+      if (result.ok) {
+        setLibraryRemovePreview(result.data);
+        libraryRemovePreviewRef.current = result.data;
+      } else {
+        setNotice(operationMessage(result));
+      }
+    } catch (error) {
+      setNotice(
+        terminalSafe(error instanceof Error ? error.message : 'Unable to preview skill removal.'),
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeLibrarySkill = async (): Promise<void> => {
+    const reviewed = libraryRemovePreviewRef.current;
+    if (reviewed === undefined) {
+      setNotice('Create and review the removal preview before deleting the canonical skill.');
+      return;
+    }
+    setBusy(true);
+    try {
+      const outcome = await confirmTuiLibraryRemoveReview({
+        apply: () => props.actions.removeLibrarySkill(reviewed.id),
+        preview: () => props.actions.previewLibraryRemove(reviewed.id),
+        reviewed,
+      });
+      if (outcome.kind === 'changed') {
+        setLibraryRemovePreview(outcome.preview);
+        libraryRemovePreviewRef.current = outcome.preview;
+        setNotice('The library revision changed. Review the updated removal and press y again.');
+        return;
+      }
+      if (outcome.kind === 'preview-failed') {
+        setNotice(operationMessage(outcome.result));
+        return;
+      }
+      if (!outcome.result.ok) {
+        setNotice(operationMessage(outcome.result));
+        return;
+      }
+      const removedId = reviewed.id;
+      setSelected((ids) => {
+        const next = new Set(ids);
+        next.delete(removedId);
+        return next;
+      });
+      setLibraryRemovePreview(undefined);
+      libraryRemovePreviewRef.current = undefined;
+      setScreen('catalog');
+      setCursor(0);
+      await reload();
+      setNotice(
+        `Removed ${removedId} from the canonical library. Installed copies remain orphaned.`,
+      );
+    } catch (error) {
+      setNotice(
+        terminalSafe(error instanceof Error ? error.message : 'Unable to remove the skill.'),
       );
     } finally {
       setBusy(false);
@@ -1209,6 +1318,10 @@ export function TuiApp(props: {
           setInstallPreview(undefined);
           installPreviewRef.current = undefined;
         }
+        if (screen === 'library-remove-review') {
+          setLibraryRemovePreview(undefined);
+          libraryRemovePreviewRef.current = undefined;
+        }
         if (screen === 'setup-connect-review' || screen === 'setup-create-review') {
           setSetupPlan(undefined);
           setupPlanRef.current = undefined;
@@ -1281,6 +1394,10 @@ export function TuiApp(props: {
         openInstallReview();
         return;
       }
+      if (input === 'x') {
+        void openLibraryRemoveReview();
+        return;
+      }
       if (input === 'g') {
         setActiveGroup((value) => {
           const index = value === null ? -1 : groups.indexOf(value);
@@ -1312,6 +1429,7 @@ export function TuiApp(props: {
         return;
       }
       if (input === 'i') openInstallReview();
+      if (input === 'x') void openLibraryRemoveReview();
       return;
     }
     if (screen === 'install-review') {
@@ -1336,6 +1454,10 @@ export function TuiApp(props: {
         return;
       }
       if (input === 'y') void install();
+      return;
+    }
+    if (screen === 'library-remove-review') {
+      if (input === 'y') void removeLibrarySkill();
       return;
     }
     if (screen === 'managed') {
@@ -1541,7 +1663,7 @@ export function TuiApp(props: {
           withColor(muted),
           dashboard.skills.length === 0
             ? 'r refresh · Esc back · q quit'
-            : '↑↓ move · g group · Type search · Space toggle · Enter details · i review install · Esc back',
+            : '↑↓ move · g group · Type search · Space toggle · Enter details · i install · x remove · Esc back',
         ),
       );
     }
@@ -1568,7 +1690,7 @@ export function TuiApp(props: {
         createElement(
           Text,
           withColor(muted),
-          'Space toggle selection · i review install · Esc catalog',
+          'Space toggle selection · i review install · x remove from library · Esc catalog',
         ),
       );
     }
@@ -1612,6 +1734,14 @@ export function TuiApp(props: {
               preview: installPreview,
             }),
       );
+    }
+    if (screen === 'library-remove-review') {
+      return libraryRemovePreview === undefined
+        ? createElement(Text, withColor(muted), 'Preparing the removal review…')
+        : createElement(TuiLibraryRemoveReview, {
+            color: props.color,
+            preview: libraryRemovePreview,
+          });
     }
     if (screen === 'managed') {
       return createElement(

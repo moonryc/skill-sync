@@ -19,6 +19,10 @@ shows managed reconciliation badges, and reports valid Codex/Claude skill
 directories that exist on disk but are not represented by this project's state.
 Project and global dashboards honor a valid effective `defaults.targets` set
 and fall back to Codex only when no valid target set is available.
+From the catalog, press `x` on the highlighted skill to review canonical
+removal. The TUI shows the exact ID and library revision, warns that installed
+copies remain orphaned, and revalidates the preview when `y` is pressed. If the
+revision changed, the updated review requires a second confirmation.
 The inventory is read-only while browsing. Press `Enter` or `a` on an eligible
 entry to add it to the Git library. Choose a group with the arrow keys; every
 location offers `Save in …`, its immediate child folders, and `Add folder`.
