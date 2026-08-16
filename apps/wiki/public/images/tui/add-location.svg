@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title desc">
+  <title id="title">Choose a group for a local skill</title>
+  <desc id="desc">The skill-sync terminal group browser with Save in workflows, an openspec child folder, and Add folder options.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-15%" width="120%" height="135%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#020617" flood-opacity="0.42"/>
+    </filter>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#080d18"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="680" fill="#07111f"/>
+  <circle cx="1080" cy="50" r="260" fill="#d946ef" opacity="0.08"/>
+  <rect x="70" y="54" width="1060" height="572" rx="22" fill="url(#screen)" stroke="#334155" filter="url(#shadow)"/>
+  <path d="M70 112h1060" stroke="#334155"/>
+  <circle cx="108" cy="83" r="8" fill="#fb7185"/>
+  <circle cx="136" cy="83" r="8" fill="#fbbf24"/>
+  <circle cx="164" cy="83" r="8" fill="#34d399"/>
+  <text x="600" y="90" fill="#94a3b8" font-family="SFMono-Regular,Consolas,Liberation Mono,monospace" font-size="18" text-anchor="middle">skill-sync tui</text>
+  <g font-family="SFMono-Regular,Consolas,Liberation Mono,monospace" font-size="20">
+    <rect x="104" y="140" width="992" height="52" rx="10" fill="#0f172a" stroke="#d946ef"/>
+    <text x="126" y="173" fill="#f0abfc" font-weight="700">✦ skill-sync command center · project scope</text>
+    <text x="104" y="235" fill="#f8fafc" font-weight="700">Choose library location</text>
+    <text x="104" y="278" fill="#cbd5e1">Local skill: codex · /Users/you/project/.codex/skills/openspec-propose</text>
+    <text x="104" y="321" fill="#cbd5e1">Location: workflows</text>
+    <text x="104" y="374" fill="#cbd5e1">  Save in workflows</text>
+    <text x="104" y="417" fill="#cbd5e1">  openspec/</text>
+    <rect x="92" y="438" width="330" height="43" rx="8" fill="#d946ef" opacity="0.14"/>
+    <text x="104" y="467" fill="#f0abfc">❯ Add folder</text>
+    <text x="104" y="528" fill="#94a3b8">↑↓ move · Enter choose · Esc parent/cancel</text>
+    <text x="104" y="583" fill="#64748b">Started from skill-sync tui</text>
+  </g>
+</svg>

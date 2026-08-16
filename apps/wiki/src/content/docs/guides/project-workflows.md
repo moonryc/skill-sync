@@ -38,6 +38,34 @@ Run `skill-sync --global` or `skill-sync --global tui` to use the same visual
 workflow against user-level state; its inventory then identifies global skills
 that exist on disk but are not globally tracked.
 
+### Add a local skill visually
+
+Open **Unmanaged inventory** to find valid Codex and Claude skill directories that are not yet
+tracked in the selected scope.
+
+<figure class="tui-shot">
+  <img src="/images/tui/unmanaged-inventory.svg" alt="The TUI unmanaged inventory with an actionable local Codex skill selected" />
+  <figcaption>Select a local skill, then press <kbd>Enter</kbd> or <kbd>a</kbd> to add it to the Git library.</figcaption>
+</figure>
+
+The location browser is keyboard-driven. Move through groups with the arrow keys, choose
+**Save in …** at the desired location, or select **Add folder**. A new folder opens immediately,
+so you can save there or create another nested folder before anything is written.
+
+<figure class="tui-shot">
+  <img src="/images/tui/add-location.svg" alt="The TUI group browser with Save in workflows, openspec, and Add folder choices" />
+  <figcaption>Every group offers a save action, its immediate child folders, and an <strong>Add folder</strong> action.</figcaption>
+</figure>
+
+The final review shows the exact canonical skill ID and digest. Pressing <kbd>y</kbd> commits and
+pushes that local content to the canonical Git library, then starts tracking the unchanged local
+directory. The target files are not replaced.
+
+<figure class="tui-shot">
+  <img src="/images/tui/add-review.svg" alt="The TUI review before adding and tracking a local skill" />
+  <figcaption>The write happens only after the exact destination and content digest are reviewed.</figcaption>
+</figure>
+
 On first run, `Create GitHub library (starts empty)` makes the authoring state
 explicit. After setup, a populated library opens the catalog with
 `Space` selection and `i` install-review guidance. An empty library remains on
