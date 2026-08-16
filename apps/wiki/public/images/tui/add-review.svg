@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="680" viewBox="0 0 1200 680" role="img" aria-labelledby="title desc">
+  <title id="title">Review adding a local skill to the Git library</title>
+  <desc id="desc">The skill-sync terminal review showing the local source, canonical skill ID, digest, and add-and-track confirmation.</desc>
+  <defs>
+    <filter id="shadow" x="-10%" y="-15%" width="120%" height="135%">
+      <feDropShadow dx="0" dy="18" stdDeviation="22" flood-color="#020617" flood-opacity="0.42"/>
+    </filter>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#080d18"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="680" fill="#07111f"/>
+  <circle cx="1080" cy="50" r="260" fill="#2dd4bf" opacity="0.08"/>
+  <rect x="70" y="54" width="1060" height="572" rx="22" fill="url(#screen)" stroke="#334155" filter="url(#shadow)"/>
+  <path d="M70 112h1060" stroke="#334155"/>
+  <circle cx="108" cy="83" r="8" fill="#fb7185"/>
+  <circle cx="136" cy="83" r="8" fill="#fbbf24"/>
+  <circle cx="164" cy="83" r="8" fill="#34d399"/>
+  <text x="600" y="90" fill="#94a3b8" font-family="SFMono-Regular,Consolas,Liberation Mono,monospace" font-size="18" text-anchor="middle">skill-sync tui</text>
+  <g font-family="SFMono-Regular,Consolas,Liberation Mono,monospace" font-size="20">
+    <rect x="104" y="140" width="992" height="52" rx="10" fill="#0f172a" stroke="#d946ef"/>
+    <text x="126" y="173" fill="#f0abfc" font-weight="700">✦ skill-sync command center · project scope</text>
+    <text x="104" y="239" fill="#f8fafc" font-weight="700">Review add to library</text>
+    <text x="104" y="292" fill="#cbd5e1">Local source: /Users/you/project/.codex/skills/openspec-propose</text>
+    <text x="104" y="345" fill="#cbd5e1">Canonical skill: workflows/openspec/openspec-propose</text>
+    <text x="104" y="398" fill="#cbd5e1">Content digest: 9e1b75a68b50731f2ce39990aa99b3a1c70fe37c51d2e5fab9ea67417210b653</text>
+    <text x="104" y="462" fill="#fbbf24">This will commit and push the local skill to the Git library,</text>
+    <text x="104" y="493" fill="#fbbf24">then track this existing local copy.</text>
+    <text x="104" y="548" fill="#94a3b8">y add and track · Esc change location</text>
+    <text x="104" y="593" fill="#64748b">Started from skill-sync tui</text>
+  </g>
+</svg>
