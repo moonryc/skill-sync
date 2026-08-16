@@ -864,7 +864,8 @@ async function syncDirectoryDurably(path: string): Promise<void> {
 async function syncRegularPath(path: string): Promise<void> {
   const information = await lstat(path);
   if (information.isFile()) {
-    const handle = await open(path, 'r');
+    // Windows requires a writable handle for fsync even when only flushing copied data.
+    const handle = await open(path, process.platform === 'win32' ? 'r+' : 'r');
     try {
       await handle.sync();
     } finally {
