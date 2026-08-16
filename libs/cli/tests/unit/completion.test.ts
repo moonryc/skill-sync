@@ -131,7 +131,11 @@ describe('static shell completion', () => {
   it('passes installed shell syntax checks and can require the complete shell matrix', () => {
     const checked = {
       bash: syntaxCheck('bash', ['-n'], generateCompletionScript('bash')),
-      fish: syntaxCheck('fish', ['--no-config', '--no-execute'], generateCompletionScript('fish')),
+      fish: syntaxCheck(
+        'fish',
+        ['--no-config', '--no-execute', '-'],
+        generateCompletionScript('fish'),
+      ),
       zsh: syntaxCheck('zsh', ['-n'], generateCompletionScript('zsh')),
     };
 
