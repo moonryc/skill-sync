@@ -1,0 +1,16 @@
+{
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "entries": [
+    {
+      "action": "replace",
+      "destination": ".codex/skills/example",
+      "state": "original-moved"
+    }
+  ],
+  "kind": "install",
+  "note": "interrupted legacy fixture",
+  "operationId": "legacy-interrupted",
+  "schemaVersion": 1,
+  "status": "failed",
+  "updatedAt": "2026-01-01T00:00:01.000Z"
+}
