@@ -6,6 +6,10 @@ Claude project needs.
 `skill-sync` is a command-line tool, not a JavaScript API. It gives you a validated, versioned
 source of truth for skills while keeping project and user-level copies explicit and reviewable.
 
+[Documentation](https://skill-sync.ryanmoon.xyz/) ·
+[GitHub](https://github.com/moonryc/skill-sync) ·
+[Report an issue](https://github.com/moonryc/skill-sync/issues)
+
 ## What it does
 
 - Organizes reusable skills in a Git repository with portable group and skill IDs.
@@ -177,10 +181,11 @@ The command prints a deterministic completion script and never edits your shell 
 
 ## Documentation and support
 
-- [Installation guide](https://github.com/moonryc/skill-sync/blob/main/apps/wiki/src/content/docs/getting-started/installation.md)
-- [Quick start](https://github.com/moonryc/skill-sync/blob/main/apps/wiki/src/content/docs/getting-started/quick-start.md)
-- [Command reference](https://github.com/moonryc/skill-sync/blob/main/apps/wiki/src/content/docs/reference/index.mdx)
-- [Troubleshooting](https://github.com/moonryc/skill-sync/blob/main/apps/wiki/src/content/docs/troubleshooting.md)
+- [Documentation home](https://skill-sync.ryanmoon.xyz/)
+- [Installation guide](https://skill-sync.ryanmoon.xyz/getting-started/installation/)
+- [Quick start](https://skill-sync.ryanmoon.xyz/getting-started/quick-start/)
+- [Command reference](https://skill-sync.ryanmoon.xyz/reference/)
+- [Troubleshooting](https://skill-sync.ryanmoon.xyz/troubleshooting/)
 - [Report an issue](https://github.com/moonryc/skill-sync/issues)
 
 ## License

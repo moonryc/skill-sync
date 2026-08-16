@@ -148,6 +148,9 @@ try {
     throw new Error('packed skill-sync bin metadata is incorrect');
   }
   if (packageJson.engines?.node !== '>=22') throw new Error('packed Node engine is incorrect');
+  if (packageJson.homepage !== 'https://skill-sync.ryanmoon.xyz/') {
+    throw new Error('packed npm homepage metadata is incorrect');
+  }
   if (packageJson.publishConfig?.access !== 'public') {
     throw new Error('packed npm access metadata is incorrect');
   }

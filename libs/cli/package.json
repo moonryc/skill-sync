@@ -1,7 +1,8 @@
 {
   "name": "@moonryc/skill-sync",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Safely manage a Git-backed library of AI skills across Codex, Claude, and project repositories.",
+  "homepage": "https://skill-sync.ryanmoon.xyz/",
   "type": "module",
   "sideEffects": false,
   "bin": {
@@ -28,6 +29,9 @@
     "type": "git",
     "url": "git+https://github.com/moonryc/skill-sync.git",
     "directory": "libs/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/moonryc/skill-sync/issues"
   },
   "publishConfig": {
     "access": "public",
