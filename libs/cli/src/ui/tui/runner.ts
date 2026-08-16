@@ -33,6 +33,7 @@ import type {
   TuiInstallSkillPreview,
   TuiLibraryAddPreview,
   TuiLibraryInitPlan,
+  TuiLibraryRemovePreview,
   TuiLibrarySetupIntent,
   TuiLauncher,
   TuiLaunchRequest,
@@ -70,6 +71,38 @@ export function parseTuiLibraryAddPreviewResult(
     return invalidAddPreview('required ID, digest, revision, or dry-run fields were missing.');
   }
   return success({ changed: true, digest, dryRun: true, id, revision });
+}
+
+function invalidLibraryRemovePreview(reason: string): CommandResult<TuiLibraryRemovePreview> {
+  return failure(
+    {
+      code: 'INVALID_LIBRARY_REMOVE_PREVIEW',
+      message: `The library remove dry-run returned an invalid review plan: ${reason}`,
+    },
+    EXIT_CODES.internal,
+  );
+}
+
+export function parseTuiLibraryRemovePreviewResult(
+  result: CommandResult<unknown>,
+): CommandResult<TuiLibraryRemovePreview> {
+  if (!result.ok) return result;
+  if (!isRecord(result.data)) return invalidLibraryRemovePreview('expected an object result.');
+  const id = requiredString(result.data, 'id');
+  const revision = requiredString(result.data, 'revision');
+  const warning = requiredString(result.data, 'warning');
+  if (
+    id === undefined ||
+    revision === undefined ||
+    warning === undefined ||
+    result.data.changed !== true ||
+    result.data.dryRun !== true
+  ) {
+    return invalidLibraryRemovePreview(
+      'required ID, revision, warning, or dry-run fields were missing.',
+    );
+  }
+  return success({ changed: true, dryRun: true, id, revision, warning });
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
@@ -780,6 +813,16 @@ export class DefaultTuiActionPort implements TuiActionPort {
         ),
       ),
     );
+  }
+
+  public async previewLibraryRemove(id: string): Promise<CommandResult<TuiLibraryRemovePreview>> {
+    return parseTuiLibraryRemovePreviewResult(
+      await this.execute(invocation('library:remove', [id], this.setupOptions({ dryRun: true }))),
+    );
+  }
+
+  public async removeLibrarySkill(id: string): Promise<CommandResult<unknown>> {
+    return await this.execute(invocation('library:remove', [id], this.setupOptions({ yes: true })));
   }
 
   public async install(

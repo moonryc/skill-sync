@@ -202,7 +202,10 @@ In the catalog, a genuinely empty library instead says
 `This library has no skills yet. Open Unmanaged inventory to add an on-disk skill, or run skill-sync add <path> --dry-run.`;
 a search or group filter with no matches says
 `No skills match the current search and group filter.` and does not suggest
-adding a skill. When a bare
+adding a skill. Press `x` on a catalog skill to review canonical removal. The
+review shows the exact ID and library revision, warns that installed copies
+remain orphaned, and repeats the dry-run on `y`; a changed revision requires
+another confirmation before deletion. When a bare
 invocation is piped or otherwise noninteractive, it prints a short setup preview →
 exact apply → `list` → `install` quick start and exits without reading configuration,
 recovery state, project files, or the network.

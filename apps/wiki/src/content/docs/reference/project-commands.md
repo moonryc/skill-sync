@@ -21,7 +21,12 @@ skill-sync tui
 A bare `skill-sync` invocation starts the same interface when both standard
 input and output are terminals. It supports grouped browsing, search,
 multi-skill installation reviews, managed-skill reconciliation views, and an
-inventory of valid but untracked skills in supported agent directories. Press
+inventory of valid but untracked skills in supported agent directories. In the
+catalog, press `x` to review removal of the highlighted canonical skill. The
+review names the qualified ID, current library revision, remote commit/push,
+and the fact that installed copies remain orphaned. Pressing `y` repeats the
+dry-run; a changed revision requires another confirmation before the normal
+`library remove` workflow is applied. Press
 `Enter` or `a` on an eligible entry to browse library groups with the arrow keys.
 Each location offers `Save in …`, immediate child folders, and `Add folder`.
 Entering one portable folder name opens the new location, allowing repeated
