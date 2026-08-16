@@ -24,6 +24,11 @@
     "git"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/moonryc/skill-sync.git",
+    "directory": "libs/cli"
+  },
   "publishConfig": {
     "access": "public",
     "provenance": true
