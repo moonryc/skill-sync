@@ -1,5 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
@@ -30,6 +33,22 @@ function syntaxCheck(executable: string, arguments_: readonly string[], script: 
   }
   expect(result.status, `${executable}: ${result.stderr}`).toBe(0);
   return true;
+}
+
+function syntaxCheckFile(
+  executable: string,
+  arguments_: readonly string[],
+  extension: string,
+  script: string,
+): boolean {
+  const directory = mkdtempSync(join(tmpdir(), 'skill-sync-completion-'));
+  const path = join(directory, `completion.${extension}`);
+  try {
+    writeFileSync(path, script, 'utf8');
+    return syntaxCheck(executable, [...arguments_, path], '');
+  } finally {
+    rmSync(directory, { force: true, recursive: true });
+  }
 }
 
 describe('static shell completion', () => {
@@ -131,9 +150,10 @@ describe('static shell completion', () => {
   it('passes installed shell syntax checks and can require the complete shell matrix', () => {
     const checked = {
       bash: syntaxCheck('bash', ['-n'], generateCompletionScript('bash')),
-      fish: syntaxCheck(
+      fish: syntaxCheckFile(
         'fish',
-        ['--no-config', '--no-execute', '-'],
+        ['--no-config', '--no-execute'],
+        'fish',
         generateCompletionScript('fish'),
       ),
       zsh: syntaxCheck('zsh', ['-n'], generateCompletionScript('zsh')),
